@@ -20,7 +20,7 @@ gravityos-webui/
 
 ```bash
 cd /opt/gravity
-git clone https://github.com/TON_USERNAME/gravityos-webui.git .
+git clone https://gitlab.com/syper/gravityos-webui.git .
 npm install --ignore-scripts --omit=optional
 systemctl restart gravity-webui
 ```

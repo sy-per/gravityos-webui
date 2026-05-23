@@ -4,7 +4,7 @@
 set -e
 
 INSTALL_DIR="/opt/gravity"
-REPO_URL="https://github.com/TON_USERNAME/gravityos-webui.git"
+REPO_URL="https://gitlab.com/syper/gravityos-webui.git"
 BRANCH="main"
 
 echo "=== GravityOS WebUI Update ==="

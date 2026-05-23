@@ -364,7 +364,7 @@ app.post("/api/updates/system/start", auth, (req,res) => {
 // Vérifier les mises à jour GravityOS (via git)
 app.get("/api/updates/gravity/check", auth, async(req,res) => {
   try {
-    const REPO = "https://github.com/TON_USERNAME/gravityos-webui.git";
+    const REPO = "https://gitlab.com/syper/gravityos-webui.git";
     const isGit = fs.existsSync("/opt/gravity/.git");
     if(!isGit) return res.json({available:true, message:`Repo non initialisé — cliquez Mettre à jour pour connecter ${REPO}`, count:1, commits:["Premier déploiement depuis git"]});
     await execAsync("git -C /opt/gravity fetch origin 2>/dev/null");
