@@ -296,7 +296,13 @@ app.post("/api/vms", auth, async (req,res) => {
     const memKB = parseInt(memMB)*1024;
     const cdrom = iso ? `<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='${iso}'/><target dev='sdb' bus='sata'/><readonly/></disk>` : "";
     const bootDev = iso ? "<boot dev='cdrom'/><boot dev='hd'/>" : "<boot dev='hd'/>";
-    const xml = `<domain type='kvm'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os><type arch='x86_64' machine='pc-q35-2.9'>hvm</type>${bootDev}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>/usr/bin/qemu-system-x86_64</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/><target dev='vda' bus='virtio'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='virtio'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console></devices></domain>`;
+    // Détecter si KVM est disponible (pas dans VirtualBox)
+    let domainType = 'kvm';
+    try { await execAsync('test -e /dev/kvm'); } catch { domainType = 'qemu'; }
+    // Détecter l'émulateur disponible
+    let emulator = '/usr/bin/qemu-system-x86_64';
+    try { const {stdout:em} = await execAsync('which qemu-system-x86_64 2>/dev/null || echo /usr/bin/qemu-system-x86_64'); emulator = em.trim(); } catch {}
+    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os><type arch='x86_64' machine='pc'>hvm</type>${bootDev}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console></devices></domain>`;
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
     require("fs").writeFileSync(xmlPath, xml);
     const {stdout,stderr} = await execAsync(`virsh --connect qemu:///system define "${xmlPath}"`);
