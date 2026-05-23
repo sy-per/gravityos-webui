@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GravityOS — Installation</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#07080f;--surface:#0f1020;--surface2:#171830;--surface3:#1e2040;
+  --border:rgba(255,255,255,0.07);--accent:#6c63ff;--accent2:#4f8ef7;
+  --green:#3dd68c;--red:#f05050;--amber:#f5a623;--text:#e8eaf6;--text2:#7b7fa8;--text3:#4a4d6a;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;overflow:hidden}
+
+/* Fond */
+.bg-orbs{position:fixed;inset:0;pointer-events:none;overflow:hidden}
+.orb{position:absolute;border-radius:50%;filter:blur(120px);opacity:.08;animation:float 12s ease-in-out infinite}
+.orb1{width:600px;height:600px;background:var(--accent);top:-200px;left:-200px}
+.orb2{width:400px;height:400px;background:var(--accent2);bottom:-150px;right:-150px;animation-delay:5s}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-30px)}}
+
+/* Layout principal */
+.installer{position:relative;z-index:1;width:900px;max-width:98vw;display:flex;flex-direction:column;height:100vh;max-height:700px}
+
+/* Header */
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:24px 32px 0;flex-shrink:0}
+.logo{display:flex;align-items:center;gap:12px}
+.logo img{height:32px;filter:drop-shadow(0 0 12px rgba(108,99,255,.5))}
+.logo-txt{font-size:18px;font-weight:700;background:linear-gradient(135deg,#a78bfa,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.step-counter{font-size:12px;color:var(--text2)}
+
+/* Steps bar */
+.steps-bar{display:flex;align-items:center;padding:20px 32px;gap:0;flex-shrink:0}
+.step-item{display:flex;align-items:center;gap:10px;flex:1}
+.step-item:last-child{flex:0}
+.step-dot{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0;border:2px solid var(--text3);color:var(--text3);transition:all .4s}
+.step-dot.active{border-color:var(--accent);color:var(--accent);background:rgba(108,99,255,.12);box-shadow:0 0 16px rgba(108,99,255,.3)}
+.step-dot.done{border-color:var(--green);background:var(--green);color:#000}
+.step-label{font-size:11px;color:var(--text3);transition:color .3s;white-space:nowrap}
+.step-label.active{color:var(--text)}
+.step-line{flex:1;height:1px;background:var(--border);margin:0 8px;transition:background .4s}
+.step-line.done{background:var(--green)}
+
+/* Card principale */
+.card{background:rgba(15,16,32,.8);border:1px solid var(--border);border-radius:20px;margin:0 16px;flex:1;display:flex;flex-direction:column;overflow:hidden;backdrop-filter:blur(20px)}
+
+/* Panels */
+.panel{display:none;flex:1;padding:32px;overflow-y:auto;flex-direction:column}
+.panel.active{display:flex}
+.panel-title{font-size:22px;font-weight:700;letter-spacing:-.5px;margin-bottom:6px}
+.panel-sub{font-size:13px;color:var(--text2);margin-bottom:28px;line-height:1.6}
+
+/* Form */
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.form-group{display:flex;flex-direction:column;gap:6px}
+.form-group.full{grid-column:1/-1}
+.form-label{font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px}
+.form-input{background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:10px;padding:11px 14px;font-size:14px;color:var(--text);outline:none;transition:all .2s;width:100%}
+.form-input:focus{border-color:rgba(108,99,255,.5);background:rgba(108,99,255,.04);box-shadow:0 0 0 3px rgba(108,99,255,.1)}
+.form-hint{font-size:11px;color:var(--text3)}
+select.form-input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%237b7fa8'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;cursor:pointer}
+select.form-input option{background:#0f1020}
+
+/* Disques */
+.disk-list{display:flex;flex-direction:column;gap:10px}
+.disk-card{border:2px solid var(--border);border-radius:12px;padding:16px 20px;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:16px;background:rgba(255,255,255,.02)}
+.disk-card:hover{border-color:rgba(108,99,255,.3);background:rgba(108,99,255,.04)}
+.disk-card.selected{border-color:var(--accent);background:rgba(108,99,255,.08)}
+.disk-ico{font-size:28px;flex-shrink:0}
+.disk-info{flex:1}
+.disk-name{font-size:15px;font-weight:600}
+.disk-detail{font-size:12px;color:var(--text2);margin-top:3px}
+.disk-size{font-size:20px;font-weight:700;color:var(--accent2)}
+.disk-warn{display:flex;align-items:center;gap:8px;padding:10px 14px;background:rgba(245,166,35,.07);border:1px solid rgba(245,166,35,.2);border-radius:8px;font-size:12px;color:var(--amber);margin-top:4px}
+
+/* Password strength */
+.pw-bar{height:3px;border-radius:2px;margin-top:6px;transition:all .3s;background:var(--surface3)}
+.pw-fill{height:100%;border-radius:2px;transition:all .3s}
+.pw-hint{font-size:11px;margin-top:3px}
+
+/* Progress / Installation */
+.install-wrap{flex:1;display:flex;flex-direction:column;justify-content:center;gap:0}
+.progress-steps{display:flex;flex-direction:column;gap:12px;margin-bottom:32px}
+.prog-row{display:flex;align-items:center;gap:14px}
+.prog-ico{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;border:2px solid var(--border);color:var(--text3);background:var(--surface2);transition:all .4s}
+.prog-ico.active{border-color:var(--accent);color:var(--accent);animation:pulse 1.5s ease-in-out infinite;background:rgba(108,99,255,.1)}
+.prog-ico.done{border-color:var(--green);background:var(--green);color:#000}
+.prog-ico.error{border-color:var(--red);background:rgba(240,80,80,.1);color:var(--red)}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(108,99,255,.4)}50%{box-shadow:0 0 0 8px rgba(108,99,255,0)}}
+.prog-label{flex:1;font-size:13px;color:var(--text2);transition:color .3s}
+.prog-label.active{color:var(--text);font-weight:600}
+.prog-label.done{color:var(--green)}
+.prog-check{font-size:14px;opacity:0;transition:opacity .3s}
+.prog-check.show{opacity:1}
+
+.big-bar{height:8px;border-radius:4px;background:var(--surface3);overflow:hidden;margin-bottom:12px}
+.big-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:4px;transition:width .5s ease;width:0%}
+.pct-txt{font-size:13px;color:var(--text2);text-align:center}
+
+/* Log terminal */
+.log-box{background:#000;border:1px solid var(--border);border-radius:10px;padding:14px;font-family:'SF Mono',monospace;font-size:11px;color:#7aff7a;max-height:140px;overflow-y:auto;line-height:1.5}
+
+/* Succès */
+.success-anim{text-align:center;padding:20px 0}
+.success-ico{font-size:64px;animation:pop .5s cubic-bezier(.36,1.56,.64,1) forwards;display:inline-block}
+@keyframes pop{0%{transform:scale(0) rotate(-20deg)}100%{transform:scale(1) rotate(0)}}
+.success-title{font-size:24px;font-weight:700;margin:16px 0 8px;background:linear-gradient(135deg,var(--green),#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.success-sub{color:var(--text2);font-size:14px;margin-bottom:24px}
+.access-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:24px}
+.access-card{background:var(--surface2);border:1px solid var(--border);border-radius:12px;padding:14px}
+.access-label{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px}
+.access-val{font-size:13px;color:var(--accent2);font-weight:500}
+.reboot-bar{height:5px;background:var(--surface3);border-radius:3px;overflow:hidden;margin-bottom:8px}
+.reboot-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));width:0;border-radius:3px}
+
+/* Footer */
+.footer{display:flex;align-items:center;justify-content:space-between;padding:20px 32px;flex-shrink:0}
+.btn{padding:10px 22px;border-radius:10px;border:1px solid var(--border);background:rgba(255,255,255,.05);color:var(--text2);font-size:14px;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:8px;font-weight:500}
+.btn:hover{background:rgba(255,255,255,.09);color:var(--text)}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#fff;font-weight:600}
+.btn-primary:hover{opacity:.92;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-success{background:var(--green);border:none;color:#000;font-weight:700}
+.error-box{background:rgba(240,80,80,.08);border:1px solid rgba(240,80,80,.2);border-radius:8px;padding:10px 14px;font-size:13px;color:var(--red);margin-top:12px;display:none}
+.error-box.show{display:block}
+</style>
+</head>
+<body>
+<div class="bg-orbs"><div class="orb orb1"></div><div class="orb orb2"></div></div>
+
+<div class="installer">
+  <!-- Header -->
+  <div class="hdr">
+    <div class="logo">
+      <img src="/gravity-logo.png" alt="GravityOS" style="height:36px;filter:drop-shadow(0 0 12px rgba(108,99,255,.5))" onerror="this.outerHTML='<span class=\'logo-txt\'>GravityOS</span>'">
+    </div>
+    <span class="step-counter" id="step-counter">Étape 1 sur 4</span>
+  </div>
+
+  <!-- Steps bar -->
+  <div class="steps-bar">
+    <div class="step-item">
+      <div class="step-dot active" id="sd0">1</div>
+      <span class="step-label active" id="sl0">Disque</span>
+    </div>
+    <div class="step-line" id="line0"></div>
+    <div class="step-item">
+      <div class="step-dot" id="sd1">2</div>
+      <span class="step-label" id="sl1">Configuration</span>
+    </div>
+    <div class="step-line" id="line1"></div>
+    <div class="step-item">
+      <div class="step-dot" id="sd2">3</div>
+      <span class="step-label" id="sl2">Installation</span>
+    </div>
+    <div class="step-line" id="line2"></div>
+    <div class="step-item">
+      <div class="step-dot" id="sd3">4</div>
+      <span class="step-label" id="sl3">Terminé</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <!-- Panel 0 : Choix du disque -->
+    <div class="panel active" id="p0">
+      <div class="panel-title">💿 Choisissez un disque</div>
+      <div class="panel-sub">GravityOS sera installé sur ce disque. Son contenu sera entièrement effacé.</div>
+      <div class="disk-list" id="disk-list">
+        <div style="color:var(--text3);font-size:13px;text-align:center;padding:20px">Chargement des disques...</div>
+      </div>
+      <div class="disk-warn" id="disk-warn" style="display:none">
+        <span>⚠️</span>
+        <span>Le disque <strong id="warn-disk"></strong> sera entièrement effacé. Cette action est irréversible.</span>
+      </div>
+    </div>
+
+    <!-- Panel 1 : Configuration -->
+    <div class="panel" id="p1">
+      <div class="panel-title">⚙️ Configuration du système</div>
+      <div class="panel-sub">Personnalisez votre NAS. Ces paramètres peuvent être modifiés plus tard dans les Paramètres.</div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label class="form-label">Nom du serveur</label>
+          <input class="form-input" id="cfg-hostname" type="text" value="gravity-nas" placeholder="gravity-nas"
+                 oninput="this.value=this.value.toLowerCase().replace(/[^a-z0-9-]/g,'');updatePreview()">
+          <span class="form-hint">Accessible via <span id="hostname-hint" style="color:var(--accent2)">gravity-nas.local</span></span>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Fuseau horaire</label>
+          <select class="form-input" id="cfg-tz">
+            <option value="Europe/Paris">🇫🇷 Europe/Paris</option>
+            <option value="Europe/London">🇬🇧 Europe/London</option>
+            <option value="Europe/Berlin">🇩🇪 Europe/Berlin</option>
+            <option value="Europe/Brussels">🇧🇪 Europe/Brussels</option>
+            <option value="Europe/Zurich">🇨🇭 Europe/Zurich</option>
+            <option value="America/New_York">🇺🇸 America/New_York</option>
+            <option value="America/Montreal">🇨🇦 America/Montreal</option>
+            <option value="America/Los_Angeles">🇺🇸 America/Los_Angeles</option>
+            <option value="Asia/Tokyo">🇯🇵 Asia/Tokyo</option>
+            <option value="UTC">🌐 UTC</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Nom d'utilisateur</label>
+          <input class="form-input" id="cfg-user" type="text" value="gravity" placeholder="admin"
+                 oninput="this.value=this.value.toLowerCase().replace(/[^a-z0-9_-]/g,'')">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Mot de passe</label>
+          <input class="form-input" id="cfg-pass" type="password" placeholder="••••••••" oninput="checkPw(this.value)">
+          <div class="pw-bar"><div class="pw-fill" id="pw-fill"></div></div>
+          <span class="pw-hint" id="pw-hint" style="color:var(--text3)">Min. 6 caractères</span>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Confirmer le mot de passe</label>
+          <input class="form-input" id="cfg-pass2" type="password" placeholder="••••••••">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Langue</label>
+          <select class="form-input" id="cfg-lang">
+            <option value="fr_FR.UTF-8">🇫🇷 Français</option>
+            <option value="en_US.UTF-8">🇬🇧 English</option>
+          </select>
+        </div>
+      </div>
+      <div class="error-box" id="cfg-err"></div>
+    </div>
+
+    <!-- Panel 2 : Installation -->
+    <div class="panel" id="p2">
+      <div class="panel-title">🚀 Installation en cours...</div>
+      <div class="panel-sub" id="install-subtitle">Merci de patienter. N'éteignez pas l'appareil pendant l'installation.</div>
+      <div class="install-wrap">
+        <div class="big-bar"><div class="big-fill" id="big-fill"></div></div>
+        <div class="pct-txt" id="pct-txt">0% — Démarrage...</div>
+        <br>
+        <div class="progress-steps" id="prog-steps">
+          <div class="prog-row" id="pr0">
+            <div class="prog-ico" id="pi0">1</div>
+            <span class="prog-label" id="pl0">Partitionnement du disque</span>
+            <span class="prog-check" id="pc0">✓</span>
+          </div>
+          <div class="prog-row" id="pr1">
+            <div class="prog-ico" id="pi1">2</div>
+            <span class="prog-label" id="pl1">Formatage des partitions</span>
+            <span class="prog-check" id="pc1">✓</span>
+          </div>
+          <div class="prog-row" id="pr2">
+            <div class="prog-ico" id="pi2">3</div>
+            <span class="prog-label" id="pl2">Copie du système</span>
+            <span class="prog-check" id="pc2">✓</span>
+          </div>
+          <div class="prog-row" id="pr3">
+            <div class="prog-ico" id="pi3">4</div>
+            <span class="prog-label" id="pl3">Configuration</span>
+            <span class="prog-check" id="pc3">✓</span>
+          </div>
+          <div class="prog-row" id="pr4">
+            <div class="prog-ico" id="pi4">5</div>
+            <span class="prog-label" id="pl4">Chargeur de démarrage</span>
+            <span class="prog-check" id="pc4">✓</span>
+          </div>
+          <div class="prog-row" id="pr5">
+            <div class="prog-ico" id="pi5">6</div>
+            <span class="prog-label" id="pl5">Finalisation</span>
+            <span class="prog-check" id="pc5">✓</span>
+          </div>
+        </div>
+        <div class="log-box" id="log-box"></div>
+        <div class="error-box" id="install-err"></div>
+      </div>
+    </div>
+
+    <!-- Panel 3 : Succès -->
+    <div class="panel" id="p3" style="justify-content:center;align-items:center">
+      <div class="success-anim">
+        <span class="success-ico">🎉</span>
+        <div class="success-title">Installation réussie !</div>
+        <div class="success-sub">GravityOS est maintenant installé sur votre disque.</div>
+        <div class="access-grid">
+          <div class="access-card">
+            <div class="access-label">Interface Web</div>
+            <div class="access-val" id="s-webui">—</div>
+          </div>
+          <div class="access-card">
+            <div class="access-label">SSH</div>
+            <div class="access-val" id="s-ssh">—</div>
+          </div>
+          <div class="access-card">
+            <div class="access-label">Samba</div>
+            <div class="access-val" id="s-smb">—</div>
+          </div>
+          <div class="access-card">
+            <div class="access-label">Identifiants</div>
+            <div class="access-val" id="s-creds">—</div>
+          </div>
+        </div>
+        <div style="margin-bottom:20px;font-size:13px;color:var(--text2)">⚠️ Retirez le support Live CD avant de redémarrer</div>
+        <div class="reboot-bar"><div class="reboot-fill" id="reboot-fill"></div></div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:16px" id="reboot-txt">Redémarrage automatique dans 15s...</div>
+        <button class="btn btn-success" onclick="doReboot()" style="width:100%;padding:14px;font-size:15px">⟳ Redémarrer maintenant</button>
+      </div>
+    </div>
+  </div><!-- card -->
+
+  <!-- Footer -->
+  <div class="footer">
+    <button class="btn" id="btn-back" onclick="goBack()" style="visibility:hidden">← Retour</button>
+    <div style="font-size:11px;color:var(--text3)" id="footer-info"></div>
+    <button class="btn btn-primary" id="btn-next" onclick="goNext()" disabled>Suivant →</button>
+  </div>
+</div><!-- installer -->
+
+<script>
+let step = 0;
+let selectedDisk = null;
+let pollInterval = null;
+let rebootTimer = null;
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+loadDisks();
+
+async function loadDisks() {
+  const r = await fetch('/api/install/disks', {credentials:'include'});
+  const disks = await r.json();
+  const el = document.getElementById('disk-list');
+  if (!disks.length) {
+    el.innerHTML = '<div style="color:var(--text3);text-align:center;padding:30px">Aucun disque détecté</div>';
+    return;
+  }
+  el.innerHTML = disks.map(d => `
+    <div class="disk-card" id="dc-${d.name}" onclick="selectDisk('${d.name}','${d.size}','${d.model||'Disque inconnu'}')">
+      <span class="disk-ico">${d.name.includes('nvme') ? '⚡' : '💿'}</span>
+      <div class="disk-info">
+        <div class="disk-name">/dev/${d.name}</div>
+        <div class="disk-detail">${d.model||'Disque'} ${d.children ? '— ' + d.children.length + ' partition(s)' : ''}</div>
+      </div>
+      <div class="disk-size">${d.size}</div>
+    </div>`).join('');
+}
+
+function selectDisk(name, size, model) {
+  document.querySelectorAll('.disk-card').forEach(c => c.classList.remove('selected'));
+  document.getElementById('dc-'+name)?.classList.add('selected');
+  selectedDisk = name;
+  document.getElementById('disk-warn').style.display = 'flex';
+  document.getElementById('warn-disk').textContent = `/dev/${name} (${size})`;
+  document.getElementById('btn-next').disabled = false;
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+function goNext() {
+  if (step === 0) {
+    if (!selectedDisk) return;
+    goStep(1);
+  } else if (step === 1) {
+    if (!validateConfig()) return;
+    startInstall();
+    goStep(2);
+    document.getElementById('btn-next').style.display = 'none';
+    document.getElementById('btn-back').style.visibility = 'hidden';
+  }
+}
+
+function goBack() {
+  if (step === 1) goStep(0);
+}
+
+function goStep(n) {
+  document.querySelectorAll('.panel').forEach((p,i) => p.classList.toggle('active', i===n));
+  // Update step dots
+  for (let i = 0; i < 4; i++) {
+    const dot = document.getElementById('sd'+i);
+    const lbl = document.getElementById('sl'+i);
+    if (i < n) { dot.className='step-dot done'; dot.textContent='✓'; }
+    else if (i === n) { dot.className='step-dot active'; dot.textContent=i+1; }
+    else { dot.className='step-dot'; dot.textContent=i+1; }
+    lbl.className = 'step-label' + (i===n?' active':'');
+    if (i < 3) document.getElementById('line'+i).className = 'step-line' + (i<n?' done':'');
+  }
+  const counters = ['Étape 1 sur 4','Étape 2 sur 4','Installation...','Terminé'];
+  document.getElementById('step-counter').textContent = counters[n] || '';
+  document.getElementById('btn-back').style.visibility = n === 1 ? 'visible' : 'hidden';
+  document.getElementById('btn-next').disabled = n === 0 ? !selectedDisk : false;
+  if (n === 1) document.getElementById('btn-next').textContent = 'Installer →';
+  step = n;
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+function updatePreview() {
+  const h = document.getElementById('cfg-hostname').value || 'gravity-nas';
+  document.getElementById('hostname-hint').textContent = h + '.local';
+}
+
+function checkPw(pw) {
+  const fill = document.getElementById('pw-fill');
+  const hint = document.getElementById('pw-hint');
+  let s = 0;
+  if (pw.length >= 6) s++;
+  if (pw.length >= 10) s++;
+  if (/[A-Z]/.test(pw)) s++;
+  if (/[0-9]/.test(pw)) s++;
+  if (/[^A-Za-z0-9]/.test(pw)) s++;
+  const pct = s * 20;
+  const colors = ['#f05050','#f5a623','#f5a623','#3dd68c','#3dd68c'];
+  const labels = ['Très faible','Faible','Moyen','Fort ✓','Très fort ✓'];
+  fill.style.width = pct + '%';
+  fill.style.background = colors[s-1] || '#f05050';
+  hint.textContent = pw ? (labels[s-1]||'Très faible') : 'Min. 6 caractères';
+  hint.style.color = s >= 3 ? 'var(--green)' : s >= 2 ? 'var(--amber)' : 'var(--red)';
+}
+
+function validateConfig() {
+  const pass = document.getElementById('cfg-pass').value;
+  const pass2 = document.getElementById('cfg-pass2').value;
+  const err = document.getElementById('cfg-err');
+  err.classList.remove('show');
+  if (!document.getElementById('cfg-hostname').value.trim()) {
+    err.textContent = 'Le nom du serveur est requis'; err.classList.add('show'); return false;
+  }
+  if (pass.length < 6) {
+    err.textContent = 'Mot de passe trop court (minimum 6 caractères)'; err.classList.add('show'); return false;
+  }
+  if (pass !== pass2) {
+    err.textContent = 'Les mots de passe ne correspondent pas'; err.classList.add('show'); return false;
+  }
+  return true;
+}
+
+// ── Installation ──────────────────────────────────────────────────────────────
+async function startInstall() {
+  const data = {
+    disk: selectedDisk,
+    hostname: document.getElementById('cfg-hostname').value || 'gravity-nas',
+    username: document.getElementById('cfg-user').value || 'gravity',
+    password: document.getElementById('cfg-pass').value,
+    timezone: document.getElementById('cfg-tz').value
+  };
+  await fetch('/api/install/start', {
+    method:'POST', credentials:'include',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(data)
+  });
+  pollInterval = setInterval(pollStatus, 1500);
+}
+
+// Step → UI row mapping
+const stepMap = {1:0, 2:1, 3:2, 4:2, 5:3, 6:4, 7:5};
+
+async function pollStatus() {
+  try {
+    const [sr, lr] = await Promise.all([
+      fetch('/api/install/status', {credentials:'include'}).then(r=>r.json()),
+      fetch('/api/install/logs',   {credentials:'include'}).then(r=>r.json())
+    ]);
+
+    // Barre globale
+    document.getElementById('big-fill').style.width = sr.progress + '%';
+    document.getElementById('pct-txt').textContent = sr.progress + '% — ' + sr.stepName;
+
+    // Lignes de progression
+    const activeRow = stepMap[sr.step] ?? -1;
+    for (let i = 0; i < 6; i++) {
+      const ico = document.getElementById('pi'+i);
+      const lbl = document.getElementById('pl'+i);
+      const chk = document.getElementById('pc'+i);
+      if (sr.error) {
+        if (i === activeRow) { ico.className='prog-ico error'; lbl.className='prog-label'; }
+      } else if (i < activeRow) {
+        ico.className='prog-ico done'; ico.textContent='✓';
+        lbl.className='prog-label done'; chk.className='prog-check show';
+      } else if (i === activeRow) {
+        ico.className='prog-ico active';
+        lbl.className='prog-label active';
+      }
+    }
+
+    // Log terminal
+    if (lr.log) {
+      const box = document.getElementById('log-box');
+      const lines = lr.log.trim().split('\n');
+      box.textContent = lines.slice(-8).join('\n');
+      box.scrollTop = box.scrollHeight;
+    }
+
+    // Terminé
+    if (sr.done) {
+      clearInterval(pollInterval);
+      if (sr.error) {
+        document.getElementById('install-err').textContent = '❌ Erreur : ' + sr.error;
+        document.getElementById('install-err').classList.add('show');
+        document.getElementById('pct-txt').textContent = 'Installation échouée';
+      } else {
+        showSuccess();
+      }
+    }
+  } catch {}
+}
+
+function showSuccess() {
+  const hostname = document.getElementById('cfg-hostname').value || 'gravity-nas';
+  const user = document.getElementById('cfg-user').value || 'gravity';
+  goStep(3);
+  document.getElementById('btn-next').style.display = 'none';
+  document.getElementById('s-webui').textContent  = 'http://' + hostname + '.local';
+  document.getElementById('s-ssh').textContent    = 'ssh ' + user + '@' + hostname + '.local';
+  document.getElementById('s-smb').textContent    = '\\\\' + hostname + '\\public';
+  document.getElementById('s-creds').textContent  = user + ' / (votre mot de passe)';
+  // Countdown reboot 15s
+  let t = 15;
+  rebootTimer = setInterval(() => {
+    t--;
+    document.getElementById('reboot-txt').textContent = 'Redémarrage automatique dans ' + t + 's...';
+    document.getElementById('reboot-fill').style.width = ((15-t)/15*100) + '%';
+    document.getElementById('reboot-fill').style.transition = 'width 1s linear';
+    if (t <= 0) { clearInterval(rebootTimer); doReboot(); }
+  }, 1000);
+}
+
+async function doReboot() {
+  if (rebootTimer) clearInterval(rebootTimer);
+  document.getElementById('reboot-txt').textContent = 'Redémarrage en cours...';
+  document.querySelector('.btn-success').disabled = true;
+  await fetch('/api/install/reboot', {method:'POST', credentials:'include'});
+}
+</script>
+</body>
+</html>

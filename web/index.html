@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GravityOS</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#09090f;--surface:#13141f;--surface2:#1c1e2e;--surface3:#242638;
+  --border:rgba(255,255,255,0.07);--accent:#6c63ff;--accent2:#4f8ef7;
+  --accent3:#9d7bff;--text:#e8eaf6;--text2:#7b7fa8;--text3:#4a4d6a;
+  --green:#3dd68c;--amber:#f5a623;--red:#f05050;--cyan:#4dd9e0;
+  --r:12px;--rs:8px;--rx:4px;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;height:100vh;overflow:hidden;display:flex;flex-direction:column}
+
+/* ── TOPBAR ── */
+.topbar{height:48px;background:rgba(9,9,15,0.95);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:0;flex-shrink:0;backdrop-filter:blur(20px);position:relative;z-index:100}
+.logo-wrap{display:flex;align-items:center;gap:12px;margin-right:24px}
+.logo-img{height:28px;width:auto;object-fit:contain;filter:drop-shadow(0 0 12px rgba(108,99,255,0.5))}
+.logo-sep{width:1px;height:20px;background:var(--border);margin-right:24px}
+.topbar-nav{display:flex;gap:2px;flex:1}
+.tnav{padding:6px 14px;font-size:12.5px;color:var(--text2);border-radius:var(--rs);cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:6px;font-weight:500;border:1px solid transparent}
+.tnav:hover{color:var(--text);background:rgba(255,255,255,0.05)}
+.tnav.active{color:var(--accent3);background:rgba(108,99,255,0.12);border-color:rgba(108,99,255,0.2)}
+.topbar-right{display:flex;align-items:center;gap:10px}
+.tpill{background:rgba(255,255,255,0.05);border:1px solid var(--border);border-radius:20px;padding:3px 12px;font-size:11px;color:var(--text2)}
+.tpill.green{color:var(--green);border-color:rgba(61,214,140,0.2);background:rgba(61,214,140,0.08)}
+.tdot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+#clock{font-size:12px;color:var(--text2);font-variant-numeric:tabular-nums}
+
+/* ── LAYOUT ── */
+.main{display:flex;flex:1;overflow:hidden}
+.sidebar{width:52px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;align-items:center;padding:8px 0;gap:2px;flex-shrink:0}
+.sicon{width:38px;height:38px;border-radius:var(--rs);display:flex;align-items:center;justify-content:center;font-size:16px;cursor:pointer;transition:all .15s;position:relative;color:var(--text3)}
+.sicon:hover{background:rgba(255,255,255,0.06);color:var(--text2)}
+.sicon.active{background:rgba(108,99,255,0.15);color:var(--accent3)}
+.sicon.active::after{content:'';position:absolute;right:-1px;top:50%;transform:translateY(-50%);width:2px;height:18px;background:var(--accent);border-radius:2px 0 0 2px}
+.ssep{width:28px;height:1px;background:var(--border);margin:4px 0}
+.sspacer{flex:1}
+
+/* ── PANELS ── */
+.content{flex:1;overflow:hidden;position:relative}
+.panel{display:none;width:100%;height:100%;overflow-y:auto;padding:24px}
+.panel.active{display:block}
+.ph{font-size:18px;font-weight:600;letter-spacing:-.4px;margin-bottom:4px}
+.ps{font-size:12px;color:var(--text2);margin-bottom:20px}
+
+/* ── CARDS ── */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:18px}
+.card-title{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:6px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.gap{gap:14px;display:flex;flex-direction:column}
+
+/* ── STAT CARDS ── */
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px;position:relative;overflow:hidden}
+.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
+.stat.blue::before{background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.stat.purple::before{background:linear-gradient(90deg,var(--accent3),var(--accent))}
+.stat.green::before{background:var(--green)}
+.stat.amber::before{background:var(--amber)}
+.stat-lbl{font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px}
+.stat-val{font-size:26px;font-weight:700;letter-spacing:-1px;line-height:1}
+.stat-unit{font-size:13px;font-weight:400;color:var(--text2);margin-left:2px}
+.stat-bar{height:3px;background:rgba(255,255,255,0.06);border-radius:2px;margin-top:10px;overflow:hidden}
+.stat-fill{height:100%;border-radius:2px;transition:width 1s}
+
+/* ── TABLES ── */
+table{width:100%;border-collapse:collapse}
+th{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;padding:0 14px 10px;text-align:left;font-weight:600}
+td{padding:10px 14px;border-top:1px solid rgba(255,255,255,0.04);font-size:12.5px}
+tr:hover td{background:rgba(255,255,255,0.02)}
+.mono{font-family:'SF Mono',monospace;font-size:11px}
+
+/* ── BADGES ── */
+.badge{font-size:10px;padding:2px 8px;border-radius:20px;font-weight:500;display:inline-flex;align-items:center;gap:4px}
+.bg{background:rgba(61,214,140,.12);color:var(--green)}
+.br{background:rgba(240,80,80,.12);color:var(--red)}
+.ba{background:rgba(245,166,35,.12);color:var(--amber)}
+.bb{background:rgba(79,142,247,.12);color:var(--accent2)}
+.bx{background:rgba(255,255,255,.06);color:var(--text2)}
+
+/* ── BUTTONS ── */
+.btn{padding:5px 14px;border-radius:var(--rs);border:1px solid var(--border);background:rgba(255,255,255,.06);color:var(--text);font-size:12px;cursor:pointer;transition:all .15s;display:inline-flex;align-items:center;gap:5px}
+.btn:hover{background:rgba(255,255,255,.1)}
+.btn-primary{background:rgba(108,99,255,.2);border-color:rgba(108,99,255,.35);color:var(--accent3)}
+.btn-primary:hover{background:rgba(108,99,255,.3)}
+.btn-danger{background:rgba(240,80,80,.1);border-color:rgba(240,80,80,.25);color:var(--red)}
+
+/* ── INPUTS ── */
+input[type=text],input[type=password],select{background:var(--surface2);border:1px solid var(--border);border-radius:var(--rs);padding:7px 12px;font-size:13px;color:var(--text);outline:none;transition:border .15s}
+input[type=text]:focus,input[type=password]:focus,select:focus{border-color:rgba(108,99,255,.4)}
+select option{background:var(--surface2)}
+
+/* ── TOGGLE ── */
+.toggle{width:36px;height:20px;border-radius:10px;cursor:pointer;position:relative;transition:background .2s;flex-shrink:0}
+.toggle.on{background:var(--accent)}
+.toggle.off{background:rgba(255,255,255,.12)}
+.toggle::after{content:'';position:absolute;top:3px;width:14px;height:14px;background:#fff;border-radius:50%;transition:left .2s;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+.toggle.on::after{left:19px}
+.toggle.off::after{left:3px}
+
+/* ── DISK / SERVICE ROWS ── */
+.drow{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.drow:last-child{border-bottom:none}
+.dico{font-size:22px;flex-shrink:0}
+.dinfo{flex:1}
+.dname{font-size:13px;font-weight:500}
+.dsub{font-size:11px;color:var(--text2);margin-top:2px}
+.dbar{height:3px;background:rgba(255,255,255,.06);border-radius:2px;margin-top:5px;overflow:hidden}
+
+/* ── NET GRAPH ── */
+canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
+
+/* ── PROXY ROWS ── */
+.prow{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.prow:last-child{border-bottom:none}
+.pdomain{font-size:13px;font-weight:500;color:var(--accent2)}
+.pupstream{font-size:11px;color:var(--text2);margin-top:2px;font-family:monospace}
+
+/* ── VM PANEL ── */
+.vm-row{display:grid;grid-template-columns:2fr 1fr 1fr 80px 80px auto;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)}
+.vm-row:last-child{border-bottom:none}
+.vm-name{font-weight:600;font-size:13px}
+.vm-info{font-size:11px;color:var(--text2);margin-top:2px}
+
+/* ── TERMINAL ── */
+#terminal-frame{width:100%;height:calc(100vh - 130px);border:none;border-radius:var(--r)}
+
+/* ── NOTIF ── */
+.notif{position:fixed;bottom:20px;right:20px;background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--r);padding:14px 18px;min-width:260px;z-index:999;transform:translateX(120%);transition:transform .3s;box-shadow:0 8px 30px rgba(0,0,0,.4)}
+.notif.show{transform:translateX(0)}
+.notif-t{font-weight:600;font-size:13px;margin-bottom:3px}
+.notif-b{font-size:12px;color:var(--text2)}
+
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.08);border-radius:2px}
+</style>
+</head>
+<body>
+
+<!-- TOPBAR -->
+<div class="topbar">
+  <div class="logo-wrap">
+    <img src="/gravity-logo.png" class="logo-img" alt="Gravity" onerror="this.replaceWith(document.createTextNode('⚡ GravityOS'))">
+  </div>
+  <div class="logo-sep"></div>
+  <div class="topbar-nav">
+    <div class="tnav active" id="tnav-dash"    onclick="nav('dash')">   🏠 Dashboard</div>
+    <div class="tnav"        id="tnav-storage" onclick="nav('storage')">🖴 Stockage</div>
+    <div class="tnav"        id="tnav-shares"  onclick="nav('shares')"> 🔗 Partages</div>
+    <div class="tnav"        id="tnav-proxy"   onclick="nav('proxy')">  🌐 Proxy</div>
+    <div class="tnav"        id="tnav-vms"     onclick="nav('vms')">    🖥️ VMs</div>
+    <div class="tnav"        id="tnav-docker"  onclick="nav('docker')"> 🐳 Docker</div>
+    <div class="tnav"        id="tnav-updates" onclick="nav('updates')">🔄 Mises à jour</div>
+    <div class="tnav"        id="tnav-settings"onclick="nav('settings')">⚙️ Paramètres</div>
+  </div>
+  <div class="topbar-right">
+    <div class="tdot"></div>
+    <span class="tpill green">Opérationnel</span>
+    <span class="tpill" id="clock">--:--</span>
+    <button onclick="logout()" style="background:rgba(240,80,80,.1);border:1px solid rgba(240,80,80,.2);border-radius:8px;padding:4px 12px;font-size:11px;color:var(--red);cursor:pointer">⏻ Déconnexion</button>
+  </div>
+</div>
+
+<div class="main">
+<div class="sidebar">
+  <div class="sicon active" id="s-dash"    onclick="nav('dash')"    title="Dashboard">🏠</div>
+  <div class="sicon"        id="s-storage" onclick="nav('storage')" title="Stockage">🖴</div>
+  <div class="sicon"        id="s-shares"  onclick="nav('shares')"  title="Partages">🔗</div>
+  <div class="sicon"        id="s-proxy"   onclick="nav('proxy')"   title="Proxy">🌐</div>
+  <div class="ssep"></div>
+  <div class="sicon"        id="s-vms"     onclick="nav('vms')"     title="VMs KVM">🖥️</div>
+  <div class="sicon"        id="s-docker"  onclick="nav('docker')"  title="Docker">🐳</div>
+  <div class="ssep"></div>
+  <div class="sspacer"></div>
+  <div class="sicon"        id="s-updates"  onclick="nav('updates')"  title="Mises à jour">🔄</div>
+  <div class="sicon"        id="s-terminal" onclick="nav('terminal')" title="Terminal">⌨️</div>
+  <div class="sicon"        id="s-settings" onclick="nav('settings')" title="Paramètres">⚙️</div>
+</div>
+
+<div class="content">
+
+<!-- DASHBOARD -->
+<div class="panel active" id="panel-dash">
+  <div class="ph">Dashboard</div>
+  <div class="ps">GravityOS v1.0 · Debian 12 Bookworm · <span id="uptime-txt">chargement...</span></div>
+
+  <!-- Bandeau Live CD -->
+  <div id="live-banner" style="display:none;background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.25);border-radius:12px;padding:14px 18px;margin-bottom:16px;align-items:center;gap:16px;flex-wrap:wrap">
+    <div style="flex:1">
+      <div style="font-weight:600;color:var(--amber);margin-bottom:4px">⚠️ Mode Live CD — GravityOS n'est pas installé sur ce disque</div>
+      <div style="font-size:12px;color:var(--text2)">Les VMs KVM et la persistance des données ne sont pas disponibles. Installez GravityOS sur un disque pour les activer.</div>
+    </div>
+    <button class="btn btn-primary" onclick="window.location.href='/install'" style="flex-shrink:0">💾 Installer GravityOS →</button>
+  </div>
+
+  <div class="grid4" style="margin-bottom:14px">
+    <div class="stat blue"><div class="stat-lbl">CPU</div><div class="stat-val" id="d-cpu">–<span class="stat-unit">%</span></div><div class="stat-bar"><div class="stat-fill" id="d-cpu-bar" style="width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div></div>
+    <div class="stat purple"><div class="stat-lbl">RAM</div><div class="stat-val" id="d-ram">–<span class="stat-unit">%</span></div><div class="stat-bar"><div class="stat-fill" id="d-ram-bar" style="width:0%;background:var(--accent3)"></div></div></div>
+    <div class="stat green"><div class="stat-lbl">Réseau ↓</div><div class="stat-val" id="d-net">–<span class="stat-unit">Mo/s</span></div><div class="stat-bar"><div class="stat-fill" id="d-net-bar" style="width:0%;background:var(--green)"></div></div></div>
+    <div class="stat amber"><div class="stat-lbl">Température</div><div class="stat-val" id="d-temp">–<span class="stat-unit">°C</span></div><div class="stat-bar"><div class="stat-fill" id="d-temp-bar" style="width:0%;background:var(--amber)"></div></div></div>
+  </div>
+  <div class="grid2" style="margin-bottom:14px">
+    <div class="card">
+      <div class="card-title">🖴 Stockage</div>
+      <div id="disk-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">🚀 Services</div>
+      <div class="drow"><span class="dico">🔗</span><div class="dinfo"><div class="dname">Samba (SMB)</div><div class="dsub">Port 445</div></div><span class="badge bg">Actif</span></div>
+      <div class="drow"><span class="dico">📁</span><div class="dinfo"><div class="dname">NFS</div><div class="dsub">Port 2049</div></div><span class="badge bg">Actif</span></div>
+      <div class="drow"><span class="dico">📤</span><div class="dinfo"><div class="dname">FTP / FTPS</div><div class="dsub">Port 21</div></div><span class="badge bg">Actif</span></div>
+      <div class="drow"><span class="dico">🌐</span><div class="dinfo"><div class="dname">Nginx Proxy</div><div class="dsub">Port 80/443</div></div><span class="badge bg">Actif</span></div>
+      <div class="drow"><span class="dico">🐳</span><div class="dinfo"><div class="dname">Docker</div><div class="dsub">driver: vfs</div></div><span class="badge bg">Actif</span></div>
+    </div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between"><span>🖥️ Machines virtuelles</span><button class="btn" style="font-size:11px" onclick="nav('vms')">Gérer →</button></div>
+      <div id="dash-vms"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between"><span>🐳 Conteneurs Docker</span><button class="btn" style="font-size:11px" onclick="nav('docker')">Gérer →</button></div>
+      <div id="dash-docker"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- STOCKAGE -->
+<div class="panel" id="panel-storage">
+  <div class="ph">Stockage</div>
+  <div class="ps">Disques physiques, partitions et systèmes de fichiers</div>
+  <div class="gap">
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>🗄️ Disques détectés</span>
+        <button class="btn" onclick="loadDisks()">↻ Actualiser</button>
+      </div>
+      <table><thead><tr><th>Device</th><th>Taille</th><th>Modèle</th><th>Type</th><th>S.M.A.R.T.</th><th></th></tr></thead>
+      <tbody id="disk-table"><tr><td colspan="6" style="color:var(--text3)">Chargement...</td></tr></tbody></table>
+    </div>
+    <div class="card">
+      <div class="card-title">📊 Utilisation des volumes</div>
+      <div id="fs-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">⚙️ RAID (mdstat)</div>
+      <pre id="mdstat" style="font-size:11px;font-family:monospace;color:var(--text2);white-space:pre-wrap">Chargement...</pre>
+    </div>
+  </div>
+</div>
+
+<!-- PARTAGES -->
+<div class="panel" id="panel-shares">
+  <div class="ph">Partages réseau</div>
+  <div class="ps">SMB/CIFS, NFS et FTP</div>
+  <div class="gap">
+    <!-- Bandeau info connexion SMB -->
+    <div style="background:rgba(79,142,247,.07);border:1px solid rgba(79,142,247,.2);border-radius:10px;padding:12px 16px;font-size:12px;color:var(--text2)">
+      🔗 <strong style="color:var(--text)">Connexion Windows/Mac :</strong>
+      <span id="smb-connect-info">Chargement...</span>
+      <span style="margin-left:16px;font-size:11px">· Identifiants : utilisateur gravity / votre mot de passe</span>
+    </div>
+    <!-- SMB -->
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>🔗 Partages Samba (SMB)</span>
+        <button class="btn btn-primary" onclick="showAddSmb()">+ Ajouter</button>
+      </div>
+      <table><thead><tr><th>Nom</th><th>Chemin</th><th>Accès</th><th>Invité</th><th></th></tr></thead>
+      <tbody id="smb-table"></tbody></table>
+      <div id="smb-form" style="display:none;margin-top:14px">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:end">
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Nom</div><input type="text" id="smb-name" placeholder="media" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:13px;outline:none"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Chemin</div><input type="text" id="smb-path" placeholder="/srv/shares/media" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:13px;outline:none"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Invité</div>
+            <select id="smb-guest" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;color:var(--text);font-size:13px;outline:none"><option value="no">Non</option><option value="yes">Oui</option></select></div>
+          <button class="btn btn-primary" onclick="addSmb()">Créer</button>
+        </div>
+      </div>
+    </div>
+    <!-- NFS -->
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>📁 Exports NFS</span>
+        <button class="btn btn-primary" onclick="showAddNfs()">+ Ajouter</button>
+      </div>
+      <table><thead><tr><th>Chemin</th><th>Clients</th><th>Options</th><th></th></tr></thead>
+      <tbody id="nfs-table"></tbody></table>
+      <div id="nfs-form" style="display:none;margin-top:14px">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;align-items:end">
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Chemin</div><input type="text" id="nfs-path" placeholder="/srv/shares/media"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Clients</div><input type="text" id="nfs-clients" placeholder="192.168.0.0/16"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Options</div><input type="text" id="nfs-opts" placeholder="rw,sync,no_subtree_check"></div>
+          <button class="btn btn-primary" onclick="addNfs()">Créer</button>
+        </div>
+      </div>
+    </div>
+    <!-- FTP -->
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>📤 FTP / FTPS</span>
+        <button class="btn" id="ftp-toggle-btn" onclick="toggleFtp()">⏹ Arrêter</button>
+      </div>
+      <div style="display:flex;gap:20px;align-items:center;padding:8px 0">
+        <div><div style="font-size:11px;color:var(--text2)">Statut</div><span id="ftp-status" class="badge bg" style="margin-top:4px;display:inline-flex">Actif</span></div>
+        <div><div style="font-size:11px;color:var(--text2)">Port</div><div style="font-size:13px;margin-top:4px">21 (FTP) · 21/TLS (FTPS)</div></div>
+        <div><div style="font-size:11px;color:var(--text2)">Accès anonyme</div><div class="toggle off" style="margin-top:4px" id="ftp-anon"></div></div>
+        <div><div style="font-size:11px;color:var(--text2)">Racine</div><div style="font-size:13px;margin-top:4px;font-family:monospace">/srv/shares</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- PROXY -->
+<div class="panel" id="panel-proxy">
+  <div class="ph">Reverse Proxy</div>
+  <div class="ps">Nginx — Redirections HTTP/HTTPS avec Let's Encrypt automatique</div>
+  <div class="card">
+    <div class="card-title" style="justify-content:space-between">
+      <span>🌐 Hôtes proxy</span>
+      <button class="btn btn-primary" onclick="toggleProxyForm()">+ Ajouter un hôte</button>
+    </div>
+    <div id="proxy-form" style="display:none;margin-bottom:16px;padding:14px;background:var(--surface2);border-radius:var(--rs)">
+      <div style="display:grid;grid-template-columns:1fr 1fr auto auto auto;gap:10px;align-items:end">
+        <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Domaine</div><input type="text" id="px-domain" placeholder="jellyfin.example.com"></div>
+        <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Upstream</div><input type="text" id="px-upstream" placeholder="localhost:8096"></div>
+        <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">HTTPS</div><div class="toggle off" id="px-ssl" onclick="this.classList.toggle('on');this.classList.toggle('off')"></div></div>
+        <button class="btn btn-primary" onclick="addProxy()">Créer</button>
+        <button class="btn" onclick="toggleProxyForm()">Annuler</button>
+      </div>
+    </div>
+    <div id="proxy-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+  </div>
+</div>
+
+<!-- VMs -->
+<div class="panel" id="panel-vms">
+  <div class="ph">Machines virtuelles</div>
+  <div class="ps">KVM natif via libvirt — Passthrough USB, réseaux virtuels</div>
+  <div class="gap">
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>🖥️ VMs</span>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="nav('isos')">📀 ISOs</button>
+          <button class="btn btn-primary" onclick="toggleVmForm()">+ Nouvelle VM</button>
+        </div>
+      </div>
+      <!-- Formulaire création VM -->
+      <div id="vm-form" style="display:none;margin-bottom:16px;padding:14px;background:var(--surface2);border-radius:var(--rs)">
+        <div style="display:grid;grid-template-columns:1fr 80px 100px 100px 1fr auto;gap:10px;align-items:end">
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Nom</div><input type="text" id="vm-name" placeholder="debian-vm"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">vCPUs</div><input type="text" id="vm-cpu" placeholder="2" style="width:100%"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">RAM (Mo)</div><input type="text" id="vm-mem" placeholder="2048" style="width:100%"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Disque (Go)</div><input type="text" id="vm-disk" placeholder="20" style="width:100%"></div>
+          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">ISO</div>
+            <select id="vm-iso" style="width:100%"><option value="">Sans ISO</option></select></div>
+          <button class="btn btn-primary" onclick="createVm()" style="height:34px">Créer</button>
+        </div>
+      </div>
+      <div id="vm-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+    </div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title">🔌 Périphériques USB</div>
+        <div id="usb-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+      </div>
+      <div class="card">
+        <div class="card-title">🔀 Réseaux libvirt</div>
+        <div id="net-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- DOCKER -->
+<div class="panel" id="panel-docker">
+  <div class="ph">Docker</div>
+  <div class="ps">Conteneurs en cours d'exécution</div>
+  <div class="card">
+    <div class="card-title" style="justify-content:space-between">
+      <span>📦 Conteneurs</span>
+      <button class="btn" onclick="loadContainers()">↻</button>
+    </div>
+    <table><thead><tr><th>Nom</th><th>Image</th><th>Ports</th><th>État</th><th>Actions</th></tr></thead>
+    <tbody id="docker-table"><tr><td colspan="5" style="color:var(--text3)">Chargement...</td></tr></tbody></table>
+  </div>
+</div>
+
+<!-- RÉSEAU -->
+<div class="panel" id="panel-network" style="display:none"></div>
+
+<!-- MISES À JOUR -->
+<div class="panel" id="panel-updates">
+  <div class="ph">Mises à jour</div>
+  <div class="ps">Système Debian et GravityOS</div>
+  <div class="gap" style="max-width:700px">
+    <!-- Système -->
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>🐧 Système Debian</span>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="checkSysUpdate()">🔍 Vérifier</button>
+          <button class="btn btn-primary" id="btn-sys-update" onclick="startSysUpdate()" disabled>⬆ Mettre à jour</button>
+        </div>
+      </div>
+      <div id="sys-update-status" style="font-size:13px;color:var(--text2);margin-bottom:12px">Cliquez sur Vérifier pour chercher les mises à jour disponibles.</div>
+      <div id="sys-pkg-list" style="display:none;max-height:120px;overflow-y:auto;background:var(--surface2);border-radius:8px;padding:10px;font-size:11px;font-family:monospace;color:var(--text2);margin-bottom:12px"></div>
+      <div id="sys-update-log" style="display:none;background:#000;border-radius:8px;padding:12px;font-size:11px;font-family:monospace;color:#7aff7a;max-height:160px;overflow-y:auto;white-space:pre-wrap"></div>
+    </div>
+    <!-- GravityOS -->
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>🪐 GravityOS WebUI</span>
+        <div style="display:flex;gap:8px">
+          <button class="btn" onclick="checkGravityUpdate()">🔍 Vérifier</button>
+          <button class="btn btn-primary" id="btn-gravity-update" onclick="startGravityUpdate()" disabled>⬆ Mettre à jour</button>
+        </div>
+      </div>
+      <div id="gravity-update-status" style="font-size:13px;color:var(--text2);margin-bottom:12px">Vérification des mises à jour GravityOS via git.</div>
+      <div id="gravity-pkg-list" style="display:none;max-height:120px;overflow-y:auto;background:var(--surface2);border-radius:8px;padding:10px;font-size:11px;font-family:monospace;color:var(--text2);margin-bottom:12px"></div>
+      <div id="gravity-update-log" style="display:none;background:#000;border-radius:8px;padding:12px;font-size:11px;font-family:monospace;color:#7aff7a;max-height:160px;overflow-y:auto;white-space:pre-wrap"></div>
+    </div>
+  </div>
+</div>
+
+<!-- TERMINAL -->
+<div class="panel" id="panel-terminal" style="padding:0">
+  <iframe id="terminal-frame" src="/terminal-redirect" class="terminal-frame" style="width:100%;height:calc(100vh - 97px);border:none"></iframe>
+</div>
+
+<!-- PARAMÈTRES -->
+<div class="panel" id="panel-settings">
+  <div class="ph">Paramètres</div>
+  <div class="ps">Système, installation et sécurité</div>
+  <div class="gap" style="max-width:680px">
+
+    <div class="card">
+      <div class="card-title">🌐 Réseau</div>
+      <div id="iface-info"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+      <div style="display:flex;gap:24px;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+        <div><div style="font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">↓ Réception</div><div style="font-size:20px;font-weight:700;color:var(--accent2)" id="rx-speed">– Mo/s</div></div>
+        <div><div style="font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">↑ Émission</div><div style="font-size:20px;font-weight:700;color:var(--green)" id="tx-speed">– Mo/s</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">⚙️ Système</div>
+      <div class="drow" style="justify-content:space-between"><div><div class="dname">Nom du serveur</div><div class="dsub" id="set-hostname">gravity-nas.local</div></div><button class="btn">Modifier</button></div>
+      <div class="drow" style="justify-content:space-between"><div><div class="dname">Fuseau horaire</div><div class="dsub">Europe/Paris</div></div>
+        <select style="font-size:12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);outline:none">
+          <option>Europe/Paris</option><option>UTC</option><option>Europe/London</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔑 Changer les identifiants WebUI</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end">
+        <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Utilisateur</div>
+          <input type="text" id="chg-user" value="gravity" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:13px;outline:none"></div>
+        <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Nouveau mot de passe</div>
+          <input type="password" id="chg-pass" placeholder="••••••••" style="width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;color:var(--text);font-size:13px;outline:none"></div>
+        <button class="btn btn-primary" onclick="changePass()">Appliquer</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔒 Sécurité</div>
+      <div class="drow" style="justify-content:space-between"><div><div class="dname">Accès SSH</div><div class="dsub">Port 22</div></div><div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off')"></div></div>
+      <div class="drow" style="justify-content:space-between"><div><div class="dname">Pare-feu (ufw)</div><div class="dsub">SMB / NFS / FTP / HTTP / SSH</div></div><div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off')"></div></div>
+      <div class="drow" style="justify-content:space-between"><div><div class="dname">Fail2ban</div><div class="dsub">Bannissement automatique des IPs suspectes</div></div><div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off')"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">⚡ Actions</div>
+      <div style="display:flex;gap:10px">
+        <button class="btn" onclick="if(confirm('Redémarrer le serveur ?'))api('POST','/api/system/reboot')">↺ Redémarrer</button>
+        <button class="btn btn-danger" onclick="if(confirm('Éteindre le serveur ?'))api('POST','/api/system/shutdown')">⏻ Éteindre</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🪐 À propos</div>
+      <div class="drow"><div><div class="dname">GravityOS v1.0.0</div><div class="dsub">Debian 12 Bookworm · KVM + Docker + Nginx + SMB/NFS/FTP</div></div></div>
+    </div>
+
+  </div>
+</div>
+
+</div><!-- content -->
+</div><!-- main -->
+
+<div class="notif" id="notif"><div class="notif-t" id="notif-t"></div><div class="notif-b" id="notif-b"></div></div>
+
+<script>
+const TOKEN = localStorage.getItem('gravity-token') || 'gravity-default-token';
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+function nav(id) {
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tnav').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.sicon').forEach(s=>s.classList.remove('active'));
+  document.getElementById('panel-'+id)?.classList.add('active');
+  document.getElementById('tnav-'+id)?.classList.add('active');
+  document.getElementById('s-'+id)?.classList.add('active');
+  const loaders = {dash:loadDash,storage:loadStorage,shares:loadShares,proxy:loadProxy,vms:loadVms,docker:loadContainers,updates:loadUpdates,settings:loadSettings};
+  loaders[id]?.();
+  if(id==='terminal') document.getElementById('terminal-frame').src='http://'+location.hostname+':4200';
+}
+
+// ── API ───────────────────────────────────────────────────────────────────────
+async function api(method, url, body) {
+  try {
+    const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body:body?JSON.stringify(body):undefined, credentials:'include'});
+    if (r.status === 401) { window.location.href = '/login.html'; return null; }
+    return await r.json();
+  } catch(e) { return null; }
+}
+
+// ── Logout ────────────────────────────────────────────────────────────────────
+async function logout() {
+  await api('POST','/api/auth/logout');
+  window.location.href = '/login.html';
+}
+
+// ── Clock ─────────────────────────────────────────────────────────────────────
+function tick(){const n=new Date();document.getElementById('clock').textContent=String(n.getHours()).padStart(2,'0')+':'+String(n.getMinutes()).padStart(2,'0')}
+tick();setInterval(tick,10000);
+
+// ── WebSocket métriques ───────────────────────────────────────────────────────
+const pts=Array.from({length:50},()=>0);
+let ws;
+function connectWs(){
+  ws=new WebSocket('ws://'+location.host);
+  ws.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    if(d.type!=='metrics')return;
+    document.getElementById('d-cpu').innerHTML=d.cpu+'<span class="stat-unit">%</span>';
+    document.getElementById('d-cpu-bar').style.width=d.cpu+'%';
+    document.getElementById('d-ram').innerHTML=d.ram.pct+'<span class="stat-unit">%</span>';
+    document.getElementById('d-ram-bar').style.width=d.ram.pct+'%';
+    const mb=Math.round((d.net.rx||0)/1048576);
+    document.getElementById('d-net').innerHTML=mb+'<span class="stat-unit">Mo/s</span>';
+    document.getElementById('d-net-bar').style.width=Math.min(mb,200)/2+'%';
+    document.getElementById('d-temp').innerHTML=(d.temp||0)+'<span class="stat-unit">°C</span>';
+    document.getElementById('d-temp-bar').style.width=Math.min(d.temp,100)+'%';
+    if(document.getElementById('rx-speed')) document.getElementById('rx-speed').textContent=mb+' Mo/s';
+    const tx=Math.round((d.net.tx||0)/1048576);
+    if(document.getElementById('tx-speed')) document.getElementById('tx-speed').textContent=tx+' Mo/s';
+    pts.shift(); pts.push(mb); drawGraph();
+    if(d.disks?.length) renderDashDisks(d.disks);
+  };
+  ws.onclose=()=>setTimeout(connectWs,3000);
+}
+connectWs();
+
+function drawGraph(){
+  const c=document.getElementById('netgraph');
+  if(!c)return;
+  const ctx=c.getContext('2d');
+  c.width=c.offsetWidth||400; c.height=60;
+  const max=Math.max(...pts,1);
+  ctx.clearRect(0,0,c.width,c.height);
+  ctx.beginPath();
+  pts.forEach((v,i)=>{const x=i*(c.width/(pts.length-1)),y=c.height-(v/max)*(c.height*.85);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+  ctx.strokeStyle='rgba(79,142,247,.8)';ctx.lineWidth=1.5;ctx.stroke();
+  ctx.lineTo(c.width,c.height);ctx.lineTo(0,c.height);
+  const g=ctx.createLinearGradient(0,0,0,c.height);g.addColorStop(0,'rgba(79,142,247,.25)');g.addColorStop(1,'rgba(79,142,247,.02)');
+  ctx.fillStyle=g;ctx.fill();
+}
+
+function renderDashDisks(disks){
+  const el=document.getElementById('disk-list');if(!el)return;
+  el.innerHTML=disks.slice(0,4).map(d=>`<div class="drow"><span class="dico">💿</span><div class="dinfo"><div class="dname">${d.fs}</div><div class="dsub">${fmt(d.used)} / ${fmt(d.size)}</div><div class="dbar"><div style="width:${d.pct}%;height:100%;background:${d.pct>85?'var(--red)':d.pct>60?'var(--amber)':'var(--accent)'};border-radius:2px"></div></div></div><span style="font-size:13px;font-weight:600">${d.pct}%</span></div>`).join('');
+}
+
+function fmt(b){if(!b)return'0 o';const u=['o','Ko','Mo','Go','To'],i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i];}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+async function loadDash(){
+  const s=await api('GET','/api/system');
+  if(s){
+    const h=Math.floor((s.uptime||0)/3600),d=Math.floor(h/24);
+    document.getElementById('uptime-txt').textContent=`Uptime: ${d}j ${h%24}h · ${s.hostname||'gravity-nas'}`;
+    if(s.isLive){
+      document.getElementById('live-banner').style.display='flex';
+    }
+  }
+  // Charger VMs dashboard
+  loadDashVms();
+  // Charger Docker dashboard
+  loadDashDocker();
+}
+
+async function loadDashVms(){
+  const el=document.getElementById('dash-vms');
+  const d=await api('GET','/api/vms');
+  if(!d||d.isLive){el.innerHTML='<div style="font-size:12px;color:var(--text3);padding:6px 0">Disponible après installation sur disque</div>';return;}
+  if(!d.vms?.length){el.innerHTML='<div style="font-size:12px;color:var(--text3);padding:6px 0">Aucune VM — créez-en une dans l\'onglet VMs</div>';return;}
+  el.innerHTML=d.vms.slice(0,4).map(v=>`<div class="drow"><span class="dico">🖥️</span><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">${v.vcpus||'?'} vCPU · ${v.memMB||'?'} Mo</div></div><span class="badge ${v.state?.includes('run')?'bg':'br'}">${v.state?.includes('run')?'Running':'Stopped'}</span></div>`).join('');
+}
+
+async function loadDashDocker(){
+  const el=document.getElementById('dash-docker');
+  const cs=await api('GET','/api/containers');
+  if(!cs?.length){el.innerHTML='<div style="font-size:12px;color:var(--text3);padding:6px 0">Aucun conteneur Docker</div>';return;}
+  el.innerHTML=cs.slice(0,5).map(c=>`<div class="drow"><span class="dico">🐳</span><div class="dinfo"><div class="dname">${c.name||c.id}</div><div class="dsub">${c.image}</div></div><span class="badge ${c.state==='running'?'bg':'br'}">${c.state==='running'?'Actif':'Arrêté'}</span></div>`).join('');
+}
+
+
+
+// ── Stockage ──────────────────────────────────────────────────────────────────
+async function loadStorage(){
+  const [d,md]=await Promise.all([api('GET','/api/disks'),api('GET','/api/mdstat')]);
+  if(d?.devices) document.getElementById('disk-table').innerHTML=d.devices.filter(x=>x.type==='disk').map(dev=>`<tr><td><span class="mono">/dev/${dev.name}</span></td><td>${dev.size||'?'}</td><td style="color:var(--text2);font-size:11px">${dev.model||'—'}</td><td><span class="badge bx">${dev.protocol||dev.type}</span></td><td><span class="badge bg">OK</span></td><td><button class="btn" onclick="toast('S.M.A.R.T.','Analyse de /dev/${dev.name}...')">Analyser</button></td></tr>`).join('')||'<tr><td colspan="6" style="color:var(--text3)">Aucun disque</td></tr>';
+  if(d?.filesystems) document.getElementById('fs-list').innerHTML=d.filesystems.map(f=>`<div class="drow"><span class="dico">${f.fs.includes('tmp')?'🗃️':'💿'}</span><div class="dinfo"><div class="dname">${f.fs}</div><div class="dsub">${fmt(f.used)} / ${fmt(f.size)}</div><div class="dbar"><div style="width:${f.pct}%;height:100%;background:${f.pct>85?'var(--red)':f.pct>60?'var(--amber)':'var(--accent)'};border-radius:2px"></div></div></div><span style="font-size:13px;font-weight:600;min-width:36px;text-align:right">${f.pct}%</span></div>`).join('');
+  if(md?.raw) document.getElementById('mdstat').textContent=md.raw||'Aucun RAID';
+}
+
+// ── Partages ──────────────────────────────────────────────────────────────────
+async function loadShares(){
+  const [smb,nfs,ftp,smbSt]=await Promise.all([api('GET','/api/smb/shares'),api('GET','/api/nfs/exports'),api('GET','/api/ftp/status'),api('GET','/api/smb/status')]);
+  if(smb) document.getElementById('smb-table').innerHTML=(smb.length?smb:[{name:'public',path:'/srv/shares/public',guest_ok:'yes',read_only:'no'},{name:'media',path:'/srv/shares/media',guest_ok:'no',read_only:'no'}]).map(s=>`<tr><td><strong>${s.name}</strong></td><td class="mono">${s.path||'—'}</td><td><span class="badge ${s.read_only==='yes'?'ba':'bg'}">${s.read_only==='yes'?'Lecture':'Lect./Écrit.'}</span></td><td><span class="badge ${s.guest_ok==='yes'?'bb':'bx'}">${s.guest_ok==='yes'?'Oui':'Non'}</span></td><td><button class="btn btn-danger" onclick="delSmb('${s.name}')">✕</button></td></tr>`).join('');
+  if(nfs) document.getElementById('nfs-table').innerHTML=(nfs.length?nfs:[{path:'/srv/shares/public',options:'*(rw,sync,no_subtree_check)'}]).map(e=>`<tr><td class="mono">${e.path}</td><td class="mono">${(e.options||'').split('(')[0]||'*'}</td><td class="mono" style="font-size:10px">${(e.options||'').match(/\((.+)\)/)?.[1]||e.options}</td><td><button class="btn btn-danger">✕</button></td></tr>`).join('');
+  if(ftp){document.getElementById('ftp-status').className='badge '+(ftp.active?'bg':'br');document.getElementById('ftp-status').textContent=ftp.active?'Actif':'Arrêté';document.getElementById('ftp-toggle-btn').textContent=ftp.active?'⏹ Arrêter':'▶ Démarrer';}
+  // Afficher info SMB pour connexion
+  if(smbSt&&document.getElementById('smb-connect-info')){
+    document.getElementById('smb-connect-info').textContent=`Connexion Windows : ${smbSt.path||'\\\\'+smbSt.ip+'\\public'}  |  smbd: ${smbSt.smbd}  |  nmbd: ${smbSt.nmbd}`;
+  }
+}
+function showAddSmb(){const f=document.getElementById('smb-form');f.style.display=f.style.display==='none'?'block':'none'}
+function showAddNfs(){const f=document.getElementById('nfs-form');f.style.display=f.style.display==='none'?'block':'none'}
+async function addSmb(){const r=await api('POST','/api/smb/shares',{name:document.getElementById('smb-name').value,path:document.getElementById('smb-path').value,public:document.getElementById('smb-guest').value==='yes'});toast('SMB',r?.ok?'Partage créé ✓':r?.error||'Erreur');loadShares();}
+async function addNfs(){const r=await api('POST','/api/nfs/exports',{path:document.getElementById('nfs-path').value,clients:document.getElementById('nfs-clients').value,options:document.getElementById('nfs-opts').value});toast('NFS',r?.ok?'Export créé ✓':'Erreur');loadShares();}
+async function delSmb(n){if(confirm(`Supprimer le partage "${n}" ?`)){await api('DELETE','/api/smb/shares/'+n);loadShares();}}
+async function toggleFtp(){const r=await api('POST','/api/ftp/toggle');toast('FTP',r?.running?'FTP démarré':'FTP arrêté');loadShares();}
+
+// ── Proxy ─────────────────────────────────────────────────────────────────────
+async function loadProxy(){
+  const hosts=await api('GET','/api/proxy/hosts');
+  document.getElementById('proxy-list').innerHTML=(hosts?.length?hosts:[{domain:'nas.example.com',upstream:'localhost:4000',ssl:false}]).map(h=>`<div class="prow"><div><div class="pdomain">${h.ssl?'🔒 ':'🔓 '}${h.domain}</div><div class="pupstream">→ http://${h.upstream}</div></div><div style="display:flex;gap:8px;align-items:center"><span class="badge ${h.ssl?'bg':'bx'}">${h.ssl?'HTTPS':'HTTP'}</span><button class="btn btn-danger" onclick="delProxy('${h.name}')">✕</button></div></div>`).join('')||'<div style="color:var(--text3);font-size:12px">Aucun hôte configuré</div>';
+}
+function toggleProxyForm(){const f=document.getElementById('proxy-form');f.style.display=f.style.display==='none'?'block':'none'}
+async function addProxy(){const ssl=document.getElementById('px-ssl').classList.contains('on');const r=await api('POST','/api/proxy/hosts',{domain:document.getElementById('px-domain').value,upstream:document.getElementById('px-upstream').value,ssl});toast('Proxy',r?.ok?'Hôte créé ✓':'Erreur nginx');loadProxy();}
+async function delProxy(n){await api('DELETE','/api/proxy/hosts/'+n);toast('Proxy','Hôte supprimé');loadProxy();}
+
+// ── VMs ───────────────────────────────────────────────────────────────────────
+async function loadVms(){
+  const [d,usb,nets,isos]=await Promise.all([api('GET','/api/vms'),api('GET','/api/usb'),api('GET','/api/networks'),api('GET','/api/isos')]);
+  const vmEl=document.getElementById('vm-list');
+  if(d?.isLive){
+    vmEl.innerHTML=`<div style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);border-radius:10px;padding:16px;color:var(--amber);font-size:13px">⚠️ ${d.message}</div>`;
+  } else if(d?.vms?.length){
+    vmEl.innerHTML=`<div style="display:grid;grid-template-columns:2fr 60px 80px 80px auto;gap:10px;padding:0 0 8px;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px"><span>Nom</span><span>vCPUs</span><span>RAM</span><span>État</span><span>Actions</span></div>`
+      +d.vms.map(v=>`<div class="drow"><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">ID ${v.id||'—'}</div></div><div>${v.vcpus||'?'}</div><div>${v.memMB||'?'} Mo</div><span class="badge ${v.state?.includes('run')?'bg':v.state?.includes('shut')?'br':'ba'}">${v.state||'?'}</span><div style="display:flex;gap:6px">${v.state?.includes('run')?`<button class="btn" onclick="vmAction('${v.name}','stop')">⏹</button><button class="btn" onclick="vmAction('${v.name}','restart')">↺</button>`:`<button class="btn btn-primary" onclick="vmAction('${v.name}','start')">▶</button>`}<button class="btn btn-danger" onclick="if(confirm('Supprimer ${v.name} ?'))vmAction('${v.name}','delete')">✕</button></div></div>`).join('');
+  } else {
+    vmEl.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px 0">Aucune VM — créez-en une ci-dessus</div>';
+  }
+  if(usb?.length) document.getElementById('usb-list').innerHTML=usb.map(u=>`<div class="drow" style="gap:10px"><span class="dico">🔌</span><div class="dinfo"><div class="dname" style="font-size:12px">${u.name}</div><div class="dsub">${u.id}</div></div></div>`).join('');
+  else document.getElementById('usb-list').innerHTML='<div style="font-size:12px;color:var(--text3)">Aucun périphérique USB</div>';
+  if(nets?.length) document.getElementById('net-list').innerHTML=nets.map(n=>`<div class="drow" style="justify-content:space-between"><div><div class="dname" style="font-size:13px">${n.name}</div></div><span class="badge ${n.state==='active'?'bg':'bx'}">${n.state||'?'}</span></div>`).join('');
+  if(isos?.length){const sel=document.getElementById('vm-iso');sel.innerHTML='<option value="">Sans ISO</option>'+isos.map(i=>`<option value="${i.path}">${i.name} (${fmt(i.size)})</option>`).join('');}
+}
+async function vmAction(name,action){const url=action==='delete'?`/api/vms/${name}`:`/api/vms/${name}/${action}`;const method=action==='delete'?'DELETE':'POST';const r=await api(method,url);toast('VM',r?.ok?`${name}: ${action} ✓`:r?.error||'Erreur');loadVms();}
+function toggleVmForm(){const f=document.getElementById('vm-form');f.style.display=f.style.display==='none'?'block':'none'}
+async function createVm(){const r=await api('POST','/api/vms',{name:document.getElementById('vm-name').value,vcpus:parseInt(document.getElementById('vm-cpu').value)||2,memMB:parseInt(document.getElementById('vm-mem').value)||2048,diskGB:parseInt(document.getElementById('vm-disk').value)||20,iso:document.getElementById('vm-iso').value});toast('VM',r?.ok?'VM en cours de création...':r?.error||'Erreur');if(r?.ok)setTimeout(loadVms,2000);}
+
+// ── Docker ────────────────────────────────────────────────────────────────────
+async function loadContainers(){
+  const cs=await api('GET','/api/containers');
+  document.getElementById('docker-table').innerHTML=(cs||[]).map(c=>`<tr><td><strong>${c.name||c.id}</strong></td><td class="mono">${c.image}</td><td class="mono">${c.ports||'—'}</td><td><span class="badge ${c.state==='running'?'bg':c.state==='exited'?'br':'ba'}">${c.state}</span></td><td style="display:flex;gap:6px;padding:10px 14px">${c.state==='running'?`<button class="btn" onclick="cAction('${c.id}','stop')">⏹</button>`:`<button class="btn btn-primary" onclick="cAction('${c.id}','start')">▶</button>`}<button class="btn btn-danger" onclick="cAction('${c.id}','delete')">✕</button></td></tr>`).join('')||'<tr><td colspan="5" style="color:var(--text3)">Aucun conteneur</td></tr>';
+}
+async function cAction(id,action){const url=action==='delete'?`/api/containers/${id}`:`/api/containers/${id}/${action}`;await api(action==='delete'?'DELETE':'POST',url);toast('Docker','OK');loadContainers();}
+
+// ── Changer mot de passe ──────────────────────────────────────────────────────
+async function changePass(){
+  const u=document.getElementById('chg-user')?.value||'gravity';
+  const p=document.getElementById('chg-pass')?.value;
+  if(!p||p.length<6){toast('Erreur','Mot de passe trop court (min. 6 caractères)');return;}
+  const r=await api('POST','/api/system/change-password',{username:u,password:p});
+  if(r?.ok){toast('Mot de passe','Changé avec succès — reconnectez-vous');setTimeout(()=>window.location.href='/login.html',2000);}
+  else toast('Erreur',r?.error||'Échec du changement');
+}
+
+// ── Réseau / Paramètres ───────────────────────────────────────────────────────
+async function loadSettings(){
+  const s=await api('GET','/api/system');
+  if(s?.os) document.getElementById('iface-info').innerHTML=`
+    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Hostname</span><span>${s.os.hostname}</span></div>
+    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Adresse IP</span><span>${s.os.hostname ? s.hostname||'—' : '—'}</span></div>
+    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">OS</span><span>${s.os.distro||'Debian'} ${s.os.release||'12'}</span></div>
+    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Kernel</span><span class="mono">${s.os.kernel||'?'}</span></div>`;
+}
+async function loadNetwork(){ loadSettings(); }
+
+// ── Mises à jour ──────────────────────────────────────────────────────────────
+async function loadUpdates() {
+  document.getElementById('sys-update-status').textContent = 'Prêt — cliquez sur Vérifier.';
+  document.getElementById('gravity-update-status').textContent = 'Prêt — cliquez sur Vérifier.';
+}
+
+async function checkSysUpdate() {
+  const el = document.getElementById('sys-update-status');
+  el.textContent = '🔍 Vérification en cours...';
+  document.getElementById('btn-sys-update').disabled = true;
+  const r = await api('GET','/api/updates/system/check');
+  if(!r) { el.textContent = 'Erreur lors de la vérification'; return; }
+  if(r.count > 0) {
+    el.innerHTML = `<span style="color:var(--amber)">⬆ ${r.count} paquet(s) à mettre à jour</span>`;
+    const pkgEl = document.getElementById('sys-pkg-list');
+    pkgEl.style.display = 'block';
+    pkgEl.textContent = r.packages.join('\n');
+    document.getElementById('btn-sys-update').disabled = false;
+  } else {
+    el.innerHTML = '<span style="color:var(--green)">✓ Système à jour</span>';
+  }
+}
+
+async function startSysUpdate() {
+  document.getElementById('btn-sys-update').disabled = true;
+  document.getElementById('sys-update-status').innerHTML = '<span style="color:var(--accent2)">⏳ Mise à jour en cours...</span>';
+  const logEl = document.getElementById('sys-update-log');
+  logEl.style.display = 'block'; logEl.textContent = '';
+  await api('POST','/api/updates/system/start');
+  pollUpdateLog('sys-update-log', ()=>{
+    document.getElementById('sys-update-status').innerHTML = '<span style="color:var(--green)">✓ Système mis à jour!</span>';
+  });
+}
+
+async function checkGravityUpdate() {
+  const el = document.getElementById('gravity-update-status');
+  el.textContent = '🔍 Vérification via git...';
+  document.getElementById('btn-gravity-update').disabled = true;
+  const r = await api('GET','/api/updates/gravity/check');
+  if(!r) { el.textContent = 'Erreur'; return; }
+  if(r.available) {
+    el.innerHTML = `<span style="color:var(--amber)">⬆ ${r.count} commit(s) disponible(s)</span>`;
+    const pkgEl = document.getElementById('gravity-pkg-list');
+    pkgEl.style.display = 'block';
+    pkgEl.textContent = r.commits.join('\n');
+    document.getElementById('btn-gravity-update').disabled = false;
+  } else {
+    el.innerHTML = `<span style="color:var(--green)">✓ ${r.message||'GravityOS à jour'}</span>`;
+  }
+}
+
+async function startGravityUpdate() {
+  document.getElementById('btn-gravity-update').disabled = true;
+  document.getElementById('gravity-update-status').innerHTML = '<span style="color:var(--accent2)">⏳ Mise à jour en cours...</span>';
+  const logEl = document.getElementById('gravity-update-log');
+  logEl.style.display = 'block'; logEl.textContent = '';
+  await api('POST','/api/updates/gravity/start');
+  pollUpdateLog('gravity-update-log', ()=>{
+    document.getElementById('gravity-update-status').innerHTML = '<span style="color:var(--green)">✓ GravityOS mis à jour!</span>';
+  });
+}
+
+function pollUpdateLog(elId, onDone) {
+  const el = document.getElementById(elId);
+  const iv = setInterval(async()=>{
+    const r = await api('GET','/api/updates/log');
+    if(!r) return;
+    el.textContent = r.log;
+    el.scrollTop = el.scrollHeight;
+    if(!r.running) { clearInterval(iv); onDone?.(); }
+  }, 1500);
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+function toast(t,b){const n=document.getElementById('notif');document.getElementById('notif-t').textContent=t;document.getElementById('notif-b').textContent=b;n.classList.add('show');clearTimeout(n._t);n._t=setTimeout(()=>n.classList.remove('show'),3500);}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+loadDash();
+</script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "name": "gravityos-webui",
+  "version": "1.0.0",
+  "description": "GravityOS NAS WebUI — Backend Node.js + Interface Web",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "update": "npm install --ignore-scripts --omit=optional"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.16.0",
+    "systeminformation": "^5.21.20",
+    "dockerode": "^4.0.0"
+  },
+  "optionalDependencies": {
+    "node-pty": "^0.10.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TON_USERNAME/gravityos-webui.git"
+  },
+  "keywords": ["nas", "homeserver", "debian", "webui", "gravityos"],
+  "license": "MIT"
+}
