@@ -473,6 +473,14 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
     echo "Dependances npm..."
     npm install --ignore-scripts --omit=optional 2>&1 | tail -3
 
+    echo "Installation node-pty (terminal)..."
+    if [ ! -d node_modules/node-pty ]; then
+      apt-get install -y --no-install-recommends build-essential python3 2>/dev/null | tail -2 || true
+      npm install node-pty 2>&1 | tail -3 && echo "node-pty OK" || echo "node-pty en mode degrade"
+    else
+      echo "node-pty deja installe"
+    fi
+
     echo ""
     systemctl restart gravity-webui 2>/dev/null || true
 

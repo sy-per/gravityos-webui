@@ -704,12 +704,15 @@ async function changePass(){
 
 // ── Réseau / Paramètres ───────────────────────────────────────────────────────
 async function loadSettings(){
-  const s=await api('GET','/api/system');
-  if(s?.os) document.getElementById('iface-info').innerHTML=`
-    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Hostname</span><span>${s.os.hostname}</span></div>
-    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Adresse IP</span><span>${s.os.hostname ? s.hostname||'—' : '—'}</span></div>
-    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">OS</span><span>${s.os.distro||'Debian'} ${s.os.release||'12'}</span></div>
-    <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Kernel</span><span class="mono">${s.os.kernel||'?'}</span></div>`;
+  const s = await api('GET','/api/system');
+  if(s?.os) {
+    document.getElementById('iface-info').innerHTML = `
+      <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Hostname</span><span>${s.os.hostname||'?'}</span></div>
+      <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">OS</span><span>${s.os.distro||'Debian'} ${s.os.release||'12'}</span></div>
+      <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Kernel</span><span class="mono">${s.os.kernel||'?'}</span></div>
+      <div class="drow" style="justify-content:space-between"><span class="mono" style="color:var(--text2)">Uptime</span><span>${Math.floor((s.uptime||0)/3600)}h ${Math.floor(((s.uptime||0)%3600)/60)}m</span></div>`;
+    if(s.os.hostname) document.getElementById('set-hostname').textContent = s.os.hostname + '.local';
+  }
 }
 async function loadNetwork(){ loadSettings(); }
 
