@@ -106,13 +106,46 @@ app.use(express.static(path.join(__dirname,"web")));
 // ── WebSocket ─────────────────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
   if (!validSid((req.headers.cookie||"").match(/gravity_sid=([a-f0-9]+)/)?.[1])) { ws.close(4401); return; }
+
   if (req.url.startsWith("/terminal")) {
-    let pty; try { pty=require("node-pty"); } catch {}
-    if (!pty) { ws.send(JSON.stringify({type:"output",data:"\r\nTerminal : http://[IP]:4200\r\n"})); return; }
-    const t = pty.spawn("/bin/bash",[],{name:"xterm-256color",cols:120,rows:40,env:process.env});
-    t.onData(d=>ws.send(JSON.stringify({type:"output",data:d})));
-    ws.on("message",r=>{ try{const m=JSON.parse(r);if(m.type==="input")t.write(m.data);if(m.type==="resize")t.resize(m.cols,m.rows);}catch{t.write(r);} });
-    ws.on("close",()=>t.kill());
+    const send = d => { try{ ws.send(JSON.stringify({type:"output",data:d})); }catch{} };
+    let pty = null;
+    try { pty = require("node-pty"); } catch {}
+
+    if (pty) {
+      // node-pty disponible : terminal complet avec resize
+      const t = pty.spawn("/bin/bash", [], {
+        name: "xterm-256color", cols: 120, rows: 40,
+        env: { ...process.env, TERM:"xterm-256color", LANG:"fr_FR.UTF-8" }
+      });
+      t.onData(d => send(d));
+      ws.on("message", raw => {
+        try {
+          const m = JSON.parse(raw);
+          if (m.type === "input")  t.write(m.data);
+          if (m.type === "resize") t.resize(Math.max(1,m.cols), Math.max(1,m.rows));
+        } catch { t.write(String(raw)); }
+      });
+      ws.on("close", () => { try{ t.kill(); }catch{} });
+    } else {
+      // Fallback : child_process.spawn sans pty (pas de couleurs mais fonctionnel)
+      const { spawn } = require("child_process");
+      const shell = spawn("/bin/bash", ["--login"], {
+        env: { ...process.env, TERM:"xterm", LANG:"fr_FR.UTF-8" },
+        stdio: ["pipe","pipe","pipe"]
+      });
+      shell.stdout.on("data", d => send(d.toString()));
+      shell.stderr.on("data", d => send(d.toString()));
+      shell.on("close", () => send("\r\n[Session terminée]\r\n"));
+      ws.on("message", raw => {
+        try {
+          const m = JSON.parse(raw);
+          if (m.type === "input") shell.stdin.write(m.data);
+        } catch { shell.stdin.write(String(raw)); }
+      });
+      ws.on("close", () => { try{ shell.kill(); }catch{} });
+      send("\r\n\x1b[33m[Mode dégradé — node-pty non disponible]\x1b[0m\r\n$ ");
+    }
     return;
   }
   let iv;
@@ -381,9 +414,39 @@ app.get("/api/updates/gravity/check", auth, async(req,res) => {
   } catch(e){ res.json({available:false, message:"Impossible de vérifier: "+e.message}); }
 });
 
-// Mettre à jour GravityOS via git + update.sh
+// Mettre à jour GravityOS via git (logique inline, pas besoin de update.sh)
 app.post("/api/updates/gravity/start", auth, (req,res) => {
-  const cmd = "bash /opt/gravity/update.sh 2>&1";
+  const REPO = "https://gitlab.com/syper/gravityos-webui.git";
+  const cmd = `
+    set -e
+    echo "=== GravityOS WebUI Update ==="
+    echo "Date: $(date)"
+    cd /opt/gravity
+
+    if [ ! -d ".git" ]; then
+      echo "Initialisation du repo git..."
+      git init
+      git remote add origin ${REPO}
+      git fetch origin
+      git checkout -b main --track origin/main
+    else
+      echo "Mise a jour depuis ${REPO}..."
+      git fetch origin
+      git pull origin main
+    fi
+
+    echo ""
+    echo "Mise a jour des dependances npm..."
+    npm install --ignore-scripts --omit=optional 2>&1 | tail -5
+
+    echo ""
+    echo "Redemarrage du service..."
+    systemctl restart gravity-webui
+
+    echo ""
+    echo "=== GravityOS mis a jour! ==="
+    git log -1 --format='Version: %h - %s' 2>/dev/null || true
+  `;
   streamUpdate(cmd, res);
 });
 
