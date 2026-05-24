@@ -15,7 +15,24 @@ let Dockerode; try { Dockerode = require("dockerode"); } catch {}
 const execAsync = promisify(exec);
 const app    = express();
 const server = http.createServer(app);
-const wss    = new WebSocketServer({ server });
+
+// WebSocket server pour les métriques (/)
+const wss = new WebSocketServer({ noServer: true });
+// WebSocket server pour le terminal (/terminal)
+const wssTerminal = new WebSocketServer({ noServer: true });
+
+// Routing des connexions WebSocket selon le path
+server.on("upgrade", (req, socket, head) => {
+  if (req.url.startsWith("/terminal")) {
+    wssTerminal.handleUpgrade(req, socket, head, ws => {
+      wssTerminal.emit("connection", ws, req);
+    });
+  } else {
+    wss.handleUpgrade(req, socket, head, ws => {
+      wss.emit("connection", ws, req);
+    });
+  }
+});
 const docker = Dockerode ? new Dockerode({ socketPath: "/var/run/docker.sock" }) : null;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -103,50 +120,53 @@ app.use((req,res,next) => {
 });
 app.use(express.static(path.join(__dirname,"web")));
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
+// ── WebSocket Terminal ────────────────────────────────────────────────────────
+wssTerminal.on("connection", (ws, req) => {
+  // Auth via cookie
+  if (!validSid((req.headers.cookie||"").match(/gravity_sid=([a-f0-9]+)/)?.[1])) {
+    ws.close(4401, "Unauthorized"); return;
+  }
+  const send = d => { try{ ws.send(JSON.stringify({type:"output",data:d})); }catch{} };
+  let pty = null;
+  try { pty = require("node-pty"); } catch {}
+
+  if (pty) {
+    const t = pty.spawn("/bin/bash", [], {
+      name:"xterm-256color", cols:120, rows:40,
+      env:{...process.env, TERM:"xterm-256color", LANG:"fr_FR.UTF-8", HOME:"/root"}
+    });
+    t.onData(d => send(d));
+    ws.on("message", raw => {
+      try {
+        const m = JSON.parse(raw);
+        if (m.type==="input")  t.write(m.data);
+        if (m.type==="resize") t.resize(Math.max(2,m.cols), Math.max(2,m.rows));
+      } catch { t.write(String(raw)); }
+    });
+    ws.on("close", () => { try{ t.kill(); }catch{} });
+  } else {
+    // Fallback sans pty
+    const { spawn } = require("child_process");
+    const shell = spawn("/bin/bash", ["--login"], {
+      env:{...process.env, TERM:"xterm", LANG:"fr_FR.UTF-8", HOME:"/root"},
+      stdio:["pipe","pipe","pipe"]
+    });
+    shell.stdout.on("data", d => send(d.toString()));
+    shell.stderr.on("data", d => send(d.toString()));
+    shell.on("close", () => send("\r\n[Session terminée]\r\n"));
+    ws.on("message", raw => {
+      try { const m=JSON.parse(raw); if(m.type==="input") shell.stdin.write(m.data); }
+      catch { shell.stdin.write(String(raw)); }
+    });
+    ws.on("close", () => { try{ shell.kill(); }catch{} });
+    send("\r\n\x1b[33m[Mode dégradé — node-pty non disponible]\x1b[0m\r\n");
+  }
+});
+
+// ── WebSocket Métriques ───────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
-  if (!validSid((req.headers.cookie||"").match(/gravity_sid=([a-f0-9]+)/)?.[1])) { ws.close(4401); return; }
-
-  if (req.url.startsWith("/terminal")) {
-    const send = d => { try{ ws.send(JSON.stringify({type:"output",data:d})); }catch{} };
-    let pty = null;
-    try { pty = require("node-pty"); } catch {}
-
-    if (pty) {
-      // node-pty disponible : terminal complet avec resize
-      const t = pty.spawn("/bin/bash", [], {
-        name: "xterm-256color", cols: 120, rows: 40,
-        env: { ...process.env, TERM:"xterm-256color", LANG:"fr_FR.UTF-8" }
-      });
-      t.onData(d => send(d));
-      ws.on("message", raw => {
-        try {
-          const m = JSON.parse(raw);
-          if (m.type === "input")  t.write(m.data);
-          if (m.type === "resize") t.resize(Math.max(1,m.cols), Math.max(1,m.rows));
-        } catch { t.write(String(raw)); }
-      });
-      ws.on("close", () => { try{ t.kill(); }catch{} });
-    } else {
-      // Fallback : child_process.spawn sans pty (pas de couleurs mais fonctionnel)
-      const { spawn } = require("child_process");
-      const shell = spawn("/bin/bash", ["--login"], {
-        env: { ...process.env, TERM:"xterm", LANG:"fr_FR.UTF-8" },
-        stdio: ["pipe","pipe","pipe"]
-      });
-      shell.stdout.on("data", d => send(d.toString()));
-      shell.stderr.on("data", d => send(d.toString()));
-      shell.on("close", () => send("\r\n[Session terminée]\r\n"));
-      ws.on("message", raw => {
-        try {
-          const m = JSON.parse(raw);
-          if (m.type === "input") shell.stdin.write(m.data);
-        } catch { shell.stdin.write(String(raw)); }
-      });
-      ws.on("close", () => { try{ shell.kill(); }catch{} });
-      send("\r\n\x1b[33m[Mode dégradé — node-pty non disponible]\x1b[0m\r\n$ ");
-    }
-    return;
+  if (!validSid((req.headers.cookie||"").match(/gravity_sid=([a-f0-9]+)/)?.[1])) {
+    ws.close(4401); return;
   }
   let iv;
   async function push() {
@@ -405,47 +425,60 @@ app.get("/api/updates/gravity/check", auth, async(req,res) => {
   try {
     const REPO = "https://gitlab.com/syper/gravityos-webui.git";
     const isGit = fs.existsSync("/opt/gravity/.git");
-    if(!isGit) return res.json({available:true, message:`Repo non initialisé — cliquez Mettre à jour pour connecter ${REPO}`, count:1, commits:["Premier déploiement depuis git"]});
+    if(!isGit) return res.json({available:true, message:"Repo non initialisé — cliquez Mettre à jour", count:1, commits:["Premier déploiement depuis git"]});
+    // Fix ownership
+    await execAsync("git config --global --add safe.directory /opt/gravity 2>/dev/null").catch(()=>{});
     await execAsync("git -C /opt/gravity fetch origin 2>/dev/null");
-    const {stdout} = await execAsync("git -C /opt/gravity log HEAD..origin/main --oneline 2>/dev/null");
+    // Détecter branche principale (main ou master)
+    const {stdout:branch} = await execAsync("git -C /opt/gravity symbolic-ref --short HEAD 2>/dev/null").catch(()=>({stdout:"main"}));
+    const br = branch.trim() || "main";
+    const {stdout} = await execAsync(`git -C /opt/gravity log HEAD..origin/${br} --oneline 2>/dev/null`).catch(()=>({stdout:""}));
     const commits = stdout.trim().split("\n").filter(Boolean);
-    const {stdout:ver} = await execAsync("git -C /opt/gravity log -1 --format='%h — %s — %cr' 2>/dev/null").catch(()=>({stdout:"?"}));
+    const {stdout:ver} = await execAsync("git -C /opt/gravity log -1 --format='%h — %s — %cr' 2>/dev/null").catch(()=>({stdout:"inconnu"}));
     res.json({available: commits.length>0, commits, count: commits.length, currentVersion: ver.trim()});
-  } catch(e){ res.json({available:false, message:"Impossible de vérifier: "+e.message}); }
+  } catch(e){ res.json({available:false, message:"Erreur: "+e.message}); }
 });
 
-// Mettre à jour GravityOS via git (logique inline, pas besoin de update.sh)
+// Mettre à jour GravityOS via git
 app.post("/api/updates/gravity/start", auth, (req,res) => {
   const REPO = "https://gitlab.com/syper/gravityos-webui.git";
   const cmd = `
-    set -e
     echo "=== GravityOS WebUI Update ==="
     echo "Date: $(date)"
+
+    # Fix ownership pour git
+    git config --global --add safe.directory /opt/gravity
+
     cd /opt/gravity
 
     if [ ! -d ".git" ]; then
-      echo "Initialisation du repo git..."
-      git init
-      git remote add origin ${REPO}
-      git fetch origin
-      git checkout -b main --track origin/main
+      echo "Clonage initial..."
+      cd /tmp
+      git clone ${REPO} gravity-webui-tmp
+      cp -r gravity-webui-tmp/. /opt/gravity/
+      rm -rf gravity-webui-tmp
+      cd /opt/gravity
+      git config --global --add safe.directory /opt/gravity
     else
-      echo "Mise a jour depuis ${REPO}..."
+      echo "Mise a jour..."
+      git config --global --add safe.directory /opt/gravity
       git fetch origin
-      git pull origin main
+      # Gérer master vs main
+      BRANCH=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | cut -d' ' -f5 || echo main)
+      git checkout $BRANCH 2>/dev/null || git checkout -b $BRANCH --track origin/$BRANCH
+      git pull origin $BRANCH
     fi
 
     echo ""
-    echo "Mise a jour des dependances npm..."
-    npm install --ignore-scripts --omit=optional 2>&1 | tail -5
+    echo "Dependances npm..."
+    npm install --ignore-scripts --omit=optional 2>&1 | tail -3
 
     echo ""
-    echo "Redemarrage du service..."
-    systemctl restart gravity-webui
+    systemctl restart gravity-webui 2>/dev/null || true
 
     echo ""
     echo "=== GravityOS mis a jour! ==="
-    git log -1 --format='Version: %h - %s' 2>/dev/null || true
+    git log -1 --format='Version: %h - %s (%cr)' 2>/dev/null || true
   `;
   streamUpdate(cmd, res);
 });
@@ -454,6 +487,12 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
 app.get("/api/updates/log", auth, (req,res) => {
   res.json({log: updateLog.join(""), running: updateRunning});
 });;
+
+// Route de diagnostic terminal
+app.get("/api/terminal/test", auth, (req,res) => {
+  let pty = null; try { pty = require("node-pty"); } catch(e) {}
+  res.json({ nodeVersion:process.version, ptyAvailable:!!pty, pid:process.pid });
+});
 
 const PORT = process.env.GRAVITY_PORT || 4000;
 server.listen(PORT, "0.0.0.0", () => console.log(`\n  GravityOS WebUI v2 — http://0.0.0.0:${PORT}\n`));

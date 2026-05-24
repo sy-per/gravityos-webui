@@ -434,8 +434,18 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
 </div>
 
 <!-- TERMINAL -->
-<div class="panel" id="panel-terminal" style="padding:16px;background:#0a0a0a">
-  <div id="terminal-container" style="width:100%;height:calc(100vh - 130px);border-radius:8px;overflow:hidden;background:#000"></div>
+<div class="panel" id="panel-terminal" style="padding:16px;display:flex;flex-direction:column;gap:12px">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-shrink:0">
+    <div>
+      <div class="ph" style="margin-bottom:2px">Terminal</div>
+      <div class="ps" id="term-status" style="margin-bottom:0">Cliquez sur Connecter</div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn" onclick="termDiag()" title="Diagnostic">🔍</button>
+      <button class="btn btn-primary" id="term-connect-btn" onclick="initTerminal()">▶ Connecter</button>
+    </div>
+  </div>
+  <div id="terminal-container" style="flex:1;border-radius:8px;overflow:hidden;background:#0d0d14;min-height:400px"></div>
 </div>
 
 <!-- PARAMÈTRES -->
@@ -779,6 +789,12 @@ function pollUpdateLog(elId, onDone) {
 // ── Toast ─────────────────────────────────────────────────────────────────────
 function toast(t,b){const n=document.getElementById('notif');document.getElementById('notif-t').textContent=t;document.getElementById('notif-b').textContent=b;n.classList.add('show');clearTimeout(n._t);n._t=setTimeout(()=>n.classList.remove('show'),3500);}
 
+async function termDiag() {
+  const r = await api('GET', '/api/terminal/test');
+  if(r) toast('Terminal Diagnostic', `node-pty: ${r.ptyAvailable?'✓ Disponible':'✗ Absent (fallback actif)'} | Node: ${r.nodeVersion}`);
+  else toast('Diagnostic', 'Impossible de joindre le serveur');
+}
+
 // ── Terminal xterm.js ─────────────────────────────────────────────────────────
 let termInstance = null;
 let termWs = null;
@@ -834,16 +850,27 @@ function connectTermWs(term, fitAddon) {
   term = term || termInstance;
   if(!term) return;
 
-  if(termWs) { try{ termWs.close(); }catch{} }
+  if(termWs && termWs.readyState < 2) { try{ termWs.close(); }catch{} }
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${proto}//${location.host}/terminal`);
   termWs = ws;
 
+  // Timeout si pas de connexion après 5s
+  const connectTimeout = setTimeout(() => {
+    if(ws.readyState !== 1) {
+      term.writeln('\r\n\x1b[31mTimeout — impossible de joindre le terminal\x1b[0m');
+      term.writeln('\x1b[33mVérifiez que gravity-webui tourne : systemctl status gravity-webui\x1b[0m\r\n');
+    }
+  }, 5000);
+
   ws.onopen = () => {
+    clearTimeout(connectTimeout);
+    document.getElementById('term-status').textContent = '● Connecté';
+    document.getElementById('term-status').style.color = 'var(--green)';
+    document.getElementById('term-connect-btn').textContent = '↺ Reconnecter';
     term.clear();
-    term.writeln('\r\n  \x1b[1;35mGravityOS Terminal\x1b[0m  —  \x1b[2mConnecté\x1b[0m\r\n');
-    // Envoyer la taille initiale
+    term.writeln('\r\n  \x1b[1;35mGravityOS Terminal\x1b[0m  —  \x1b[32mConnecté\x1b[0m\r\n');
     const {cols, rows} = term;
     ws.send(JSON.stringify({type:'resize', cols, rows}));
   };
@@ -855,12 +882,18 @@ function connectTermWs(term, fitAddon) {
     } catch { term.write(e.data); }
   };
 
-  ws.onclose = () => {
-    term.writeln('\r\n\x1b[31mDéconnecté — cliquez pour reconnecter\x1b[0m\r\n');
+  ws.onclose = (e) => {
+    document.getElementById('term-status').textContent = `● Déconnecté (code: ${e.code})`;
+    document.getElementById('term-status').style.color = 'var(--red)';
+    document.getElementById('term-connect-btn').textContent = '▶ Reconnecter';
+    term.writeln('\r\n\x1b[31mDéconnecté\x1b[0m — cliquez sur Reconnecter\r\n');
   };
 
-  ws.onerror = () => {
-    term.writeln('\r\n\x1b[31mErreur de connexion WebSocket\x1b[0m\r\n');
+  ws.onerror = (e) => {
+    clearTimeout(connectTimeout);
+    document.getElementById('term-status').textContent = '● Erreur WebSocket';
+    document.getElementById('term-status').style.color = 'var(--red)';
+    term.writeln('\r\n\x1b[31mErreur WebSocket\x1b[0m — vérifiez que nginx proxy bien les WS\r\n');
   };
 
   term.onData(data => {
