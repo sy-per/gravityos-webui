@@ -21,7 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://gitlab.com/syper/gravityos-webui.git"
+    "url": "https://github.com/sy-per/gravityos-webui.git"
   },
   "keywords": ["nas", "homeserver", "debian", "webui", "gravityos"],
   "license": "MIT"

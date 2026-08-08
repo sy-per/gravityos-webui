@@ -423,7 +423,7 @@ app.post("/api/updates/system/start", auth, (req,res) => {
 // Vérifier les mises à jour GravityOS (via git)
 app.get("/api/updates/gravity/check", auth, async(req,res) => {
   try {
-    const REPO = "https://gitlab.com/syper/gravityos-webui.git";
+    const REPO = "https://github.com/sy-per/gravityos-webui.git";
     const isGit = fs.existsSync("/opt/gravity/.git");
     if(!isGit) return res.json({available:true, message:"Repo non initialisé — cliquez Mettre à jour", count:1, commits:["Premier déploiement depuis git"]});
     // Fix ownership
@@ -441,7 +441,7 @@ app.get("/api/updates/gravity/check", auth, async(req,res) => {
 
 // Mettre à jour GravityOS via git
 app.post("/api/updates/gravity/start", auth, (req,res) => {
-  const REPO = "https://gitlab.com/syper/gravityos-webui.git";
+  const REPO = "https://github.com/sy-per/gravityos-webui.git";
   const cmd = `
     echo "=== GravityOS WebUI Update ==="
     echo "Date: $(date)"
