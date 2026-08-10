@@ -5,7 +5,7 @@ const express  = require("express");
 const http     = require("http");
 const { WebSocketServer } = require("ws");
 const si       = require("systeminformation");
-const { exec, execSync } = require("child_process");
+const { exec, execSync, spawn } = require("child_process");
 const { promisify } = require("util");
 const path     = require("path");
 const fs       = require("fs");
@@ -96,14 +96,11 @@ app.post("/api/wizard/complete", async (req,res) => {
   } catch(e) { res.status(500).json({ error:e.message }); }
 });
 
-app.get("/install", (req,res) => {
-  if (!validSid(getSid(req))) return res.redirect("/login.html");
-  res.sendFile(path.join(__dirname,"web","install.html"));
-});
-app.get("/install.html", (req,res) => {
-  if (!validSid(getSid(req))) return res.redirect("/login.html");
-  res.sendFile(path.join(__dirname,"web","install.html"));
-});
+// /install et /wizard accessibles SANS auth (avant login)
+app.get("/install",     (req,res) => res.sendFile(path.join(__dirname,"web","install.html")));
+app.get("/install.html",(req,res) => res.sendFile(path.join(__dirname,"web","install.html")));
+
+// ── Routing principal ─────────────────────────────────────────────────────────
 app.get("/", (req,res) => {
   if (!fs.existsSync(WIZARD)) return res.redirect("/wizard.html");
   if (!validSid(getSid(req))) return res.redirect("/login.html");
@@ -111,7 +108,9 @@ app.get("/", (req,res) => {
 });
 app.use((req,res,next) => {
   if (req.path.startsWith("/api/")) return next();
-  if (req.path === "/login.html" || req.path === "/wizard.html" || req.path === "/gravity-logo.png") return next();
+  // Pages publiques
+  const pub = ["/login.html","/wizard.html","/install.html","/install","/gravity-logo.png"];
+  if (pub.some(p => req.path === p || req.path.startsWith(p+"/") || req.path.startsWith(p+"?"))) return next();
   if (!validSid(getSid(req))) {
     if (!fs.existsSync(WIZARD)) return res.redirect("/wizard.html");
     return res.redirect("/login.html");
@@ -201,7 +200,7 @@ app.post("/api/system/change-password", auth, async (req,res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 //  INSTALLATION SUR DISQUE
 // ══════════════════════════════════════════════════════════════════════════════
-app.get("/api/install/disks", auth, async (req,res) => {
+app.get("/api/install/disks", async (req,res) => {
   try {
     const { stdout } = await execAsync("lsblk -J -o NAME,SIZE,MODEL,TYPE,MOUNTPOINT 2>/dev/null");
     const disks = (JSON.parse(stdout).blockdevices||[]).filter(d=>d.type==="disk");
@@ -212,9 +211,9 @@ app.get("/api/install/disks", auth, async (req,res) => {
 // Status d'installation (step, progress, done, error)
 let installStatus = { running:false, step:0, stepName:"", progress:0, done:false, error:null };
 
-app.get("/api/install/status", auth, (req,res) => res.json(installStatus));
+app.get("/api/install/status", (req,res) => res.json(installStatus));
 
-app.post("/api/install/start", auth, (req,res) => {
+app.post("/api/install/start", (req,res) => {
   const { disk, hostname, username, password, timezone } = req.body;
   if (!disk||!password) return res.status(400).json({error:"disk et password requis"});
   const safeDisk     = disk.replace(/[^a-zA-Z0-9]/g,"");
@@ -247,21 +246,127 @@ app.post("/api/install/start", auth, (req,res) => {
   child.unref();
 });
 
-app.get("/api/install/logs", auth, (req,res) => {
+app.get("/api/install/logs", (req,res) => {
   try { res.json({log:fs.readFileSync("/var/log/gravity-install.log","utf8")}); }
   catch { res.json({log:""}); }
 });
 
-app.post("/api/install/reboot", auth, (req,res) => {
+app.post("/api/install/reboot", (req,res) => {
   res.json({ok:true});
   setTimeout(() => exec("systemctl reboot"), 2000);
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  STOCKAGE
+//  STOCKAGE — Disques, Volumes (façon ZimaOS : Volume 1 = disque système, disques
+//  ajoutés = nouveaux volumes), RAID logiciel (mdadm)
 // ══════════════════════════════════════════════════════════════════════════════
 app.get("/api/disks",  auth, async (req,res) => { const [b,f]=await Promise.all([si.blockDevices(),si.fsSize()]); res.json({devices:b,filesystems:f}); });
 app.get("/api/mdstat", auth, async (req,res) => { try{const{stdout}=await execAsync("cat /proc/mdstat");res.json({raw:stdout});}catch{res.json({raw:""}); } });
+
+const VOL_ROOT = "/srv/volumes";
+async function lsblkTree(){
+  const {stdout} = await execAsync("lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,TRAN,PATH 2>/dev/null").catch(()=>({stdout:'{"blockdevices":[]}'}));
+  return JSON.parse(stdout).blockdevices || [];
+}
+function lsblkFlat(tree){ const flat=[]; (function walk(nodes){for(const n of nodes){flat.push(n);if(n.children)walk(n.children);}})(tree); return flat; }
+
+// Disques/partitions "libres" : pas de fs, pas montés, aucune partition-enfant montée,
+// pas déjà membre d'un RAID — utilisables pour créer un volume ou un RAID.
+app.get("/api/storage/available-disks", auth, async(req,res)=>{
+  try {
+    const flat = lsblkFlat(await lsblkTree());
+    const free = flat.filter(n =>
+      (n.type==="disk"||n.type==="part") &&
+      !n.mountpoint &&
+      n.fstype!=="linux_raid_member" &&
+      (!n.children || n.children.every(c=>!c.mountpoint))
+    );
+    res.json(free.map(d=>({ path:d.path||("/dev/"+d.name), name:d.name, size:Number(d.size)||0, model:(d.model||"").trim(), tran:d.tran||"", type:d.type })));
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ── Volumes ───────────────────────────────────────────────────────────────────
+app.get("/api/storage/volumes", auth, async(req,res)=>{
+  try {
+    fs.mkdirSync(VOL_ROOT,{recursive:true});
+    const {stdout:rootSrc} = await execAsync("findmnt -n -o SOURCE /").catch(()=>({stdout:"—"}));
+    const {stdout:rootDf}  = await execAsync("df -B1 --output=size,used --no-headers / 2>/dev/null").catch(()=>({stdout:"0 0"}));
+    const [rsz,rus] = rootDf.trim().split(/\s+/);
+    const volumes = [{ name:"Volume 1 (système)", path:"/srv/shares", device:rootSrc.trim()||"—", size:Number(rsz)||0, used:Number(rus)||0, system:true }];
+    for (const name of fs.readdirSync(VOL_ROOT)) {
+      const p = path.join(VOL_ROOT, name);
+      if (!fs.statSync(p).isDirectory()) continue;
+      const {stdout:info} = await execAsync(`df -B1 --output=source,size,used --no-headers ${sh(p)} 2>/dev/null`).catch(()=>({stdout:""}));
+      const [device,sz,us] = info.trim().split(/\s+/);
+      volumes.push({ name, path:p, device:device||"—", size:Number(sz)||0, used:Number(us)||0, system:false });
+    }
+    res.json(volumes);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/storage/volumes", auth, (req,res)=>{
+  const { name, device } = req.body;
+  if(!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de volume invalide (lettres/chiffres/-/_ uniquement)"});
+  if(!device || !/^\/dev\/[a-zA-Z0-9]+$/.test(device)) return res.status(400).json({error:"Périphérique invalide"});
+  const mnt = path.join(VOL_ROOT, name);
+  const cmd = `
+    mkfs.ext4 -F -L ${sh(name.slice(0,16))} ${sh(device)}
+    UUID=$(blkid -s UUID -o value ${sh(device)})
+    mkdir -p ${sh(mnt)}
+    grep -q "$UUID" /etc/fstab || echo "UUID=$UUID  ${mnt}  ext4  defaults,nofail  0  2" >> /etc/fstab
+    mount ${sh(mnt)}
+    chown gravity:gravity ${sh(mnt)}
+    echo "Volume '${name}' prêt sur ${mnt}"
+  `;
+  const jobId = runJob(cmd);
+  res.json({ok:true, jobId});
+});
+app.delete("/api/storage/volumes/:name", auth, async(req,res)=>{
+  const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
+  const mnt = path.join(VOL_ROOT, name);
+  try {
+    if(!fs.existsSync(mnt)) return res.status(404).json({error:"Volume introuvable"});
+    await execAsync(`umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
+    const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(mnt)).join("\n");
+    fs.writeFileSync("/etc/fstab", fstab);
+    res.json({ok:true, message:"Volume détaché — les données restent sur le disque (non effacées)"});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ── RAID logiciel (mdadm) ────────────────────────────────────────────────────
+app.get("/api/storage/raid", auth, async(req,res)=>{
+  try {
+    const {stdout} = await execAsync("cat /proc/mdstat").catch(()=>({stdout:""}));
+    const arrays = [];
+    for (const m of stdout.matchAll(/^(md\d+)\s*:\s*(active|inactive)\s*(\S+)?\s*(.*)$/gm)) {
+      const [,dev,state,level,members] = m;
+      arrays.push({ device:"/dev/"+dev, state, level:level||"?", members:(members.match(/\w+\[\d+\]/g)||[]).map(x=>"/dev/"+x.replace(/\[\d+\]/,"")) });
+    }
+    res.json(arrays);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/storage/raid", auth, (req,res)=>{
+  const { name, level, devices } = req.body;
+  if(!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom invalide (lettres/chiffres/-/_ uniquement)"});
+  if(!["0","1","5","6","10"].includes(String(level))) return res.status(400).json({error:"Niveau RAID invalide"});
+  if(!Array.isArray(devices) || devices.length<2 || devices.some(d=>!/^\/dev\/[a-zA-Z0-9]+$/.test(d))) return res.status(400).json({error:"Au moins 2 disques valides requis"});
+  const minDevs = {0:2,1:2,5:3,6:4,10:4}[level];
+  if(devices.length<minDevs) return res.status(400).json({error:`RAID${level} nécessite au moins ${minDevs} disques`});
+  const safeName = name.replace(/[^a-zA-Z0-9_-]/g,"");
+  const cmd = `
+    mdadm --create /dev/md/${safeName} --run --level=${level} --raid-devices=${devices.length} ${devices.map(sh).join(" ")} 2>&1
+    mkdir -p /etc/mdadm
+    mdadm --detail --scan >> /etc/mdadm/mdadm.conf 2>&1 || true
+    update-initramfs -u 2>&1 || true
+    echo "RAID${level} '${safeName}' créé — synchronisation en arrière-plan (voir /proc/mdstat)"
+  `;
+  const jobId = runJob(cmd);
+  res.json({ok:true, jobId});
+});
+app.delete("/api/storage/raid/:dev", auth, async(req,res)=>{
+  const dev = "/dev/"+req.params.dev.replace(/[^a-zA-Z0-9]/g,"");
+  try { await execAsync(`mdadm --stop ${sh(dev)} 2>&1`); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  SMB — version corrigée (parse natif, nmbd, testparm)
@@ -317,10 +422,139 @@ app.post("/api/nfs/exports", auth, async (req,res) => { const{path:p,clients,opt
 app.get("/api/ftp/status", auth, async (req,res) => { try{const{stdout}=await execAsync("systemctl is-active vsftpd");res.json({active:stdout.trim()==="active"});}catch{res.json({active:false});} });
 app.post("/api/ftp/toggle", auth, async (req,res) => { try{const{stdout}=await execAsync("systemctl is-active vsftpd");const cmd=stdout.trim()==="active"?"stop":"start";await execAsync(`systemctl ${cmd} vsftpd`);res.json({ok:true,running:cmd==="start"});}catch(e){res.status(500).json({error:e.message});} });
 
+// ── Reverse Proxy — façon Nginx Proxy Manager ────────────────────────────────
+// (Domaines multiples, WebSockets, blocage exploits, cache assets, SSL
+//  none/Let's Encrypt/custom, force SSL, HTTP/2, HSTS, emplacements
+//  personnalisés, config Nginx avancée)
 const NSITES = "/etc/nginx/sites-enabled";
-app.get("/api/proxy/hosts", auth, (req,res) => { try{const f=fs.readdirSync(NSITES).filter(f=>f!=="default"&&f!=="gravity-fallback");res.json(f.map(f=>{const c=fs.readFileSync(path.join(NSITES,f),"utf8");return{name:f,domain:c.match(/server_name\s+(.+);/)?.[1]?.trim(),upstream:c.match(/proxy_pass\s+http:\/\/(.+);/)?.[1]?.trim(),ssl:c.includes("ssl_certificate")};}));}catch{res.json([]);} });
-app.post("/api/proxy/hosts", auth, async (req,res) => { const{domain,upstream,ssl}=req.body;if(!domain||!upstream)return res.status(400).json({error:"domain et upstream requis"});const fn=domain.replace(/[^a-zA-Z0-9.-]/g,"_");const tpl=`server {\n    listen 80;\n    server_name ${domain};\n    location / {\n        proxy_pass http://${upstream};\n        proxy_set_header Host $host;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection "upgrade";\n    }\n}\n`;try{fs.writeFileSync(path.join(NSITES,fn),tpl);await execAsync("nginx -t && systemctl reload nginx");res.json({ok:true});}catch(e){res.status(500).json({error:e.message});} });
-app.delete("/api/proxy/hosts/:n", auth, async (req,res) => { try{fs.unlinkSync(path.join(NSITES,req.params.n));await execAsync("systemctl reload nginx");res.json({ok:true});}catch(e){res.status(500).json({error:e.message});} });
+const PROXY_META = `${CFG}/proxy-hosts.json`;
+function loadProxyMeta(){ try{ return JSON.parse(fs.readFileSync(PROXY_META,"utf8")); } catch{ return {}; } }
+function saveProxyMeta(m){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(PROXY_META, JSON.stringify(m,null,2)); }
+
+function proxyPassBlock(scheme,host,port,indent="        "){
+  return `${indent}proxy_pass ${scheme}://${host}:${port};
+${indent}proxy_set_header Host $host;
+${indent}proxy_set_header X-Real-IP $remote_addr;
+${indent}proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+${indent}proxy_set_header X-Forwarded-Proto $scheme;`;
+}
+function buildProxyConf(h){
+  const names = h.domains.join(" ");
+  const mainLoc = `    location / {
+${proxyPassBlock(h.scheme||"http", h.forwardHost, h.forwardPort)}
+${h.websockets ? `        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";\n` : ""}    }`;
+  const exploits = h.blockExploits ? `
+    location ~ /\\.(?!well-known) { deny all; }
+    location ~* "(eval\\(|base64_(en|de)code|globals|encode|\\.\\./)" { deny all; }` : "";
+  const cache = h.cacheAssets ? `
+    location ~* \\.(jpg|jpeg|png|gif|ico|css|js|svg|woff2?|ttf)$ {
+${proxyPassBlock(h.scheme||"http", h.forwardHost, h.forwardPort)}
+        expires 7d;
+        add_header Cache-Control "public";
+    }` : "";
+  const customLocs = (h.customLocations||[]).filter(l=>l.path&&l.host&&l.port).map(l=>`
+    location ${l.path} {
+${proxyPassBlock(l.scheme||"http", l.host, l.port)}
+    }`).join("");
+  const advanced = h.advanced ? `\n    ${h.advanced.split("\n").join("\n    ")}\n` : "";
+  const hstsHdr = h.hsts ? `        add_header Strict-Transport-Security "max-age=63072000${h.hstsSubdomains?"; includeSubDomains":""}" always;\n` : "";
+
+  if (h.sslMode!=="letsencrypt" && h.sslMode!=="custom") {
+    return `server {
+    listen 80;
+    server_name ${names};
+${mainLoc}
+${exploits}${cache}${customLocs}${advanced}
+}
+`;
+  }
+  const certPath = h.sslMode==="custom" ? h.certPath : `/etc/letsencrypt/live/${h.domains[0]}/fullchain.pem`;
+  const keyPath  = h.sslMode==="custom" ? h.keyPath  : `/etc/letsencrypt/live/${h.domains[0]}/privkey.pem`;
+  const httpBlock = `server {
+    listen 80;
+    server_name ${names};
+    ${h.forceSsl ? `location / { return 301 https://$host$request_uri; }` : mainLoc}
+}
+`;
+  const httpsBlock = `server {
+    listen 443 ssl${h.http2?" http2":""};
+    server_name ${names};
+    ssl_certificate ${certPath};
+    ssl_certificate_key ${keyPath};
+${hstsHdr}${mainLoc}
+${exploits}${cache}${customLocs}${advanced}
+}
+`;
+  return httpBlock + "\n" + httpsBlock;
+}
+
+app.get("/api/proxy/hosts", auth, (req,res) => {
+  try {
+    const meta = loadProxyMeta();
+    const files = fs.readdirSync(NSITES).filter(f=>f!=="default"&&f!=="gravity-fallback");
+    res.json(files.map(f => ({ name:f, ...( meta[f] || {domains:[f],forwardHost:"?",forwardPort:"",sslMode:"none"} ) })));
+  } catch { res.json([]); }
+});
+
+app.post("/api/proxy/hosts", auth, async (req,res) => {
+  const h = req.body;
+  if (!Array.isArray(h.domains) || !h.domains.length || !h.forwardHost || !h.forwardPort)
+    return res.status(400).json({error:"Au moins un domaine, un hôte et un port de destination sont requis"});
+  const fn = h.domains[0].replace(/[^a-zA-Z0-9.-]/g,"_");
+  try {
+    if (h.sslMode==="letsencrypt") {
+      // 1) vhost HTTP simple d'abord, requis pour la validation ACME (webroot via le / existant)
+      fs.writeFileSync(path.join(NSITES,fn), buildProxyConf({...h, sslMode:"none"}));
+      await execAsync("nginx -t && systemctl reload nginx");
+      const meta = loadProxyMeta(); meta[fn]=h; saveProxyMeta(meta);
+      const emailArg = h.letsencryptEmail ? `-m ${sh(h.letsencryptEmail)}` : "--register-unsafely-without-email";
+      const domainArgs = h.domains.map(d=>`-d ${sh(d)}`).join(" ");
+      const jobId = runJob(`certbot certonly --nginx --non-interactive --agree-tos ${emailArg} ${domainArgs} 2>&1 && echo "=== Certificat obtenu — finalisation... ===" && curl -s -X POST -H 'Content-Type: application/json' -b "gravity_sid=${getSid(req)}" http://127.0.0.1:${process.env.GRAVITY_PORT||4000}/api/proxy/hosts/${fn}/finalize-ssl >/dev/null && echo "=== Hôte HTTPS actif ✓ ==="`);
+      return res.json({ok:true, jobId, name:fn});
+    }
+    fs.writeFileSync(path.join(NSITES,fn), buildProxyConf(h));
+    await execAsync("nginx -t && systemctl reload nginx");
+    const meta = loadProxyMeta(); meta[fn]=h; saveProxyMeta(meta);
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:"Erreur Nginx : "+e.message}); }
+});
+
+// Réécrit le vhost avec le bloc HTTPS complet une fois le certificat Let's Encrypt obtenu
+app.post("/api/proxy/hosts/:name/finalize-ssl", auth, async (req,res) => {
+  try {
+    const meta = loadProxyMeta();
+    const h = meta[req.params.name];
+    if (!h) return res.status(404).json({error:"Hôte introuvable"});
+    fs.writeFileSync(path.join(NSITES,req.params.name), buildProxyConf(h));
+    await execAsync("nginx -t && systemctl reload nginx");
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:"Erreur Nginx : "+e.message}); }
+});
+
+app.delete("/api/proxy/hosts/:n", auth, async (req,res) => {
+  try {
+    fs.unlinkSync(path.join(NSITES,req.params.n));
+    const meta = loadProxyMeta(); delete meta[req.params.n]; saveProxyMeta(meta);
+    await execAsync("systemctl reload nginx");
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Certificat custom : cert + clé collés en texte (pas d'upload multipart dans ce projet)
+app.post("/api/proxy/custom-cert", auth, (req,res) => {
+  const { name, cert, key } = req.body;
+  if (!name || !cert || !key) return res.status(400).json({error:"Certificat et clé requis"});
+  try {
+    const dir = "/etc/nginx/custom-certs";
+    fs.mkdirSync(dir,{recursive:true, mode:0o700});
+    const safe = name.replace(/[^a-zA-Z0-9_-]/g,"");
+    fs.writeFileSync(path.join(dir,safe+".crt"), cert);
+    fs.writeFileSync(path.join(dir,safe+".key"), key, {mode:0o600});
+    res.json({ok:true, certPath:path.join(dir,safe+".crt"), keyPath:path.join(dir,safe+".key")});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  VMs
@@ -373,13 +607,256 @@ app.post("/api/isos/download", auth, (req,res)=>{const{url,name}=req.body;const 
 app.get("/api/usb",            auth, async(req,res)=>{try{const{stdout}=await execAsync("lsusb");res.json(stdout.split("\n").filter(Boolean).map(l=>{const m=l.match(/Bus (\d+) Device (\d+): ID (\S+) (.+)/);return m?{bus:m[1],device:m[2],id:m[3],name:m[4]}:null;}).filter(Boolean));}catch{res.json([]);}});
 app.get("/api/networks",       auth, async(req,res)=>{try{const r=await virsh("net-list --all");res.json(r.split("\n").slice(2).filter(Boolean).map(l=>{const p=l.trim().split(/\s{2,}/);return{name:p[0],state:p[1]};}).filter(n=>n.name));}catch{res.json([]);}});
 
+// ── Jobs asynchrones génériques (pull d'image, compose, volumes, RAID, backup)
+//    même principe que streamUpdate mais plusieurs jobs concurrents, par id ────
+const jobs = new Map();
+function runJob(cmd) {
+  const jobId = crypto.randomBytes(8).toString("hex");
+  const job = { log: [], running: true };
+  jobs.set(jobId, job);
+  const child = spawn("bash", ["-c", cmd], { env:{...process.env, DEBIAN_FRONTEND:"noninteractive", LANG:"C"} });
+  child.stdout.on("data", d=>job.log.push(d.toString()));
+  child.stderr.on("data", d=>job.log.push(d.toString()));
+  child.on("close", code=>{ job.running=false; job.log.push(`\n=== ${code===0?"Terminé ✓":"Erreur (code "+code+")"} ===`); });
+  return jobId;
+}
+app.get("/api/jobs/:id", auth, (req,res)=>{
+  const job = jobs.get(req.params.id);
+  if(!job) return res.status(404).json({error:"Job introuvable"});
+  res.json({log: job.log.join(""), running: job.running});
+});
+function sh(v){ return `'${String(v).replace(/'/g,"'\\''")}'`; }
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  DOCKER
 // ══════════════════════════════════════════════════════════════════════════════
+
+// ── docker compose (v2 "docker compose" si dispo, sinon "docker-compose" v1) ──
+let COMPOSE_CMD = null;
+function composeCmd() {
+  if (COMPOSE_CMD) return COMPOSE_CMD;
+  try { execSync("docker compose version", {stdio:"ignore"}); COMPOSE_CMD = "docker compose"; }
+  catch { COMPOSE_CMD = "docker-compose"; }
+  return COMPOSE_CMD;
+}
+const COMPOSE_DIR = "/srv/docker/compose";
+
+// ── Conteneurs ──────────────────────────────────────────────────────────────
 app.get("/api/containers", auth, async(req,res)=>{if(!docker)return res.json([]);try{const cs=await docker.listContainers({all:true});res.json(cs.map(c=>({id:c.Id.slice(0,12),name:c.Names[0]?.replace("/",""),image:c.Image,state:c.State,status:c.Status,ports:c.Ports.map(p=>`${p.PublicPort||""}:${p.PrivatePort}`).filter(p=>p!==":").join(", ")})));}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/containers/:id/start", auth, async(req,res)=>{try{await docker.getContainer(req.params.id).start();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/containers/:id/stop",  auth, async(req,res)=>{try{await docker.getContainer(req.params.id).stop();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.delete("/api/containers/:id",     auth, async(req,res)=>{try{await docker.getContainer(req.params.id).remove({force:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/containers/:id/start",   auth, async(req,res)=>{try{await docker.getContainer(req.params.id).start();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/containers/:id/stop",    auth, async(req,res)=>{try{await docker.getContainer(req.params.id).stop();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/containers/:id/restart", auth, async(req,res)=>{try{await docker.getContainer(req.params.id).restart();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.delete("/api/containers/:id",       auth, async(req,res)=>{try{await docker.getContainer(req.params.id).remove({force:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.get("/api/containers/:id/logs", auth, async(req,res)=>{
+  try { const {stdout} = await execAsync(`docker logs --tail 300 ${sh(req.params.id)} 2>&1`); res.type("text/plain").send(stdout); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Créer un conteneur (wizard) — image + nom + ports + volumes + env + politique de redémarrage
+app.post("/api/docker/containers/create", auth, (req,res)=>{
+  const { image, name, ports, volumes, env, restartPolicy, network, command } = req.body;
+  if(!image || !/^[a-zA-Z0-9._\-\/:]+$/.test(image)) return res.status(400).json({error:"Image invalide"});
+  try {
+    const args = ["run","-d"];
+    if(name) args.push("--name", sh(name.replace(/[^a-zA-Z0-9_.-]/g,"")));
+    args.push("--restart", sh(["always","unless-stopped","on-failure","no"].includes(restartPolicy)?restartPolicy:"unless-stopped"));
+    if(network) args.push("--network", sh(network.replace(/[^a-zA-Z0-9_.-]/g,"")));
+    for(const p of (ports||[])) if(p.host && p.container) args.push("-p", sh(`${p.host}:${p.container}${p.proto==="udp"?"/udp":""}`));
+    for(const v of (volumes||[])) if(v.host && v.container) args.push("-v", sh(`${v.host}:${v.container}${v.ro?":ro":""}`));
+    for(const e of (env||[])) if(e.key) args.push("-e", sh(`${e.key}=${e.value||""}`));
+    args.push(sh(image));
+    if(command && command.trim()) args.push(command.trim());
+    const jobId = runJob(`docker ${args.join(" ")} 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ── Images ────────────────────────────────────────────────────────────────
+app.get("/api/docker/images", auth, async(req,res)=>{
+  if(!docker) return res.json([]);
+  try {
+    const imgs = await docker.listImages();
+    res.json(imgs.map(i=>{
+      const tag = i.RepoTags?.[0] || "<none>:<none>";
+      const sep = tag.lastIndexOf(":");
+      return { id:i.Id.replace("sha256:","").slice(0,12), repo:tag.slice(0,sep), tag:tag.slice(sep+1), size:i.Size, created:i.Created };
+    }));
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/docker/images/pull", auth, (req,res)=>{
+  const { image } = req.body;
+  if(!image || !/^[a-zA-Z0-9._\-\/:]+$/.test(image)) return res.status(400).json({error:"Nom d'image invalide"});
+  const jobId = runJob(`docker pull ${sh(image)} 2>&1`);
+  res.json({ok:true, jobId});
+});
+app.delete("/api/docker/images/:id", auth, async(req,res)=>{
+  try { await docker.getImage(req.params.id).remove({force:true}); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ── Registre (Docker Hub) ────────────────────────────────────────────────────
+app.get("/api/docker/search", auth, async(req,res)=>{
+  const q = (req.query.q||"").trim();
+  if(!q) return res.json([]);
+  try {
+    const r = await fetch(`https://hub.docker.com/v2/search/repositories/?query=${encodeURIComponent(q)}&page_size=20`);
+    const d = await r.json();
+    res.json((d.results||[]).map(x=>({ name:x.repo_name, description:x.short_description, stars:x.star_count, official:x.is_official, automated:x.is_automated })));
+  } catch(e){ res.status(500).json({error:"Recherche impossible (pas d'accès internet ?) — "+e.message}); }
+});
+
+// ── Docker Compose (stacks) ──────────────────────────────────────────────────
+app.get("/api/docker/compose", auth, (req,res)=>{
+  try {
+    fs.mkdirSync(COMPOSE_DIR,{recursive:true});
+    res.json(fs.readdirSync(COMPOSE_DIR).filter(d=>fs.existsSync(path.join(COMPOSE_DIR,d,"docker-compose.yml"))));
+  } catch(e){ res.json([]); }
+});
+app.get("/api/docker/compose/:name", auth, (req,res)=>{
+  try {
+    const f = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""), "docker-compose.yml");
+    res.type("text/plain").send(fs.readFileSync(f,"utf8"));
+  } catch(e){ res.status(404).json({error:"Stack introuvable"}); }
+});
+app.post("/api/docker/compose", auth, (req,res)=>{
+  const { name, content } = req.body;
+  if(!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de stack invalide (lettres/chiffres/-/_ uniquement)"});
+  if(!content || !content.trim()) return res.status(400).json({error:"Contenu docker-compose.yml requis"});
+  try {
+    const dir = path.join(COMPOSE_DIR, name);
+    fs.mkdirSync(dir,{recursive:true});
+    fs.writeFileSync(path.join(dir,"docker-compose.yml"), content);
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/docker/compose/:name/up", auth, (req,res)=>{
+  try {
+    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/docker/compose/:name/down", auth, (req,res)=>{
+  try {
+    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  BACKUP — local / USB / distant (FTP, SMB) — config NAS, Docker, VMs, Volumes
+// ══════════════════════════════════════════════════════════════════════════════
+const BACKUP_REMOTES = `${CFG}/backup-remotes.json`;
+function loadRemotes(){ try{ return JSON.parse(fs.readFileSync(BACKUP_REMOTES,"utf8")); } catch{ return []; } }
+function saveRemotes(r){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(BACKUP_REMOTES, JSON.stringify(r,null,2)); }
+
+// Destinations "remote" enregistrées (FTP/SMB) — le mot de passe n'est jamais renvoyé au client
+app.get("/api/backup/remotes", auth, (req,res)=> res.json(loadRemotes().map(({password,...r})=>r)) );
+app.post("/api/backup/remotes", auth, (req,res)=>{
+  const { name, type, host, port, path:rp, user, password } = req.body;
+  if(!name || !["ftp","smb"].includes(type) || !host) return res.status(400).json({error:"Champs requis manquants (nom, type, hôte)"});
+  const remotes = loadRemotes();
+  remotes.push({ id:crypto.randomBytes(6).toString("hex"), name, type, host, port:port||(type==="ftp"?21:445), path:rp||"/", user:user||"", password:password||"" });
+  saveRemotes(remotes);
+  res.json({ok:true});
+});
+app.delete("/api/backup/remotes/:id", auth, (req,res)=>{ saveRemotes(loadRemotes().filter(r=>r.id!==req.params.id)); res.json({ok:true}); });
+
+// Destinations "locales" utilisables : volumes NAS + clés USB montées
+app.get("/api/backup/local-targets", auth, async(req,res)=>{
+  try {
+    const targets = [];
+    fs.mkdirSync(VOL_ROOT,{recursive:true});
+    for (const name of fs.readdirSync(VOL_ROOT)) targets.push({ label:"Volume : "+name, path:path.join(VOL_ROOT,name) });
+    const flat = lsblkFlat(await lsblkTree());
+    for (const d of flat.filter(x=>x.tran==="usb" && x.mountpoint)) targets.push({ label:"Clé USB : "+d.mountpoint, path:d.mountpoint });
+    res.json(targets);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Lance une sauvegarde : scope = tableau parmi ["config","docker","vms","volumes"]
+app.post("/api/backup/run", auth, async(req,res)=>{
+  const { scope, volumes, destType, destPath, remoteId } = req.body;
+  const sc = Array.isArray(scope) ? scope : [];
+  if(!sc.length) return res.status(400).json({error:"Sélectionnez au moins un élément à sauvegarder"});
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g,"-");
+    const archiveName = `gravityos-backup-${stamp}.tar.gz`;
+    const tmpFile = `/tmp/${archiveName}`;
+    const paths = [];
+    if (sc.includes("config")) for (const p of ["/etc/gravity","/etc/samba/smb.conf","/etc/exports"]) if (fs.existsSync(p)) paths.push(p);
+    if (sc.includes("docker") && fs.existsSync(COMPOSE_DIR)) paths.push(COMPOSE_DIR);
+    let pre = "";
+    if (sc.includes("vms")) {
+      pre += `mkdir -p /tmp/gravity-vm-defs && for vm in $(virsh --connect qemu:///system list --all --name 2>/dev/null); do virsh --connect qemu:///system dumpxml "$vm" > "/tmp/gravity-vm-defs/$vm.xml" 2>/dev/null; done\n`;
+      paths.push("/tmp/gravity-vm-defs");
+    }
+    if (sc.includes("volumes") && Array.isArray(volumes)) {
+      for (const v of volumes) { const p = path.join(VOL_ROOT, String(v).replace(/[^a-zA-Z0-9_-]/g,"")); if (fs.existsSync(p)) paths.push(p); }
+    }
+    if (!paths.length) return res.status(400).json({error:"Rien à sauvegarder pour cette sélection"});
+
+    let sendCmd;
+    if (destType==="local" || destType==="usb") {
+      if (!destPath) return res.status(400).json({error:"Destination requise"});
+      sendCmd = `mkdir -p ${sh(destPath)} && cp ${sh(tmpFile)} ${sh(path.join(destPath,archiveName))}`;
+    } else if (destType==="ftp" || destType==="smb") {
+      const r = loadRemotes().find(x=>x.id===remoteId);
+      if (!r) return res.status(400).json({error:"Destination distante introuvable"});
+      const rpath = r.path.endsWith("/") ? r.path : r.path+"/";
+      sendCmd = r.type==="ftp"
+        ? `curl -sS -T ${sh(tmpFile)} ${sh(`ftp://${r.host}:${r.port}${rpath}${archiveName}`)} --user ${sh(r.user+":"+r.password)}`
+        : `smbclient ${sh("//"+r.host+"/"+r.path)} -U ${sh(r.user+"%"+r.password)} -c ${sh("put "+tmpFile+" "+archiveName)}`;
+    } else return res.status(400).json({error:"Type de destination invalide"});
+
+    const cmd = `${pre}tar -czf ${sh(tmpFile)} ${paths.map(sh).join(" ")} 2>&1
+echo "Archive créée : $(du -h ${sh(tmpFile)} | cut -f1)"
+${sendCmd} 2>&1
+rm -f ${sh(tmpFile)}
+echo "=== Sauvegarde envoyée avec succès ==="`;
+    const jobId = runJob(cmd);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Liste les archives de sauvegarde (*.tar.gz) trouvées sur les volumes/clés USB
+app.get("/api/backup/archives", auth, async(req,res)=>{
+  try {
+    const targets = [];
+    fs.mkdirSync(VOL_ROOT,{recursive:true});
+    for (const name of fs.readdirSync(VOL_ROOT)) targets.push(path.join(VOL_ROOT,name));
+    const flat = lsblkFlat(await lsblkTree());
+    for (const d of flat.filter(x=>x.tran==="usb" && x.mountpoint)) targets.push(d.mountpoint);
+    const archives = [];
+    for (const dir of targets) {
+      try { for (const f of fs.readdirSync(dir)) if (f.endsWith(".tar.gz") && f.startsWith("gravityos-backup-")) archives.push(path.join(dir,f)); } catch {}
+    }
+    res.json(archives);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Importer une configuration NAS depuis une archive de sauvegarde déjà présente
+// sur un volume/clé USB (pas d'upload navigateur — cohérent avec le reste de
+// l'appli qui pilote tout via des chemins locaux, pas de multipart/form-data)
+app.post("/api/settings/import-config", auth, (req,res)=>{
+  const { archivePath } = req.body;
+  if(!archivePath || !fs.existsSync(archivePath)) return res.status(400).json({error:"Archive introuvable à ce chemin"});
+  const cmd = `
+    tar -tzf ${sh(archivePath)} etc/gravity >/dev/null 2>&1 || { echo "Cette archive ne contient pas de configuration NAS (créez une sauvegarde avec 'Config NAS' cochée)"; exit 1; }
+    tar -xzf ${sh(archivePath)} -C / etc/gravity etc/samba/smb.conf etc/exports 2>&1
+    exportfs -ra 2>&1 || true
+    systemctl reload smbd nmbd 2>&1 || true
+    echo "=== Configuration importée — redémarrage de la WebUI dans 3s ==="
+    (sleep 3 && systemctl restart gravity-webui) &
+    disown
+  `;
+  const jobId = runJob(cmd);
+  res.json({ok:true, jobId});
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  UTILISATEURS

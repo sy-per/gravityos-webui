@@ -112,23 +112,36 @@ select.form-input option{background:#13141f}
     </div>
   </div>
 
-  <!-- Étape 0 : Bienvenue -->
+  <!-- Étape 0 : Choix Installer / Essayer -->
   <div class="step active" id="s0">
     <div class="logo-wrap">
       <img src="/gravity-logo.png" class="logo-img" alt="GravityOS"
            onerror="this.outerHTML='<div style=\'font-size:24px;font-weight:700;background:linear-gradient(135deg,#6c63ff,#4f8ef7);-webkit-background-clip:text;-webkit-text-fill-color:transparent\'>⚡ GravityOS</div>'">
     </div>
-    <div class="step-title">Bienvenue sur GravityOS 🎉</div>
-    <div class="step-sub">Configurons votre NAS en 3 étapes rapides. Cette configuration ne s'effectue qu'une seule fois.</div>
-    <div class="welcome-checks">
-      <div class="wcheck"><span class="wcheck-ico">✓</span>Debian 12 Bookworm — système opérationnel</div>
-      <div class="wcheck"><span class="wcheck-ico">✓</span>SMB, NFS, FTP — services de partage prêts</div>
-      <div class="wcheck"><span class="wcheck-ico">✓</span>Docker &amp; KVM — virtualisation disponible</div>
-      <div class="wcheck"><span class="wcheck-ico">✓</span>Nginx — proxy inverse intégré</div>
+    <div class="step-title" style="text-align:center;margin-bottom:8px">Bienvenue sur GravityOS</div>
+    <div class="step-sub" style="text-align:center;margin-bottom:28px">NAS System basé sur Debian 12 — KVM · Docker · SMB · NFS · FTP</div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+      <!-- Bouton Installer -->
+      <div onclick="chooseInstall()" id="choice-install" style="border:2px solid var(--border);border-radius:16px;padding:24px;cursor:pointer;text-align:center;transition:all .2s;background:rgba(108,99,255,.04)">
+        <div style="font-size:44px;margin-bottom:12px">💾</div>
+        <div style="font-size:16px;font-weight:700;margin-bottom:8px">Installer</div>
+        <div style="font-size:12px;color:var(--text2);line-height:1.5">Installer GravityOS sur un disque dur de façon permanente</div>
+        <div style="margin-top:14px;padding:8px 16px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:8px;color:#fff;font-size:13px;font-weight:600">Installer →</div>
+      </div>
+      <!-- Bouton Essayer -->
+      <div onclick="chooseEssayer()" id="choice-essayer" style="border:2px solid var(--border);border-radius:16px;padding:24px;cursor:pointer;text-align:center;transition:all .2s;background:rgba(255,255,255,.02)">
+        <div style="font-size:44px;margin-bottom:12px">🚀</div>
+        <div style="font-size:16px;font-weight:700;margin-bottom:8px">Essayer</div>
+        <div style="font-size:12px;color:var(--text2);line-height:1.5">Démarrer directement avec le compte par défaut (gravity/gravity), sans installer</div>
+        <div style="margin-top:14px;padding:8px 16px;border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:13px;font-weight:600">Essayer →</div>
+      </div>
     </div>
-    <div class="actions">
-      <button class="btn-next" style="flex:1" onclick="goStep(1)">Commencer la configuration →</button>
+
+    <div style="font-size:11px;color:var(--text3);text-align:center">
+      Mode Live CD — les données ne sont pas sauvegardées après redémarrage
     </div>
+    <div class="error" id="err0"></div>
   </div>
 
   <!-- Étape 1 : Serveur -->
@@ -243,6 +256,40 @@ select.form-input option{background:#13141f}
 <script>
 let data = {};
 
+function chooseInstall() {
+  window.location.href = '/install';
+}
+
+async function chooseEssayer() {
+  const card = document.getElementById('choice-essayer');
+  const err = document.getElementById('err0');
+  card.style.borderColor = 'var(--accent)';
+  card.style.background = 'rgba(108,99,255,.08)';
+  card.style.pointerEvents = 'none';
+  try {
+    // Mode "essayer" : pas de compte à créer, on garde le gravity/gravity
+    // déjà en place (comme un live CD classique) — l'installeur, lui,
+    // continue de demander un compte via /install.
+    const r = await fetch('/api/wizard/complete', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({})
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || "Erreur lors de l'application");
+    await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({username:'gravity', password:'gravity'})
+    });
+    window.location.href = '/';
+  } catch(e) {
+    err.textContent = e.message || 'Erreur réseau';
+    err.classList.add('show');
+    card.style.pointerEvents = '';
+  }
+}
+
 function goStep(n) {
   document.querySelectorAll('.step').forEach((s,i) => s.classList.toggle('active', i===n));
   // Progress dots
@@ -308,28 +355,41 @@ async function applyConfig() {
   btn.disabled = true; spin.style.display = 'inline-block';
   err.classList.remove('show');
   try {
+    // 1. Appliquer la config
     const r = await fetch('/api/wizard/complete', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(data)
     });
     const d = await r.json();
-    if(d.ok) {
-      // Afficher écran succès
-      goStep(4);
-      document.getElementById('s-url').textContent = `http://${data.hostname}.local`;
-      document.getElementById('s-ssh').textContent = `ssh ${data.username}@${data.hostname}.local`;
-      document.getElementById('s-smb').textContent = `\\\\${data.hostname}\\public`;
-      // Barre de progression redirection
-      setTimeout(() => document.getElementById('redirect-bar').style.width = '100%', 100);
-      setTimeout(() => window.location.href = '/login.html', 3200);
-    } else {
-      err.textContent = d.error || 'Erreur lors de l\'application';
+    if(!d.ok) {
+      err.textContent = d.error || "Erreur lors de l'application";
       err.classList.add('show');
       btn.disabled = false; spin.style.display = 'none';
+      return;
     }
+
+    // 2. Auto-login avec les credentials saisis
+    const loginR = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({username: data.username, password: data.password})
+    });
+    const loginD = await loginR.json();
+
+    // 3. Afficher succès et rediriger vers le dashboard
+    goStep(4);
+    document.getElementById('s-url').textContent  = `http://${data.hostname}.local`;
+    document.getElementById('s-ssh').textContent  = `ssh ${data.username}@${data.hostname}.local`;
+    document.getElementById('s-smb').textContent  = `\\\\${data.hostname}\\public`;
+    setTimeout(() => document.getElementById('redirect-bar').style.width = '100%', 100);
+    // Si login réussi → dashboard, sinon → page login
+    setTimeout(() => {
+      window.location.href = loginD.ok ? '/' : '/login.html';
+    }, 3200);
+
   } catch(e) {
-    err.textContent = 'Erreur réseau — vérifiez que le serveur est démarré';
+    err.textContent = 'Erreur réseau';
     err.classList.add('show');
     btn.disabled = false; spin.style.display = 'none';
   }

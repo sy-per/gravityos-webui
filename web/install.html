@@ -515,15 +515,28 @@ function showSuccess() {
     document.getElementById('reboot-txt').textContent = 'Redémarrage automatique dans ' + t + 's...';
     document.getElementById('reboot-fill').style.width = ((15-t)/15*100) + '%';
     document.getElementById('reboot-fill').style.transition = 'width 1s linear';
-    if (t <= 0) { clearInterval(rebootTimer); doReboot(); }
+    if (t <= 0) { clearInterval(rebootTimer); doReboot(hostname); }
   }, 1000);
 }
 
-async function doReboot() {
+async function doReboot(hostname) {
   if (rebootTimer) clearInterval(rebootTimer);
+  const h = hostname || document.getElementById('cfg-hostname')?.value || 'gravity-nas';
   document.getElementById('reboot-txt').textContent = 'Redémarrage en cours...';
   document.querySelector('.btn-success').disabled = true;
   await fetch('/api/install/reboot', {method:'POST', credentials:'include'});
+  // Rediriger vers le nouveau hostname 10s après le reboot
+  document.getElementById('reboot-txt').textContent = 'Redirection vers http://' + h + '.local dans 10s...';
+  let countdown = 10;
+  const iv = setInterval(() => {
+    countdown--;
+    document.getElementById('reboot-txt').textContent =
+      'Redirection vers http://' + h + '.local dans ' + countdown + 's...';
+    if (countdown <= 0) {
+      clearInterval(iv);
+      window.location.href = 'http://' + h + '.local';
+    }
+  }, 1000);
 }
 </script>
 </body>
