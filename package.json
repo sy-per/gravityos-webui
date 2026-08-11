@@ -1,6 +1,6 @@
 {
   "name": "gravityos-webui",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "GravityOS NAS WebUI — Backend Node.js + Interface Web",
   "main": "server.js",
   "scripts": {
