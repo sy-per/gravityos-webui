@@ -1379,7 +1379,7 @@ function resetContainerForm(){
 }
 function ccRow(containerId,ph1,ph2,extra,vals){
   const row=document.createElement('div'); row.className='rowform';
-  row.innerHTML=`<input type="text" placeholder="${ph1}" value="${vals?.[0]||''}"><input type="text" placeholder="${ph2}" value="${vals?.[1]||''}">${extra||''}<button class="btn btn-danger" onclick="this.parentElement.remove()">✕</button>`;
+  row.innerHTML=`<input type="text" placeholder="${ph1}" value="${vals?.[0]||''}">${extra||''}<input type="text" placeholder="${ph2}" value="${vals?.[1]||''}"><button class="btn btn-danger" onclick="this.parentElement.remove()">✕</button>`;
   document.getElementById(containerId).appendChild(row);
   return row;
 }
