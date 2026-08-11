@@ -871,7 +871,7 @@ function nav(id) {
   document.getElementById('panel-'+id)?.classList.add('active');
   document.getElementById('s-'+id)?.classList.add('active');
   const loaders = {dash:loadDash,storage:loadStorage,shares:loadShares,proxy:loadProxy,vms:loadVms,docker:loadContainers,updates:loadUpdates,settings:loadSettings};
-  if(id==='docker') loadImages(); // pré-charge pour le <datalist> du wizard de création
+  if(id==='docker'){ loadImages(); resumeContainerJob(); } // pré-charge pour le <datalist> du wizard + reprend un suivi de création en cours
   loaders[id]?.();
   // terminal : charger shellinabox avec le bon host (NAS, pas localhost client)
   if(id==='terminal') {
@@ -1354,13 +1354,25 @@ async function loadContainers(){
   const cs=await api('GET','/api/containers');
   document.getElementById('docker-table').innerHTML=(cs||[]).map(c=>`<tr><td><strong>${c.name||c.id}</strong></td><td class="mono">${c.image}</td><td class="mono">${c.ports||'—'}</td><td><span class="badge ${c.state==='running'?'bg':c.state==='exited'?'br':'ba'}">${c.state}</span></td><td class="mono">${c.cpu||'—'}</td><td class="mono">${c.mem?c.mem.split('/')[0].trim()+(c.memPct?' ('+c.memPct+')':''):'—'}</td><td style="display:flex;gap:6px;padding:10px 14px">${c.state==='running'?`<button class="btn" onclick="cAction('${c.id}','stop')">⏹</button><button class="btn" onclick="cAction('${c.id}','restart')">⟳</button>`:`<button class="btn btn-primary" onclick="cAction('${c.id}','start')">▶</button>`}<button class="btn" onclick="containerLogs('${c.id}')">📋</button><button class="btn btn-danger" onclick="cAction('${c.id}','delete')">✕</button></td></tr>`).join('')||'<tr><td colspan="7" style="color:var(--text3)">Aucun conteneur</td></tr>';
 }
-async function cAction(id,action){const url=action==='delete'?`/api/containers/${id}`:`/api/containers/${id}/${action}`;const r=await api(action==='delete'?'DELETE':'POST',url);toast('Docker',r?.ok?'OK':r?.error||'Erreur');loadContainers();}
+async function cAction(id,action){
+  if(action==='delete' && !confirm('Supprimer ce conteneur ? Cette action est irréversible.')) return;
+  const url=action==='delete'?`/api/containers/${id}`:`/api/containers/${id}/${action}`;
+  const r=await api(action==='delete'?'DELETE':'POST',url);
+  toast('Docker',r?.ok?'OK':r?.error||'Erreur');
+  loadContainers();
+}
 async function containerLogs(id){
   const box=document.getElementById('container-logs-box');
   if(box.style.display==='block'&&box.dataset.id===id){box.style.display='none';return;}
   box.dataset.id=id; box.style.display='block'; box.textContent='Chargement...';
-  const r=await fetch('/api/containers/'+id+'/logs',{credentials:'include'});
-  box.textContent=r.ok?await r.text():'Erreur de lecture des logs';
+  box.scrollIntoView({behavior:'smooth', block:'nearest'});
+  try {
+    const r=await fetch('/api/containers/'+id+'/logs',{credentials:'include'});
+    const text = await r.text();
+    box.textContent = r.ok ? (text || '(aucun log — le conteneur n\'a peut-être encore rien écrit)') : ('Erreur : '+text);
+  } catch(e) {
+    box.textContent = 'Erreur réseau : '+e.message;
+  }
   box.scrollTop=box.scrollHeight;
 }
 
@@ -1441,7 +1453,17 @@ async function createContainer(){
   const r=await api('POST','/api/docker/containers/create',body);
   btn.disabled=false; btn.textContent='🚀 Créer et démarrer';
   if(!r?.ok){err.textContent=r?.error||'Erreur inconnue';err.style.display='block';return;}
-  pollJob(r.jobId,'cc-log',()=>{loadContainers();toast('Docker','Conteneur créé ✓ (voir le journal ci-dessus pour le détail)');});
+  sessionStorage.setItem('gravity-cc-jobid', r.jobId);
+  pollJob(r.jobId,'cc-log',()=>{sessionStorage.removeItem('gravity-cc-jobid');loadContainers();toast('Docker','Conteneur créé ✓ (voir le journal ci-dessus pour le détail)');});
+}
+// Si une création de conteneur était en cours (pull d'image longue) et que
+// l'utilisateur a changé d'onglet ou rechargé la page entre-temps, reprend
+// l'affichage du journal au lieu de le perdre silencieusement.
+function resumeContainerJob(){
+  const jobId = sessionStorage.getItem('gravity-cc-jobid');
+  if(!jobId) return;
+  document.getElementById('container-form').style.display='block';
+  pollJob(jobId,'cc-log',()=>{sessionStorage.removeItem('gravity-cc-jobid');loadContainers();});
 }
 
 // ── Images ────────────────────────────────────────────────────────────────────

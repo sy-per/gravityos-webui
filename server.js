@@ -646,7 +646,11 @@ app.get("/api/networks",       auth, async(req,res)=>{try{const r=await virsh("n
 const jobs = new Map();
 function runJob(cmd) {
   const jobId = crypto.randomBytes(8).toString("hex");
-  const job = { log: [], running: true };
+  // Toujours une première ligne immédiate : sans ça la boîte de log reste
+  // vide tant que la commande n'a rien écrit (ex: pull d'une grosse image
+  // qui met du temps avant le premier octet), donnant l'impression que rien
+  // ne se passe.
+  const job = { log: ["$ "+cmd.trim().split("\n")[0]+"\n"], running: true };
   jobs.set(jobId, job);
   const child = spawn("bash", ["-c", cmd], { env:{...process.env, DEBIAN_FRONTEND:"noninteractive", LANG:"C"} });
   child.stdout.on("data", d=>job.log.push(d.toString()));
