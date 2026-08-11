@@ -1000,11 +1000,10 @@ app.get("/api/updates/gravity/check", auth, async(req,res) => {
     if(!isGit) return res.json({available:true, message:"Repo non initialisé — cliquez Mettre à jour", count:1, commits:["Premier déploiement depuis git"]});
     // Fix ownership
     await execAsync("git config --global --add safe.directory /opt/gravity 2>/dev/null").catch(()=>{});
-    await execAsync("git -C /opt/gravity fetch origin 2>/dev/null");
-    // Détecter branche principale (main ou master)
-    const {stdout:branch} = await execAsync("git -C /opt/gravity symbolic-ref --short HEAD 2>/dev/null").catch(()=>({stdout:"main"}));
-    const br = branch.trim() || "main";
-    const {stdout} = await execAsync(`git -C /opt/gravity log HEAD..origin/${br} --oneline 2>/dev/null`).catch(()=>({stdout:""}));
+    await execAsync("git -C /opt/gravity fetch origin main 2>/dev/null");
+    // Branche fixe "main" (cohérent avec /api/updates/gravity/start qui fait
+    // désormais un reset --hard sur origin/main, pas de détection de branche)
+    const {stdout} = await execAsync(`git -C /opt/gravity log HEAD..origin/main --oneline 2>/dev/null`).catch(()=>({stdout:""}));
     const commits = stdout.trim().split("\n").filter(Boolean);
     const {stdout:ver} = await execAsync("git -C /opt/gravity log -1 --format='%h — %s — %cr' 2>/dev/null").catch(()=>({stdout:"inconnu"}));
     res.json({available: commits.length>0, commits, count: commits.length, currentVersion: ver.trim()});
@@ -1034,11 +1033,21 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
     else
       echo "Mise a jour..."
       git config --global --add safe.directory /opt/gravity
-      git fetch origin
-      # Gérer master vs main
-      BRANCH=$(git remote show origin 2>/dev/null | grep 'HEAD branch' | cut -d' ' -f5 || echo main)
-      git checkout $BRANCH 2>/dev/null || git checkout -b $BRANCH --track origin/$BRANCH
-      git pull origin $BRANCH
+      # /opt/gravity n'a jamais de commits locaux légitimes (c'est un
+      # déploiement, pas un dépôt de dev) : fetch + reset --hard converge
+      # TOUJOURS vers origin/main, peu importe l'état local (HEAD détaché,
+      # branche locale bizarre, modifications non commitées...). L'ancienne
+      # méthode (détection de branche via "git remote show origin" + "git
+      # pull") pouvait échouer silencieusement (script sans "set -e") et
+      # laisser le dépôt bloqué indéfiniment derrière origin, avec "Vérifier"
+      # signalant sans cesse les mêmes commits disponibles après coup.
+      if ! git fetch origin main 2>&1; then
+        echo "ERREUR: impossible de contacter GitHub (fetch échoué)"
+      elif ! git reset --hard origin/main 2>&1; then
+        echo "ERREUR: git reset --hard a échoué"
+      else
+        echo "Dépôt synchronisé sur origin/main : $(git log -1 --format='%h %s')"
+      fi
     fi
 
     echo ""
