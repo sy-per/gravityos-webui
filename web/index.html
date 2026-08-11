@@ -143,6 +143,9 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
 .notif-t{font-weight:600;font-size:13px;margin-bottom:3px}
 .notif-b{font-size:12px;color:var(--text2)}
 
+.spin{animation:spin 1.6s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+
 /* ── SCROLLBAR ── */
 ::-webkit-scrollbar{width:4px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -649,8 +652,8 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
         </div>
       </div>
 
-      <table><thead><tr><th>Nom</th><th>Image</th><th>Ports</th><th>État</th><th>Actions</th></tr></thead>
-      <tbody id="docker-table"><tr><td colspan="5" style="color:var(--text3)">Chargement...</td></tr></tbody></table>
+      <table><thead><tr><th>Nom</th><th>Image</th><th>Ports</th><th>État</th><th>CPU</th><th>RAM</th><th>Actions</th></tr></thead>
+      <tbody id="docker-table"><tr><td colspan="7" style="color:var(--text3)">Chargement...</td></tr></tbody></table>
       <div id="container-logs-box" class="logbox"></div>
     </div>
   </div>
@@ -797,8 +800,8 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
     <div class="card">
       <div class="card-title">⚡ Actions</div>
       <div style="display:flex;gap:10px">
-        <button class="btn" onclick="if(confirm('Redémarrer le serveur ?'))api('POST','/api/system/reboot')">↺ Redémarrer</button>
-        <button class="btn btn-danger" onclick="if(confirm('Éteindre le serveur ?'))api('POST','/api/system/shutdown')">⏻ Éteindre</button>
+        <button class="btn" onclick="powerAction('reboot')">↺ Redémarrer</button>
+        <button class="btn btn-danger" onclick="powerAction('shutdown')">⏻ Éteindre</button>
       </div>
     </div>
 
@@ -824,6 +827,39 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
 </div><!-- main -->
 
 <div class="notif" id="notif"><div class="notif-t" id="notif-t"></div><div class="notif-b" id="notif-b"></div></div>
+
+<!-- Sélecteur de dossier (volumes Docker) -->
+<div id="dirpicker-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9998;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;width:480px;max-width:90vw;max-height:75vh;display:flex;flex-direction:column">
+    <div style="font-weight:700;margin-bottom:8px">📁 Choisir un dossier</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <button class="btn" style="flex:1" onclick="dirPickerLoad('/srv/volumes')">💾 Volumes</button>
+      <button class="btn" style="flex:1" onclick="dirPickerLoad('/srv/shares')">🏠 Volume 1 (système)</button>
+    </div>
+    <div id="dirpicker-path" class="mono" style="font-size:11px;color:var(--text2);margin-bottom:8px;word-break:break-all"></div>
+    <div id="dirpicker-list" style="flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:6px;margin-bottom:10px;min-height:180px"></div>
+    <div style="display:flex;gap:8px;margin-bottom:10px">
+      <input type="text" id="dirpicker-newname" placeholder="Nouveau dossier..." style="flex:1">
+      <button class="btn" onclick="dirPickerMkdir()">+ Créer</button>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="closeDirPicker()">Annuler</button>
+      <button class="btn btn-primary" onclick="dirPickerSelect()">Sélectionner ce dossier</button>
+    </div>
+  </div>
+</div>
+
+<!-- Redémarrage / extinction — plein écran façon Synology -->
+<div id="power-overlay" style="display:none;position:fixed;inset:0;background:rgba(9,9,15,.97);z-index:9999;align-items:center;justify-content:center;flex-direction:column;backdrop-filter:blur(10px)">
+  <div style="text-align:center">
+    <div id="power-icon" style="font-size:64px;margin-bottom:20px">🔄</div>
+    <div id="power-title" style="font-size:22px;font-weight:700;margin-bottom:10px">Redémarrage en cours...</div>
+    <div id="power-sub" style="font-size:13px;color:var(--text2);margin-bottom:24px">Le NAS sera de nouveau disponible dans environ <span id="power-countdown">60</span>s</div>
+    <div style="width:280px;height:4px;background:var(--surface2);border-radius:2px;overflow:hidden;margin:0 auto">
+      <div id="power-bar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2));transition:width 1s linear"></div>
+    </div>
+  </div>
+</div>
 
 
 
@@ -1316,7 +1352,7 @@ function pollJob(jobId, logElId, onDone){
 // ── Conteneurs ────────────────────────────────────────────────────────────────
 async function loadContainers(){
   const cs=await api('GET','/api/containers');
-  document.getElementById('docker-table').innerHTML=(cs||[]).map(c=>`<tr><td><strong>${c.name||c.id}</strong></td><td class="mono">${c.image}</td><td class="mono">${c.ports||'—'}</td><td><span class="badge ${c.state==='running'?'bg':c.state==='exited'?'br':'ba'}">${c.state}</span></td><td style="display:flex;gap:6px;padding:10px 14px">${c.state==='running'?`<button class="btn" onclick="cAction('${c.id}','stop')">⏹</button><button class="btn" onclick="cAction('${c.id}','restart')">⟳</button>`:`<button class="btn btn-primary" onclick="cAction('${c.id}','start')">▶</button>`}<button class="btn" onclick="containerLogs('${c.id}')">📋</button><button class="btn btn-danger" onclick="cAction('${c.id}','delete')">✕</button></td></tr>`).join('')||'<tr><td colspan="5" style="color:var(--text3)">Aucun conteneur</td></tr>';
+  document.getElementById('docker-table').innerHTML=(cs||[]).map(c=>`<tr><td><strong>${c.name||c.id}</strong></td><td class="mono">${c.image}</td><td class="mono">${c.ports||'—'}</td><td><span class="badge ${c.state==='running'?'bg':c.state==='exited'?'br':'ba'}">${c.state}</span></td><td class="mono">${c.cpu||'—'}</td><td class="mono">${c.mem?c.mem.split('/')[0].trim()+(c.memPct?' ('+c.memPct+')':''):'—'}</td><td style="display:flex;gap:6px;padding:10px 14px">${c.state==='running'?`<button class="btn" onclick="cAction('${c.id}','stop')">⏹</button><button class="btn" onclick="cAction('${c.id}','restart')">⟳</button>`:`<button class="btn btn-primary" onclick="cAction('${c.id}','start')">▶</button>`}<button class="btn" onclick="containerLogs('${c.id}')">📋</button><button class="btn btn-danger" onclick="cAction('${c.id}','delete')">✕</button></td></tr>`).join('')||'<tr><td colspan="7" style="color:var(--text3)">Aucun conteneur</td></tr>';
 }
 async function cAction(id,action){const url=action==='delete'?`/api/containers/${id}`:`/api/containers/${id}/${action}`;const r=await api(action==='delete'?'DELETE':'POST',url);toast('Docker',r?.ok?'OK':r?.error||'Erreur');loadContainers();}
 async function containerLogs(id){
@@ -1330,14 +1366,43 @@ async function containerLogs(id){
 
 // ── Wizard création conteneur ────────────────────────────────────────────────
 function toggleContainerForm(){const f=document.getElementById('container-form');f.style.display=f.style.display==='none'?'block':'none';}
-function ccRow(containerId,ph1,ph2,extra){
-  const row=document.createElement('div'); row.className='rowform';
-  row.innerHTML=`<input type="text" placeholder="${ph1}"><input type="text" placeholder="${ph2}">${extra||''}<button class="btn btn-danger" onclick="this.parentElement.remove()">✕</button>`;
-  document.getElementById(containerId).appendChild(row);
+function resetContainerForm(){
+  document.getElementById('cc-image').value='';
+  document.getElementById('cc-name').value='';
+  document.getElementById('cc-network').value='';
+  document.getElementById('cc-command').value='';
+  document.getElementById('cc-ports').innerHTML='';
+  document.getElementById('cc-volumes').innerHTML='';
+  document.getElementById('cc-envs').innerHTML='';
+  document.getElementById('cc-err').style.display='none';
+  document.getElementById('cc-log').style.display='none';
 }
-function ccAddPort(){ccRow('cc-ports','8080 (hôte)','80 (conteneur)');}
-function ccAddVolume(){ccRow('cc-volumes','/srv/shares/data (hôte)','/data (conteneur)');}
+function ccRow(containerId,ph1,ph2,extra,vals){
+  const row=document.createElement('div'); row.className='rowform';
+  row.innerHTML=`<input type="text" placeholder="${ph1}" value="${vals?.[0]||''}"><input type="text" placeholder="${ph2}" value="${vals?.[1]||''}">${extra||''}<button class="btn btn-danger" onclick="this.parentElement.remove()">✕</button>`;
+  document.getElementById(containerId).appendChild(row);
+  return row;
+}
+function ccAddPort(host,container){ccRow('cc-ports','8080 (hôte)','80 (conteneur)','',[host,container]);}
+function ccAddVolume(){ccRow('cc-volumes','/srv/volumes/... (hôte)','/data (conteneur)','<button type="button" class="btn" onclick="openDirPicker(this)" title="Parcourir">📁</button>');}
 function ccAddEnv(){ccRow('cc-envs','CLE','valeur');}
+
+// Préremplit le wizard depuis la liste des images, avec suggestion de ports
+// détectés sur l'image (Dockerfile EXPOSE) si déjà tirée localement
+async function createFromImage(repo,tag){
+  dockerTab('containers');
+  resetContainerForm();
+  document.getElementById('container-form').style.display='block';
+  document.getElementById('cc-image').value=`${repo}:${tag}`;
+  document.getElementById('container-form').scrollIntoView({behavior:'smooth',block:'start'});
+  const ports=await api('GET','/api/docker/images/ports?ref='+encodeURIComponent(`${repo}:${tag}`));
+  if(Array.isArray(ports) && ports.length){
+    ports.forEach(p=>ccAddPort(p.port,p.port));
+    toast('Docker',`${ports.length} port(s) détecté(s) sur l'image, préremplis`);
+  } else {
+    toast('Docker','Conteneur prérempli — ajoutez les ports/volumes nécessaires');
+  }
+}
 function ccRows(containerId){return[...document.getElementById(containerId).children].map(r=>{const i=r.querySelectorAll('input');return{a:i[0].value.trim(),b:i[1].value.trim()};}).filter(r=>r.a);}
 async function createContainer(){
   const err=document.getElementById('cc-err'); err.style.display='none';
@@ -1365,7 +1430,7 @@ async function createContainer(){
 async function loadImages(){
   const imgs=await api('GET','/api/docker/images');
   const tbl=document.getElementById('images-table');
-  if(tbl) tbl.innerHTML=(imgs||[]).map(i=>`<tr><td>${i.repo}</td><td class="mono">${i.tag}</td><td class="mono">${(i.size/1048576).toFixed(0)} Mo</td><td><button class="btn btn-danger" onclick="deleteImage('${i.id}')">✕</button></td></tr>`).join('')||'<tr><td colspan="4" style="color:var(--text3)">Aucune image locale</td></tr>';
+  if(tbl) tbl.innerHTML=(imgs||[]).map(i=>`<tr><td>${i.repo}</td><td class="mono">${i.tag}</td><td class="mono">${(i.size/1048576).toFixed(0)} Mo</td><td style="display:flex;gap:6px"><button class="btn btn-primary" onclick="createFromImage('${i.repo}','${i.tag}')">+ Créer un conteneur</button><button class="btn btn-danger" onclick="deleteImage('${i.id}')">✕</button></td></tr>`).join('')||'<tr><td colspan="4" style="color:var(--text3)">Aucune image locale</td></tr>';
   const dl=document.getElementById('cc-image-list');
   if(dl) dl.innerHTML=(imgs||[]).map(i=>`<option value="${i.repo}:${i.tag}">`).join('');
 }
@@ -1549,6 +1614,102 @@ function pollUpdateLog(elId, onDone) {
 
 // ── Toast ─────────────────────────────────────────────────────────────────────
 function toast(t,b){const n=document.getElementById('notif');document.getElementById('notif-t').textContent=t;document.getElementById('notif-b').textContent=b;n.classList.add('show');clearTimeout(n._t);n._t=setTimeout(()=>n.classList.remove('show'),3500);}
+
+// ── Sélecteur de dossier (volumes Docker) ────────────────────────────────────
+let dirPickerTargetInput = null;
+async function openDirPicker(btn){
+  dirPickerTargetInput = btn.closest('.rowform').querySelector('input');
+  document.getElementById('dirpicker-overlay').style.display='flex';
+  await dirPickerLoad(dirPickerTargetInput.value.trim() || '/srv/volumes');
+}
+async function dirPickerLoad(p){
+  const r = await api('GET','/api/storage/browse?path='+encodeURIComponent(p));
+  if(!r || r.ok===false){
+    if(p!=='/srv/volumes'){ toast('Stockage', r?.error||'Dossier introuvable'); return dirPickerLoad('/srv/volumes'); }
+    return;
+  }
+  document.getElementById('dirpicker-path').textContent=r.path;
+  document.getElementById('dirpicker-path').dataset.path=r.path;
+  const list=document.getElementById('dirpicker-list');
+  const esc=s=>s.replace(/'/g,"\\'");
+  let html = r.parent!==null ? `<div class="drow" style="cursor:pointer;padding:6px 8px" onclick="dirPickerLoad('${esc(r.parent)}')">⬅️ ..</div>` : '';
+  html += r.entries.map(name=>{
+    const full=(r.path.endsWith('/')?r.path:r.path+'/')+name;
+    return `<div class="drow" style="cursor:pointer;padding:6px 8px" onclick="dirPickerLoad('${esc(full)}')">📁 ${name}</div>`;
+  }).join('');
+  list.innerHTML = html || '<div style="color:var(--text3);font-size:12px;padding:8px">Dossier vide</div>';
+}
+async function dirPickerMkdir(){
+  const input=document.getElementById('dirpicker-newname');
+  const name=input.value.trim();
+  if(!name) return;
+  const p=document.getElementById('dirpicker-path').dataset.path;
+  const r=await api('POST','/api/storage/browse/mkdir',{path:p,name});
+  if(!r?.ok){ toast('Stockage', r?.error||'Erreur de création'); return; }
+  input.value='';
+  dirPickerLoad(r.path);
+}
+function dirPickerSelect(){
+  const p=document.getElementById('dirpicker-path').dataset.path;
+  if(dirPickerTargetInput) dirPickerTargetInput.value=p;
+  closeDirPicker();
+}
+function closeDirPicker(){
+  document.getElementById('dirpicker-overlay').style.display='none';
+  dirPickerTargetInput=null;
+}
+
+// ── Redémarrage / extinction (page plein écran façon Synology) ──────────────
+function powerAction(action){
+  const label = action==='reboot' ? 'redémarrer' : 'éteindre';
+  if(!confirm(`Voulez-vous vraiment ${label} le NAS ?`)) return;
+  api('POST','/api/system/'+action);
+  showPowerOverlay(action);
+}
+function showPowerOverlay(action){
+  const overlay=document.getElementById('power-overlay');
+  const icon=document.getElementById('power-icon');
+  const title=document.getElementById('power-title');
+  const sub=document.getElementById('power-sub');
+  const bar=document.getElementById('power-bar');
+  overlay.style.display='flex';
+  icon.className='spin'; icon.textContent = action==='reboot' ? '🔄' : '⏻';
+  title.textContent = action==='reboot' ? 'Redémarrage en cours...' : 'Extinction en cours...';
+  const total = action==='reboot' ? 60 : 20;
+  let remaining = total;
+  const tick=()=>{
+    bar.style.width = Math.round((total-remaining)/total*100)+'%';
+    sub.innerHTML = action==='reboot'
+      ? `Le NAS sera de nouveau disponible dans environ <span id="power-countdown">${Math.max(remaining,0)}</span>s`
+      : (remaining>0 ? `Le NAS va s'éteindre dans <span id="power-countdown">${remaining}</span>s` : `Le NAS est éteint — vous pouvez fermer cette fenêtre.`);
+  };
+  tick();
+  const timer=setInterval(()=>{
+    remaining--;
+    if(remaining<=0){
+      clearInterval(timer);
+      tick();
+      if(action==='reboot'){
+        icon.className=''; icon.textContent='📡';
+        title.textContent='Vérification de la reconnexion...';
+        sub.textContent='Tentative de reconnexion au NAS...';
+        waitForReconnect();
+      } else {
+        icon.className=''; icon.textContent='✅';
+      }
+      return;
+    }
+    tick();
+  },1000);
+}
+function waitForReconnect(){
+  const timer=setInterval(async()=>{
+    try {
+      const r = await fetch('/api/auth/status',{credentials:'include', cache:'no-store'});
+      if(r.ok){ clearInterval(timer); window.location.href='/'; }
+    } catch {}
+  }, 3000);
+}
 
 // ── Terminal (shellinabox) ─────────────────────────────────────────────────────
 // Le terminal est un simple iframe vers shellinabox (port 4200), déjà installé.

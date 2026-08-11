@@ -264,6 +264,40 @@ app.get("/api/disks",  auth, async (req,res) => { const [b,f]=await Promise.all(
 app.get("/api/mdstat", auth, async (req,res) => { try{const{stdout}=await execAsync("cat /proc/mdstat");res.json({raw:stdout});}catch{res.json({raw:""}); } });
 
 const VOL_ROOT = "/srv/volumes";
+const BROWSE_ROOTS = [VOL_ROOT, "/srv/shares"];
+function isPathAllowed(p){
+  const resolved = path.resolve(p);
+  return BROWSE_ROOTS.some(root => resolved===root || resolved.startsWith(root+path.sep));
+}
+
+// Navigateur de dossiers (pour le sélecteur de volume dans le wizard Docker) —
+// limité aux volumes NAS (/srv/volumes) et au stockage système (/srv/shares),
+// ne liste que les dossiers (on choisit un point de montage, pas un fichier)
+app.get("/api/storage/browse", auth, (req,res)=>{
+  const p = req.query.path || VOL_ROOT;
+  if (!isPathAllowed(p)) return res.status(400).json({error:"Chemin non autorisé"});
+  try {
+    if (!fs.existsSync(p)) return res.status(404).json({error:"Dossier introuvable"});
+    const entries = fs.readdirSync(p, {withFileTypes:true})
+      .filter(e=>e.isDirectory())
+      .map(e=>e.name)
+      .sort((a,b)=>a.localeCompare(b));
+    const parent = BROWSE_ROOTS.includes(path.resolve(p)) ? null : path.dirname(p);
+    res.json({ path:p, parent, roots:BROWSE_ROOTS, entries });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/storage/browse/mkdir", auth, (req,res)=>{
+  const { path:p, name } = req.body;
+  if (!p || !name || !/^[a-zA-Z0-9._ -]+$/.test(name)) return res.status(400).json({error:"Nom de dossier invalide"});
+  if (!isPathAllowed(p)) return res.status(400).json({error:"Chemin non autorisé"});
+  try {
+    const dest = path.join(p, name);
+    if (!isPathAllowed(dest)) return res.status(400).json({error:"Chemin non autorisé"});
+    fs.mkdirSync(dest, {recursive:true});
+    res.json({ok:true, path:dest});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
 async function lsblkTree(){
   const {stdout} = await execAsync("lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,TRAN,PATH 2>/dev/null").catch(()=>({stdout:'{"blockdevices":[]}'}));
   return JSON.parse(stdout).blockdevices || [];
@@ -642,7 +676,39 @@ function composeCmd() {
 const COMPOSE_DIR = "/srv/docker/compose";
 
 // ── Conteneurs ──────────────────────────────────────────────────────────────
-app.get("/api/containers", auth, async(req,res)=>{if(!docker)return res.json([]);try{const cs=await docker.listContainers({all:true});res.json(cs.map(c=>({id:c.Id.slice(0,12),name:c.Names[0]?.replace("/",""),image:c.Image,state:c.State,status:c.Status,ports:c.Ports.map(p=>`${p.PublicPort||""}:${p.PrivatePort}`).filter(p=>p!==":").join(", ")})));}catch(e){res.status(500).json({error:e.message});}});
+app.get("/api/containers", auth, async(req,res)=>{
+  if(!docker) return res.json([]);
+  try {
+    const cs = await docker.listContainers({all:true});
+    // Stats CPU/RAM en un seul appel `docker stats` (bien plus rapide que
+    // d'interroger chaque conteneur individuellement via l'API Docker)
+    let statsById = {};
+    if (cs.some(c=>c.State==="running")) {
+      try {
+        const {stdout} = await execAsync(`docker stats --no-stream --format "{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}" 2>/dev/null`);
+        for (const line of stdout.trim().split("\n").filter(Boolean)) {
+          const [id,cpu,mem,memPct] = line.split("|");
+          statsById[id] = { cpu, mem, memPct };
+        }
+      } catch {}
+    }
+    res.json(cs.map(c=>{
+      const shortId = c.Id.slice(0,12);
+      const st = Object.entries(statsById).find(([k])=>shortId.startsWith(k))?.[1];
+      return {
+        id: shortId,
+        name: c.Names[0]?.replace("/",""),
+        image: c.Image,
+        state: c.State,
+        status: c.Status,
+        ports: c.Ports.map(p=>`${p.PublicPort||""}:${p.PrivatePort}`).filter(p=>p!==":").join(", "),
+        cpu: st?.cpu || null,
+        mem: st?.mem || null,
+        memPct: st?.memPct || null
+      };
+    }));
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post("/api/containers/:id/start",   auth, async(req,res)=>{try{await docker.getContainer(req.params.id).start();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/containers/:id/stop",    auth, async(req,res)=>{try{await docker.getContainer(req.params.id).stop();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/containers/:id/restart", auth, async(req,res)=>{try{await docker.getContainer(req.params.id).restart();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
@@ -669,6 +735,20 @@ app.post("/api/docker/containers/create", auth, (req,res)=>{
     const jobId = runJob(`docker ${args.join(" ")} 2>&1`);
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Ports exposés déclarés par une image (Dockerfile EXPOSE) — pour préremplir
+// le wizard de création de conteneur avec des suggestions de ports pertinentes
+app.get("/api/docker/images/ports", auth, async(req,res)=>{
+  const ref = req.query.ref;
+  if(!ref || !/^[a-zA-Z0-9._\-\/:]+$/.test(ref)) return res.status(400).json({error:"Image invalide"});
+  try {
+    const {stdout} = await execAsync(`docker image inspect ${sh(ref)} --format '{{json .Config.ExposedPorts}}' 2>/dev/null`);
+    const exposed = JSON.parse(stdout.trim()||"{}") || {};
+    // clés du type "80/tcp" → {port:"80", proto:"tcp"}
+    const ports = Object.keys(exposed).map(k=>{ const [port,proto]=k.split("/"); return {port, proto:proto||"tcp"}; });
+    res.json(ports);
+  } catch(e){ res.json([]); } // image pas encore locale (pas tirée) — pas une erreur bloquante
 });
 
 // ── Images ────────────────────────────────────────────────────────────────
