@@ -1027,6 +1027,49 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
     fi
 
     echo ""
+    echo "=== Correctifs système ==="
+    # "Mettre à jour" ne fait que du git pull sur le code WebUI — ça ne livre
+    # jamais les correctifs au niveau OS (paquets, pare-feu, config système)
+    # qui, eux, ne sont normalement appliqués qu'au build d'une nouvelle ISO.
+    # Un NAS déjà installé qui ne fait que cliquer "Mettre à jour" ne les
+    # recevait donc jamais. Chaque correctif OS ajouté ici doit être
+    # idempotent (sûr à relancer à chaque mise à jour, même déjà appliqué).
+
+    # AppArmor requis par Docker (kernel Debian l'a activé, mais le paquet
+    # fournissant apparmor_parser n'était pas installé avant le 2026-08-11)
+    if ! command -v apparmor_parser &>/dev/null; then
+      echo "Installation d'AppArmor (requis par Docker)..."
+      apt-get update -qq 2>&1 | tail -2
+      apt-get install -y apparmor 2>&1 | tail -3
+      systemctl restart docker 2>/dev/null || true
+      echo "AppArmor installé ✓"
+    fi
+
+    # smbclient requis pour les sauvegardes SMB distantes (absent avant le 2026-08-09)
+    if ! command -v smbclient &>/dev/null; then
+      echo "Installation de smbclient (requis pour les sauvegardes SMB distantes)..."
+      apt-get install -y smbclient 2>&1 | tail -3
+    fi
+
+    # Ports UDP de découverte réseau (NetBIOS + WS-Discovery) — ufw n'ouvrait
+    # que du TCP avant le 2026-08-11, rendant le NAS invisible dans "Réseau"
+    # Windows malgré une connexion directe fonctionnelle
+    ufw allow 137/udp  2>/dev/null || true
+    ufw allow 138/udp  2>/dev/null || true
+    ufw allow 3702/udp 2>/dev/null || true
+    ufw allow 5357/tcp 2>/dev/null || true
+
+    # Thème terminal shellinabox (blanc sur noir + couleurs, sinon texte
+    # illisible sur certaines installs faites avant le fix)
+    if [ -d /etc/shellinabox/options-available ]; then
+      rm -f /etc/shellinabox/options-enabled/*.css
+      ln -sf "../options-available/00_White On Black.css" "/etc/shellinabox/options-enabled/00_White On Black.css"
+      ln -sf "../options-available/01+Color Terminal.css" "/etc/shellinabox/options-enabled/01+Color Terminal.css"
+      systemctl restart shellinabox 2>/dev/null || true
+    fi
+    echo "Correctifs système appliqués ✓"
+
+    echo ""
     echo "Dependances npm..."
     npm install --ignore-scripts --omit=optional 2>&1 | tail -3
 
