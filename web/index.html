@@ -862,11 +862,15 @@ async function api(method, url, body) {
       window.location.href = '/login.html';
       return null;
     }
-    if (!r.ok) return null;
-    return await r.json();
+    let data = null;
+    try { data = await r.json(); } catch {}
+    // Ne jamais avaler le message d'erreur renvoyé par le serveur — un simple
+    // "return null" sur !r.ok cachait la vraie cause derrière un "Erreur" générique.
+    if (!r.ok) return { ok:false, error: data?.error || `Erreur ${r.status}`, ...(data||{}) };
+    return data;
   } catch(e) {
     console.warn('API error:', url, e.message);
-    return null;
+    return { ok:false, error:'Erreur réseau — le serveur ne répond pas' };
   }
 }
 
@@ -1299,11 +1303,12 @@ function dockerTab(name){
 // ── Poll générique d'un job asynchrone (pull image / compose up-down) ───────
 function pollJob(jobId, logElId, onDone){
   const el=document.getElementById(logElId);
-  el.style.display='block'; el.textContent='';
+  el.style.display='block'; el.textContent='Lancement...';
+  el.scrollIntoView({behavior:'smooth', block:'nearest'});
   const timer=setInterval(async()=>{
     const d=await api('GET','/api/jobs/'+jobId);
-    if(!d) return;
-    el.textContent=d.log; el.scrollTop=el.scrollHeight;
+    if(!d || d.ok===false) return; // erreur réseau ponctuelle, on retente au prochain tick
+    el.textContent=d.log||'(aucune sortie)'; el.scrollTop=el.scrollHeight;
     if(!d.running){ clearInterval(timer); onDone&&onDone(); }
   },1000);
 }
@@ -1349,10 +1354,11 @@ async function createContainer(){
     volumes:ccRows('cc-volumes').map(r=>({host:r.a,container:r.b})),
     env:ccRows('cc-envs').map(r=>({key:r.a,value:r.b}))
   };
+  btn.textContent='⏳ Création en cours...';
   const r=await api('POST','/api/docker/containers/create',body);
-  btn.disabled=false;
-  if(!r?.ok){err.textContent=r?.error||'Erreur';err.style.display='block';return;}
-  pollJob(r.jobId,'cc-log',()=>{loadContainers();});
+  btn.disabled=false; btn.textContent='🚀 Créer et démarrer';
+  if(!r?.ok){err.textContent=r?.error||'Erreur inconnue';err.style.display='block';return;}
+  pollJob(r.jobId,'cc-log',()=>{loadContainers();toast('Docker','Conteneur créé ✓ (voir le journal ci-dessus pour le détail)');});
 }
 
 // ── Images ────────────────────────────────────────────────────────────────────
@@ -1479,7 +1485,7 @@ async function checkSysUpdate() {
   el.textContent = '🔍 Vérification en cours...';
   document.getElementById('btn-sys-update').disabled = true;
   const r = await api('GET','/api/updates/system/check');
-  if(!r) { el.textContent = 'Erreur lors de la vérification'; return; }
+  if(!r || r.ok===false) { el.textContent = 'Erreur lors de la vérification : '+(r?.error||'inconnue'); return; }
   if(r.count > 0) {
     el.innerHTML = `<span style="color:var(--amber)">⬆ ${r.count} paquet(s) à mettre à jour</span>`;
     const pkgEl = document.getElementById('sys-pkg-list');
@@ -1507,7 +1513,7 @@ async function checkGravityUpdate() {
   el.textContent = '🔍 Vérification via git...';
   document.getElementById('btn-gravity-update').disabled = true;
   const r = await api('GET','/api/updates/gravity/check');
-  if(!r) { el.textContent = 'Erreur'; return; }
+  if(!r || r.ok===false) { el.textContent = 'Erreur : '+(r?.error||'inconnue'); return; }
   if(r.available) {
     el.innerHTML = `<span style="color:var(--amber)">⬆ ${r.count} commit(s) disponible(s)</span>`;
     const pkgEl = document.getElementById('gravity-pkg-list');
@@ -1534,7 +1540,7 @@ function pollUpdateLog(elId, onDone) {
   const el = document.getElementById(elId);
   const iv = setInterval(async()=>{
     const r = await api('GET','/api/updates/log');
-    if(!r) return;
+    if(!r || r.ok===false) return; // échec ponctuel, on retente au prochain tick
     el.textContent = r.log;
     el.scrollTop = el.scrollHeight;
     if(!r.running) { clearInterval(iv); onDone?.(); }
