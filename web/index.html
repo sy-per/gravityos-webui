@@ -1383,7 +1383,25 @@ function ccRow(containerId,ph1,ph2,extra,vals){
   document.getElementById(containerId).appendChild(row);
   return row;
 }
-function ccAddPort(host,container){ccRow('cc-ports','8080 (hôte)','80 (conteneur)','',[host,container]);}
+function ccAddPort(host,container){
+  const row=ccRow('cc-ports','8080 (hôte)','80 (conteneur)','',[host,container]);
+  const hostInput=row.querySelector('input');
+  hostInput.addEventListener('input',()=>checkPortAvailability(hostInput));
+  if(host) checkPortAvailability(hostInput);
+}
+const _portCheckTimers = new WeakMap();
+async function checkPortAvailability(input){
+  clearTimeout(_portCheckTimers.get(input));
+  input.style.borderColor=''; input.title='';
+  const port=input.value.trim();
+  if(!/^\d+$/.test(port)) return;
+  _portCheckTimers.set(input, setTimeout(async()=>{
+    const r=await api('GET','/api/docker/port-check?port='+port);
+    if(!r || r.ok===false) return;
+    if(r.available===false){ input.style.borderColor='var(--red)'; input.title='Port déjà utilisé sur le NAS'; }
+    else { input.style.borderColor='var(--green)'; input.title='Port disponible'; }
+  }, 400));
+}
 function ccAddVolume(){ccRow('cc-volumes','/srv/volumes/... (hôte)','/data (conteneur)','<button type="button" class="btn" onclick="openDirPicker(this)" title="Parcourir">📁</button>');}
 function ccAddEnv(){ccRow('cc-envs','CLE','valeur');}
 

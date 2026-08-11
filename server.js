@@ -719,6 +719,17 @@ app.get("/api/containers/:id/logs", auth, async(req,res)=>{
 });
 
 // Créer un conteneur (wizard) — image + nom + ports + volumes + env + politique de redémarrage
+// Vérifie si un port hôte est déjà occupé (autre conteneur, ou tout autre
+// service du NAS) — utilisé par le wizard pour surligner en rouge en direct
+app.get("/api/docker/port-check", auth, async(req,res)=>{
+  const port = parseInt(req.query.port,10);
+  if(!port || port<1 || port>65535) return res.status(400).json({error:"Port invalide"});
+  try {
+    const {stdout} = await execAsync(`ss -tuln 2>/dev/null | awk '{print $5}' | grep -E ":${port}$" | head -1`);
+    res.json({available: !stdout.trim(), port});
+  } catch { res.json({available:true, port}); } // en cas d'erreur, ne pas bloquer l'utilisateur
+});
+
 app.post("/api/docker/containers/create", auth, (req,res)=>{
   const { image, name, ports, volumes, env, restartPolicy, network, command } = req.body;
   if(!image || !/^[a-zA-Z0-9._\-\/:]+$/.test(image)) return res.status(400).json({error:"Image invalide"});
