@@ -89,6 +89,7 @@ app.post("/api/wizard/complete", async (req,res) => {
       fs.mkdirSync(CFG,{recursive:true});
       fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
       await execAsync(`(echo "${password}"; echo "${password}") | smbpasswd -a "${u}" -s 2>/dev/null`).catch(()=>{});
+      exec("/usr/local/bin/gravity-configure-terminal", ()=>{}); // terminal connecté auto sur ce compte admin
     }
     if (timezone) await execAsync(`timedatectl set-timezone "${timezone}"`).catch(()=>{});
     fs.writeFileSync(WIZARD, new Date().toISOString());
@@ -191,8 +192,11 @@ app.post("/api/system/change-password", auth, async (req,res) => {
   const { username, password } = req.body;
   try {
     const u = (username||"gravity").replace(/[^a-zA-Z0-9_-]/g,"");
+    await execAsync(`id "${u}" &>/dev/null || useradd -m -s /bin/bash -G sudo,libvirt,kvm,docker "${u}"`);
     await execAsync(`echo "${u}:${password}" | chpasswd`);
     fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
+    // Reconnecte le terminal web sur ce compte (admin, sans re-login)
+    exec("/usr/local/bin/gravity-configure-terminal", ()=>{});
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -608,7 +612,7 @@ app.get("/api/vms", auth, async (req,res) => {
 });
 app.post("/api/vms", auth, async (req,res) => {
   if(isLive()) return res.status(400).json({error:"Impossible en Live CD"});
-  const{name,vcpus,memMB,diskGB,iso,network}=req.body;
+  const{name,vcpus,memMB,diskGB,iso,network,bios,usbDevices}=req.body;
   if(!name||!vcpus||!memMB) return res.status(400).json({error:"name, vcpus, memMB requis"});
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g,"");
   const dp=`/var/lib/libvirt/images/${safeName}.qcow2`;
@@ -623,7 +627,27 @@ app.post("/api/vms", auth, async (req,res) => {
     // Détecter l'émulateur disponible
     let emulator = '/usr/bin/qemu-system-x86_64';
     try { const {stdout:em} = await execAsync('which qemu-system-x86_64 2>/dev/null || echo /usr/bin/qemu-system-x86_64'); emulator = em.trim(); } catch {}
-    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os><type arch='x86_64' machine='pc'>hvm</type>${bootDev}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console></devices></domain>`;
+
+    // Démarrage BIOS (Legacy/SeaBIOS, chipset i440fx) ou UEFI (OVMF, chipset q35)
+    const useUefi = bios === "uefi";
+    let osBlock;
+    if (useUefi) {
+      const nvramDir = "/var/lib/libvirt/qemu/nvram";
+      await execAsync(`mkdir -p ${nvramDir}`).catch(()=>{});
+      const nvramPath = `${nvramDir}/${safeName}_VARS.fd`;
+      await execAsync(`test -f "${nvramPath}" || cp /usr/share/OVMF/OVMF_VARS.fd "${nvramPath}"`);
+      osBlock = `<type arch='x86_64' machine='q35'>hvm</type><loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader><nvram>${nvramPath}</nvram>${bootDev}`;
+    } else {
+      osBlock = `<type arch='x86_64' machine='pc'>hvm</type>${bootDev}`;
+    }
+
+    // Passthrough USB — usbDevices: ["vendorId:productId", ...] (depuis /api/usb)
+    const usbBlock = (Array.isArray(usbDevices) ? usbDevices : []).filter(d=>/^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$/.test(d)).map(d=>{
+      const [vendor,product] = d.split(":");
+      return `<hostdev mode='subsystem' type='usb'><source><vendor id='0x${vendor}'/><product id='0x${product}'/></source></hostdev>`;
+    }).join("");
+
+    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
     require("fs").writeFileSync(xmlPath, xml);
     const {stdout,stderr} = await execAsync(`virsh --connect qemu:///system define "${xmlPath}"`);
@@ -636,8 +660,23 @@ app.post("/api/vms/:n/stop",       auth, async (req,res)=>{try{await virsh(`shut
 app.post("/api/vms/:n/force-stop", auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/restart",    auth, async (req,res)=>{try{await virsh(`reboot ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.delete("/api/vms/:n",          auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`).catch(()=>{});await virsh(`undefine ${req.params.n} --remove-all-storage`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.get("/api/isos",           auth, (req,res)=>{try{const d="/var/lib/libvirt/images";res.json(fs.readdirSync(d).filter(f=>f.endsWith(".iso")).map(f=>({name:f,path:path.join(d,f),size:fs.statSync(path.join(d,f)).size})));}catch{res.json([]);}});
-app.post("/api/isos/download", auth, (req,res)=>{const{url,name}=req.body;const dest=`/var/lib/libvirt/images/${name||path.basename(url)}`;res.json({ok:true,dest});exec(`wget -q "${url}" -O "${dest}"`);});
+app.get("/api/isos", auth, (req,res)=>{try{const d="/var/lib/libvirt/images";fs.mkdirSync(d,{recursive:true});res.json(fs.readdirSync(d).filter(f=>f.endsWith(".iso")).map(f=>({name:f,path:path.join(d,f),size:fs.statSync(path.join(d,f)).size})));}catch{res.json([]);}});
+app.post("/api/isos/download", auth, (req,res)=>{
+  const { url, name } = req.body;
+  if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({error:"URL invalide (http/https requis)"});
+  const fname = (name || path.basename(new URL(url).pathname) || `image-${Date.now()}.iso`).replace(/[^a-zA-Z0-9._-]/g,"_");
+  const dest = `/var/lib/libvirt/images/${fname}`;
+  const jobId = runJob(`mkdir -p /var/lib/libvirt/images && wget --progress=dot:giga ${sh(url)} -O ${sh(dest)} 2>&1`);
+  res.json({ok:true, jobId, dest});
+});
+app.delete("/api/isos/:name", auth, (req,res)=>{
+  try {
+    const f = path.join("/var/lib/libvirt/images", req.params.name.replace(/[^a-zA-Z0-9._-]/g,""));
+    if (!f.endsWith(".iso") || !fs.existsSync(f)) return res.status(404).json({error:"ISO introuvable"});
+    fs.unlinkSync(f);
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 app.get("/api/usb",            auth, async(req,res)=>{try{const{stdout}=await execAsync("lsusb");res.json(stdout.split("\n").filter(Boolean).map(l=>{const m=l.match(/Bus (\d+) Device (\d+): ID (\S+) (.+)/);return m?{bus:m[1],device:m[2],id:m[3],name:m[4]}:null;}).filter(Boolean));}catch{res.json([]);}});
 app.get("/api/networks",       auth, async(req,res)=>{try{const r=await virsh("net-list --all");res.json(r.split("\n").slice(2).filter(Boolean).map(l=>{const p=l.trim().split(/\s{2,}/);return{name:p[0],state:p[1]};}).filter(n=>n.name));}catch{res.json([]);}});
 
@@ -1089,8 +1128,32 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
       rm -f /etc/shellinabox/options-enabled/*.css
       ln -sf "../options-available/00_White On Black.css" "/etc/shellinabox/options-enabled/00_White On Black.css"
       ln -sf "../options-available/01+Color Terminal.css" "/etc/shellinabox/options-enabled/01+Color Terminal.css"
-      systemctl restart shellinabox 2>/dev/null || true
     fi
+
+    # /usr/local/bin/gravity-configure-terminal n'existe pas sur les NAS
+    # installés avant le 2026-08-11 (script livré uniquement par l'ISO, pas
+    # par le dépôt git de la WebUI) — on le (ré)écrit ici pour que le
+    # mécanisme "Mettre à jour" le livre aussi
+    cat > /usr/local/bin/gravity-configure-terminal <<'TERMCFG'
+#!/usr/bin/env bash
+set -uo pipefail
+CREDS="/etc/gravity/credentials"
+USER_NAME=$(head -1 "$CREDS" 2>/dev/null)
+[[ -z "$USER_NAME" ]] && USER_NAME="gravity"
+if ! id "$USER_NAME" &>/dev/null; then
+  useradd -m -s /bin/bash "$USER_NAME" 2>/dev/null || true
+fi
+usermod -aG sudo "$USER_NAME" 2>/dev/null || true
+USER_UID=$(id -u "$USER_NAME" 2>/dev/null || echo 0)
+USER_GID=$(id -g "$USER_NAME" 2>/dev/null || echo 0)
+USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+[[ -z "$USER_HOME" ]] && USER_HOME="/root"
+sed -i "s#^SHELLINABOX_ARGS=.*#SHELLINABOX_ARGS=\"--no-beep --disable-ssl -s /:$USER_UID:$USER_GID:$USER_HOME:/bin/bash\"#" /etc/default/shellinabox 2>/dev/null || true
+systemctl restart shellinabox 2>/dev/null || true
+TERMCFG
+    chmod +x /usr/local/bin/gravity-configure-terminal
+    /usr/local/bin/gravity-configure-terminal && echo "Terminal connecté auto sur le compte admin ✓"
+
     echo "Correctifs système appliqués ✓"
 
     echo ""

@@ -552,39 +552,89 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
 <!-- VMs -->
 <div class="panel" id="panel-vms">
   <div class="ph">Machines virtuelles</div>
-  <div class="ps">KVM natif via libvirt — Passthrough USB, réseaux virtuels</div>
-  <div class="gap">
-    <div class="card">
-      <div class="card-title" style="justify-content:space-between">
-        <span>🖥️ VMs</span>
-        <div style="display:flex;gap:8px">
-          <button class="btn" onclick="nav('isos')">📀 ISOs</button>
+  <div class="ps">KVM natif via libvirt — BIOS/UEFI, passthrough USB, réseaux virtuels</div>
+
+  <div class="dtabs">
+    <div class="dtab active" id="vmtab-vms" onclick="vmsTab('vms')">🖥️ VMs</div>
+    <div class="dtab" id="vmtab-isos" onclick="vmsTab('isos')">📀 ISOs</div>
+  </div>
+
+  <!-- VMs -->
+  <div class="vmsec" id="vmsec-vms">
+    <div class="gap">
+      <div class="card">
+        <div class="card-title" style="justify-content:space-between">
+          <span>🖥️ VMs</span>
           <button class="btn btn-primary" onclick="toggleVmForm()">+ Nouvelle VM</button>
         </div>
+
+        <!-- Formulaire création VM -->
+        <div id="vm-form" style="display:none;margin-bottom:16px;padding:14px;background:var(--surface2);border-radius:var(--rs)">
+          <div class="grid2">
+            <div><div class="flabel">Nom</div><input type="text" id="vm-name" placeholder="debian-vm" style="width:100%"></div>
+            <div><div class="flabel">Mode de démarrage</div>
+              <select id="vm-bios" style="width:100%">
+                <option value="legacy">BIOS (Legacy/SeaBIOS)</option>
+                <option value="uefi">UEFI (OVMF)</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid3">
+            <div><div class="flabel">vCPUs</div><input type="text" id="vm-cpu" placeholder="2" style="width:100%"></div>
+            <div><div class="flabel">RAM (Mo)</div><input type="text" id="vm-mem" placeholder="2048" style="width:100%"></div>
+            <div><div class="flabel">Disque (Go)</div><input type="text" id="vm-disk" placeholder="20" style="width:100%"></div>
+          </div>
+          <div class="grid2">
+            <div><div class="flabel">ISO de démarrage</div>
+              <select id="vm-iso" style="width:100%"><option value="">Sans ISO</option></select></div>
+            <div><div class="flabel">Réseau</div>
+              <select id="vm-network" style="width:100%"></select></div>
+          </div>
+          <div class="flabel">Périphériques USB à passer à la VM</div>
+          <div id="vm-usb-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px"></div>
+
+          <div class="error" id="vm-err" style="display:none;color:var(--red);font-size:12px;margin-top:6px"></div>
+          <div id="vm-log" class="logbox"></div>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button class="btn btn-primary" id="vm-submit" onclick="createVm()">🚀 Créer</button>
+            <button class="btn" onclick="toggleVmForm()">Annuler</button>
+          </div>
+        </div>
+
+        <div id="vm-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
       </div>
-      <!-- Formulaire création VM -->
-      <div id="vm-form" style="display:none;margin-bottom:16px;padding:14px;background:var(--surface2);border-radius:var(--rs)">
-        <div style="display:grid;grid-template-columns:1fr 80px 100px 100px 1fr auto;gap:10px;align-items:end">
-          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Nom</div><input type="text" id="vm-name" placeholder="debian-vm"></div>
-          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">vCPUs</div><input type="text" id="vm-cpu" placeholder="2" style="width:100%"></div>
-          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">RAM (Mo)</div><input type="text" id="vm-mem" placeholder="2048" style="width:100%"></div>
-          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Disque (Go)</div><input type="text" id="vm-disk" placeholder="20" style="width:100%"></div>
-          <div><div style="font-size:11px;color:var(--text2);margin-bottom:4px">ISO</div>
-            <select id="vm-iso" style="width:100%"><option value="">Sans ISO</option></select></div>
-          <button class="btn btn-primary" onclick="createVm()" style="height:34px">Créer</button>
+      <div class="grid2">
+        <div class="card">
+          <div class="card-title">🔌 Périphériques USB détectés</div>
+          <div id="usb-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+        </div>
+        <div class="card">
+          <div class="card-title">🔀 Réseaux libvirt</div>
+          <div id="net-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
         </div>
       </div>
-      <div id="vm-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
     </div>
-    <div class="grid2">
-      <div class="card">
-        <div class="card-title">🔌 Périphériques USB</div>
-        <div id="usb-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+  </div>
+
+  <!-- ISOs -->
+  <div class="vmsec" id="vmsec-isos" style="display:none">
+    <div class="card">
+      <div class="card-title">📀 Télécharger une image ISO</div>
+      <div class="grid2">
+        <div><div class="flabel">URL de l'ISO</div><input type="text" id="iso-url" placeholder="https://.../debian-12.iso" style="width:100%"></div>
+        <div><div class="flabel">Nom du fichier (optionnel)</div><input type="text" id="iso-name" placeholder="debian-12.iso" style="width:100%"></div>
       </div>
-      <div class="card">
-        <div class="card-title">🔀 Réseaux libvirt</div>
-        <div id="net-list"><div style="color:var(--text3);font-size:12px">Chargement...</div></div>
+      <div class="error" id="iso-err" style="display:none;color:var(--red);font-size:12px;margin-top:6px"></div>
+      <div id="iso-log" class="logbox"></div>
+      <button class="btn btn-primary" id="iso-submit" onclick="downloadIso()" style="margin-top:10px">⬇ Télécharger</button>
+    </div>
+    <div class="card">
+      <div class="card-title" style="justify-content:space-between">
+        <span>📀 ISOs disponibles</span>
+        <button class="btn" onclick="loadIsos()">↻</button>
       </div>
+      <table><thead><tr><th>Nom</th><th>Taille</th><th></th></tr></thead>
+      <tbody id="isos-table"><tr><td colspan="3" style="color:var(--text3)">Chargement...</td></tr></tbody></table>
     </div>
   </div>
 </div>
@@ -1306,7 +1356,15 @@ async function delProxy(n){
   loadProxy();
 }
 
-// ── VMs ───────────────────────────────────────────────────────────────────────
+// ── VMs : sous-onglets VMs / ISOs ────────────────────────────────────────────
+function vmsTab(name){
+  document.querySelectorAll('.vmsec').forEach(s=>s.style.display='none');
+  document.querySelectorAll('#panel-vms .dtab').forEach(t=>t.classList.remove('active'));
+  document.getElementById('vmsec-'+name).style.display='block';
+  document.getElementById('vmtab-'+name).classList.add('active');
+  if(name==='isos') loadIsos();
+}
+
 async function loadVms(){
   const [d,usb,nets,isos]=await Promise.all([api('GET','/api/vms'),api('GET','/api/usb'),api('GET','/api/networks'),api('GET','/api/isos')]);
   const vmEl=document.getElementById('vm-list');
@@ -1322,10 +1380,60 @@ async function loadVms(){
   else document.getElementById('usb-list').innerHTML='<div style="font-size:12px;color:var(--text3)">Aucun périphérique USB</div>';
   if(nets?.length) document.getElementById('net-list').innerHTML=nets.map(n=>`<div class="drow" style="justify-content:space-between"><div><div class="dname" style="font-size:13px">${n.name}</div></div><span class="badge ${n.state==='active'?'bg':'bx'}">${n.state||'?'}</span></div>`).join('');
   if(isos?.length){const sel=document.getElementById('vm-iso');sel.innerHTML='<option value="">Sans ISO</option>'+isos.map(i=>`<option value="${i.path}">${i.name} (${fmt(i.size)})</option>`).join('');}
+  // Réseaux disponibles pour la VM (select dédié du formulaire de création)
+  const netSel=document.getElementById('vm-network');
+  if(netSel) netSel.innerHTML=(nets?.length?nets:[{name:'default',state:'active'}]).map(n=>`<option value="${n.name}">${n.name}${n.state!=='active'?' (inactif)':''}</option>`).join('');
+  // Cases à cocher USB pour passthrough
+  const usbBox=document.getElementById('vm-usb-list');
+  if(usbBox) usbBox.innerHTML=(usb||[]).map(u=>`<label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" class="vm-usb-cb" value="${u.id}"> ${u.name} <span class="mono" style="color:var(--text3)">${u.id}</span></label>`).join('') || '<div style="color:var(--text3);font-size:12px">Aucun périphérique USB détecté</div>';
 }
 async function vmAction(name,action){const url=action==='delete'?`/api/vms/${name}`:`/api/vms/${name}/${action}`;const method=action==='delete'?'DELETE':'POST';const r=await api(method,url);toast('VM',r?.ok?`${name}: ${action} ✓`:r?.error||'Erreur');loadVms();}
-function toggleVmForm(){const f=document.getElementById('vm-form');f.style.display=f.style.display==='none'?'block':'none'}
-async function createVm(){const r=await api('POST','/api/vms',{name:document.getElementById('vm-name').value,vcpus:parseInt(document.getElementById('vm-cpu').value)||2,memMB:parseInt(document.getElementById('vm-mem').value)||2048,diskGB:parseInt(document.getElementById('vm-disk').value)||20,iso:document.getElementById('vm-iso').value});toast('VM',r?.ok?'VM en cours de création...':r?.error||'Erreur');if(r?.ok)setTimeout(loadVms,2000);}
+function toggleVmForm(){const f=document.getElementById('vm-form');f.style.display=f.style.display==='none'?'block':'none'; if(f.style.display==='block') loadVms();}
+async function createVm(){
+  const err=document.getElementById('vm-err'); err.style.display='none';
+  const name=document.getElementById('vm-name').value.trim();
+  if(!name){err.textContent='Nom requis';err.style.display='block';return;}
+  const body={
+    name,
+    bios:document.getElementById('vm-bios').value,
+    vcpus:parseInt(document.getElementById('vm-cpu').value)||2,
+    memMB:parseInt(document.getElementById('vm-mem').value)||2048,
+    diskGB:parseInt(document.getElementById('vm-disk').value)||20,
+    iso:document.getElementById('vm-iso').value,
+    network:document.getElementById('vm-network').value,
+    usbDevices:[...document.querySelectorAll('.vm-usb-cb:checked')].map(c=>c.value)
+  };
+  const btn=document.getElementById('vm-submit'); btn.disabled=true;
+  const r=await api('POST','/api/vms',body);
+  btn.disabled=false;
+  if(!r?.ok){err.textContent=r?.error||'Erreur';err.style.display='block';return;}
+  toast('VM',r.message||'VM créée ✓');
+  toggleVmForm();
+  loadVms();
+}
+
+// ── ISOs ──────────────────────────────────────────────────────────────────────
+async function loadIsos(){
+  const isos=await api('GET','/api/isos');
+  document.getElementById('isos-table').innerHTML=(isos||[]).map(i=>`<tr><td>${i.name}</td><td class="mono">${fmt(i.size)}</td><td><button class="btn btn-danger" onclick="deleteIso('${i.name}')">✕</button></td></tr>`).join('')||'<tr><td colspan="3" style="color:var(--text3)">Aucune ISO</td></tr>';
+}
+async function downloadIso(){
+  const err=document.getElementById('iso-err'); err.style.display='none';
+  const url=document.getElementById('iso-url').value.trim();
+  if(!/^https?:\/\//.test(url)){err.textContent='URL http/https requise';err.style.display='block';return;}
+  const name=document.getElementById('iso-name').value.trim();
+  const btn=document.getElementById('iso-submit'); btn.disabled=true;
+  const r=await api('POST','/api/isos/download',{url,name});
+  btn.disabled=false;
+  if(!r?.ok){err.textContent=r?.error||'Erreur';err.style.display='block';return;}
+  pollJob(r.jobId,'iso-log',()=>{loadIsos();loadVms();toast('ISO','Téléchargement terminé ✓');});
+}
+async function deleteIso(name){
+  if(!confirm(`Supprimer l'ISO "${name}" ?`))return;
+  const r=await api('DELETE','/api/isos/'+encodeURIComponent(name));
+  toast('ISO',r?.ok?'ISO supprimée':r?.error||'Erreur');
+  loadIsos(); loadVms();
+}
 
 // ── Docker : sous-onglets ───────────────────────────────────────────────────
 function dockerTab(name){
