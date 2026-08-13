@@ -628,6 +628,47 @@ async function vmLiveStat(name){
   } catch { return { memUsedMB:null, cpuPct:null }; }
 }
 
+// Démarre tout réseau libvirt référencé par la VM mais actuellement inactif —
+// évite l'échec "Requested operation is not valid: network 'default' is not
+// active" au clic sur "Démarrer" (le réseau default n'est censé être autostart
+// qu'au premier boot, gravity-first-boot.sh, mais peut rester inactif si ce
+// script n'a jamais tourné sur ce système, ex. session live/VM de test).
+async function ensureVmNetworksActive(name) {
+  const xml = await virsh(`dumpxml ${sh(name)}`);
+  const nets = [...new Set([...xml.matchAll(/<source network='([^']+)'/g)].map(m => m[1]))];
+  for (const net of nets) await virsh(`net-start ${sh(net)}`).catch(() => {});
+}
+
+async function detectDomainTypeAndEmulator() {
+  let domainType = 'kvm';
+  try { await execAsync('test -e /dev/kvm'); } catch { domainType = 'qemu'; }
+  let emulator = '/usr/bin/qemu-system-x86_64';
+  try { const {stdout:em} = await execAsync('which qemu-system-x86_64 2>/dev/null || echo /usr/bin/qemu-system-x86_64'); emulator = em.trim(); } catch {}
+  return {domainType, emulator};
+}
+
+// Bloc <os> — BIOS Legacy/SeaBIOS (machine='pc') ou UEFI/OVMF (machine='q35',
+// NVRAM par VM copié depuis le template au premier passage en UEFI)
+async function buildOsBlock(safeName, bios, bootDev) {
+  if (bios !== "uefi") return `<type arch='x86_64' machine='pc'>hvm</type>${bootDev}`;
+  const nvramDir = "/var/lib/libvirt/qemu/nvram";
+  await execAsync(`mkdir -p ${nvramDir}`).catch(() => {});
+  const nvramPath = `${nvramDir}/${safeName}_VARS.fd`;
+  await execAsync(`test -f "${nvramPath}" || cp /usr/share/OVMF/OVMF_VARS.fd "${nvramPath}"`);
+  return `<type arch='x86_64' machine='q35'>hvm</type><loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader><nvram>${nvramPath}</nvram>${bootDev}`;
+}
+
+function buildUsbBlock(usbDevices) {
+  return (Array.isArray(usbDevices) ? usbDevices : []).filter(d => /^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$/.test(d)).map(d => {
+    const [vendor,product] = d.split(":");
+    return `<hostdev mode='subsystem' type='usb'><source><vendor id='0x${vendor}'/><product id='0x${product}'/></source></hostdev>`;
+  }).join("");
+}
+
+function buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock}) {
+  return `<domain type='${domainType}'><name>${name}</name>${uuid ? `<uuid>${uuid}</uuid>` : ""}<memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${diskFile}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
+}
+
 app.get("/api/vms", auth, async (req,res) => {
   if (isLive()) return res.json({isLive:true,vms:[],message:"KVM indisponible en Live CD — installez GravityOS sur disque"});
   try {
@@ -671,33 +712,12 @@ app.post("/api/vms", auth, async (req,res) => {
     const memKB = parseInt(memMB)*1024;
     const cdrom = iso ? `<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='${iso}'/><target dev='sdb' bus='sata'/><readonly/></disk>` : "";
     const bootDev = iso ? "<boot dev='cdrom'/><boot dev='hd'/>" : "<boot dev='hd'/>";
-    // Détecter si KVM est disponible (pas dans VirtualBox)
-    let domainType = 'kvm';
-    try { await execAsync('test -e /dev/kvm'); } catch { domainType = 'qemu'; }
-    // Détecter l'émulateur disponible
-    let emulator = '/usr/bin/qemu-system-x86_64';
-    try { const {stdout:em} = await execAsync('which qemu-system-x86_64 2>/dev/null || echo /usr/bin/qemu-system-x86_64'); emulator = em.trim(); } catch {}
-
-    // Démarrage BIOS (Legacy/SeaBIOS, chipset i440fx) ou UEFI (OVMF, chipset q35)
-    const useUefi = bios === "uefi";
-    let osBlock;
-    if (useUefi) {
-      const nvramDir = "/var/lib/libvirt/qemu/nvram";
-      await execAsync(`mkdir -p ${nvramDir}`).catch(()=>{});
-      const nvramPath = `${nvramDir}/${safeName}_VARS.fd`;
-      await execAsync(`test -f "${nvramPath}" || cp /usr/share/OVMF/OVMF_VARS.fd "${nvramPath}"`);
-      osBlock = `<type arch='x86_64' machine='q35'>hvm</type><loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader><nvram>${nvramPath}</nvram>${bootDev}`;
-    } else {
-      osBlock = `<type arch='x86_64' machine='pc'>hvm</type>${bootDev}`;
-    }
-
+    const {domainType, emulator} = await detectDomainTypeAndEmulator();
+    const osBlock = await buildOsBlock(safeName, bios, bootDev);
     // Passthrough USB — usbDevices: ["vendorId:productId", ...] (depuis /api/usb)
-    const usbBlock = (Array.isArray(usbDevices) ? usbDevices : []).filter(d=>/^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$/.test(d)).map(d=>{
-      const [vendor,product] = d.split(":");
-      return `<hostdev mode='subsystem' type='usb'><source><vendor id='0x${vendor}'/><product id='0x${product}'/></source></hostdev>`;
-    }).join("");
+    const usbBlock = buildUsbBlock(usbDevices);
 
-    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
+    const xml = buildDomainXml({name:safeName, domainType, emulator, memKB, vcpus, osBlock, diskFile:dp, cdrom, network, usbBlock});
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
     fs.writeFileSync(xmlPath, xml);
     // Le disque (création ou import/conversion) tourne en job asynchrone —
@@ -707,11 +727,55 @@ app.post("/api/vms", auth, async (req,res) => {
     res.json({ok:true, jobId, disk:dp});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post("/api/vms/:n/start",      auth, async (req,res)=>{try{await virsh(`start ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/vms/:n/start",      auth, async (req,res)=>{try{await ensureVmNetworksActive(req.params.n).catch(()=>{});await virsh(`start ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/stop",       auth, async (req,res)=>{try{await virsh(`shutdown ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/force-stop", auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/restart",    auth, async (req,res)=>{try{await virsh(`reboot ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.delete("/api/vms/:n",          auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`).catch(()=>{});await virsh(`undefine ${req.params.n} --remove-all-storage`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+
+// Config actuelle d'une VM (pour préremplir le formulaire d'édition)
+app.get("/api/vms/:n", auth, async (req,res) => {
+  try {
+    const xml = await virsh(`dumpxml ${sh(req.params.n)}`);
+    const vcpus = (xml.match(/<vcpu[^>]*>(\d+)</)||[])[1];
+    const memKB = (xml.match(/<currentMemory[^>]*>(\d+)</)||[])[1];
+    const network = (xml.match(/<source network='([^']+)'/)||[])[1];
+    const bios = /machine='q35'/.test(xml) ? 'uefi' : 'legacy';
+    const iso = (xml.match(/device='cdrom'[\s\S]*?<source file='([^']+)'/)||[])[1] || "";
+    const usbDevices = [...xml.matchAll(/<hostdev[^>]*type='usb'>[\s\S]*?vendor id='0x([0-9a-fA-F]{4})'\/>\s*<product id='0x([0-9a-fA-F]{4})'/g)].map(m=>`${m[1]}:${m[2]}`);
+    res.json({ok:true, vcpus:vcpus?parseInt(vcpus):null, memMB:memKB?Math.round(parseInt(memKB)/1024):null, network, bios, iso, usbDevices});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// Édition d'une VM à l'arrêt : vCPU, RAM, réseau, BIOS/UEFI, USB (disque/ISO
+// non modifiables ici — trop risqué de changer le stockage à chaud, cf.
+// décision OVA hors scope pour la création)
+app.put("/api/vms/:n", auth, async (req,res) => {
+  if (isLive()) return res.status(400).json({error:"Impossible en Live CD"});
+  const name = req.params.n;
+  try {
+    const state = await virsh(`domstate ${sh(name)}`);
+    if (!state.includes("shut off")) return res.status(400).json({error:"Éteignez la VM avant de la modifier"});
+    const oldXml = await virsh(`dumpxml ${sh(name)}`);
+    const uuid = (oldXml.match(/<uuid>([^<]+)<\/uuid>/)||[])[1];
+    const diskFile = (oldXml.match(/device='disk'[\s\S]*?<source file='([^']+)'/)||[])[1];
+    if (!diskFile) return res.status(500).json({error:"Disque introuvable dans la config existante"});
+    const {vcpus,memMB,network,bios,iso,usbDevices} = req.body;
+    if (!vcpus||!memMB) return res.status(400).json({error:"vcpus, memMB requis"});
+    const memKB = parseInt(memMB)*1024;
+    const cdrom = iso ? `<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='${iso}'/><target dev='sdb' bus='sata'/><readonly/></disk>` : "";
+    const bootDev = iso ? "<boot dev='cdrom'/><boot dev='hd'/>" : "<boot dev='hd'/>";
+    const {domainType, emulator} = await detectDomainTypeAndEmulator();
+    const osBlock = await buildOsBlock(name, bios, bootDev);
+    const usbBlock = buildUsbBlock(usbDevices);
+    const xml = buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock});
+    const xmlPath = `/tmp/${name}-edit-${Date.now()}.xml`;
+    fs.writeFileSync(xmlPath, xml);
+    await virsh(`define ${sh(xmlPath)}`);
+    fs.unlinkSync(xmlPath);
+    res.json({ok:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
 
 // ── Console VM temps réel (noVNC dans le navigateur, via un pont websockify) ─
 // Chaque VM utilise déjà <graphics type='vnc' port='-1'/> (port assigné par

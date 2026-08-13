@@ -585,20 +585,22 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
             <div></div>
           </div>
 
-          <div class="flabel">Disque</div>
-          <div style="display:flex;gap:16px;margin-bottom:8px">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="vm-disk-mode" value="new" checked onchange="vmDiskModeChanged()"> Nouveau disque vide</label>
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="vm-disk-mode" value="import" onchange="vmDiskModeChanged()"> Importer un disque existant</label>
-          </div>
-          <div id="vm-disk-new">
-            <div class="flabel">Taille (Go)</div>
-            <input type="text" id="vm-disk" placeholder="20" style="width:100%">
-          </div>
-          <div id="vm-disk-import" style="display:none">
-            <div class="flabel">Fichier disque (qcow2 utilisé tel quel · vdi/vmdk/raw convertis automatiquement)</div>
-            <div style="display:flex;gap:8px">
-              <input type="text" id="vm-import-path" placeholder="/srv/volumes/.../disque.vdi" style="flex:1" readonly>
-              <button type="button" class="btn" onclick="openFilePicker(document.getElementById('vm-import-path'))">📁 Parcourir</button>
+          <div id="vm-disk-section">
+            <div class="flabel">Disque</div>
+            <div style="display:flex;gap:16px;margin-bottom:8px">
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="vm-disk-mode" value="new" checked onchange="vmDiskModeChanged()"> Nouveau disque vide</label>
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="vm-disk-mode" value="import" onchange="vmDiskModeChanged()"> Importer un disque existant</label>
+            </div>
+            <div id="vm-disk-new">
+              <div class="flabel">Taille (Go)</div>
+              <input type="text" id="vm-disk" placeholder="20" style="width:100%">
+            </div>
+            <div id="vm-disk-import" style="display:none">
+              <div class="flabel">Fichier disque (qcow2 utilisé tel quel · vdi/vmdk/raw convertis automatiquement)</div>
+              <div style="display:flex;gap:8px">
+                <input type="text" id="vm-import-path" placeholder="/srv/volumes/.../disque.vdi" style="flex:1" readonly>
+                <button type="button" class="btn" onclick="openFilePicker(document.getElementById('vm-import-path'))">📁 Parcourir</button>
+              </div>
             </div>
           </div>
 
@@ -1402,7 +1404,7 @@ async function loadVms(){
     vmEl.innerHTML=`<div style="display:grid;grid-template-columns:2fr 60px 90px 70px 70px 80px auto;gap:10px;padding:0 0 8px;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px"><span>Nom</span><span>vCPUs</span><span>RAM alloué</span><span>CPU</span><span>RAM util.</span><span>État</span><span>Actions</span></div>`
       +d.vms.map(v=>{
         const running=v.state?.includes('run');
-        return `<div class="drow"><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">ID ${v.id||'—'}</div></div><div>${v.vcpus||'?'}</div><div>${v.memMB||'?'} Mo</div><div class="mono">${running&&v.cpuPct!=null?v.cpuPct+'%':'—'}</div><div class="mono">${running&&v.memUsedMB!=null?v.memUsedMB+' Mo':'—'}</div><span class="badge ${running?'bg':v.state?.includes('shut')?'br':'ba'}">${v.state||'?'}</span><div style="display:flex;gap:6px">${running?`<button class="btn btn-primary" onclick="openVmConsole('${v.name}')" title="Console temps réel">🖥️</button><button class="btn" onclick="vmAction('${v.name}','stop')">⏹</button><button class="btn" onclick="vmAction('${v.name}','restart')">↺</button>`:`<button class="btn btn-primary" onclick="vmAction('${v.name}','start')">▶</button>`}<button class="btn btn-danger" onclick="if(confirm('Supprimer ${v.name} ?'))vmAction('${v.name}','delete')">✕</button></div></div>`;
+        return `<div class="drow"><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">ID ${v.id||'—'}</div></div><div>${v.vcpus||'?'}</div><div>${v.memMB||'?'} Mo</div><div class="mono">${running&&v.cpuPct!=null?v.cpuPct+'%':'—'}</div><div class="mono">${running&&v.memUsedMB!=null?v.memUsedMB+' Mo':'—'}</div><span class="badge ${running?'bg':v.state?.includes('shut')?'br':'ba'}">${v.state||'?'}</span><div style="display:flex;gap:6px">${running?`<button class="btn btn-primary" onclick="openVmConsole('${v.name}')" title="Console temps réel">🖥️</button><button class="btn" onclick="vmAction('${v.name}','stop')">⏹</button><button class="btn" onclick="vmAction('${v.name}','restart')">↺</button>`:`<button class="btn btn-primary" onclick="vmAction('${v.name}','start')">▶</button><button class="btn" onclick="editVm('${v.name}')" title="Modifier">✎</button>`}<button class="btn btn-danger" onclick="if(confirm('Supprimer ${v.name} ?'))vmAction('${v.name}','delete')">✕</button></div></div>`;
       }).join('');
   } else {
     vmEl.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px 0">Aucune VM — créez-en une ci-dessus</div>';
@@ -1425,7 +1427,38 @@ async function openVmConsole(name){
   const url=`/novnc/vnc_lite.html?host=${location.hostname}&port=${r.wsPort}&autoconnect=true&resize=scale&reconnect=true&title=${encodeURIComponent(name)}`;
   window.open(url,'_blank');
 }
-function toggleVmForm(){const f=document.getElementById('vm-form');f.style.display=f.style.display==='none'?'block':'none'; if(f.style.display==='block') loadVms();}
+let vmEditing=null;
+function resetVmForm(){
+  vmEditing=null;
+  document.getElementById('vm-name').disabled=false;
+  document.getElementById('vm-name').value='';
+  document.getElementById('vm-disk-section').style.display='block';
+  document.getElementById('vm-submit').textContent='🚀 Créer';
+}
+function toggleVmForm(){
+  const f=document.getElementById('vm-form');
+  const opening=f.style.display==='none';
+  if(opening){resetVmForm();loadVms();}
+  f.style.display=opening?'block':'none';
+}
+async function editVm(name){
+  await loadVms();
+  const r=await api('GET','/api/vms/'+encodeURIComponent(name));
+  if(!r?.ok){toast('VM',r?.error||'Erreur');return;}
+  vmEditing=name;
+  document.getElementById('vm-form').style.display='block';
+  document.getElementById('vm-name').value=name;
+  document.getElementById('vm-name').disabled=true;
+  document.getElementById('vm-bios').value=r.bios||'legacy';
+  document.getElementById('vm-cpu').value=r.vcpus||2;
+  document.getElementById('vm-mem').value=r.memMB||2048;
+  document.getElementById('vm-iso').value=r.iso||'';
+  document.getElementById('vm-network').value=r.network||'default';
+  document.getElementById('vm-disk-section').style.display='none';
+  document.querySelectorAll('.vm-usb-cb').forEach(cb=>cb.checked=(r.usbDevices||[]).includes(cb.value));
+  document.getElementById('vm-submit').textContent='💾 Enregistrer';
+  document.getElementById('vm-form').scrollIntoView({behavior:'smooth',block:'start'});
+}
 function vmDiskModeChanged(){
   const importing = document.querySelector('input[name="vm-disk-mode"]:checked').value==='import';
   document.getElementById('vm-disk-new').style.display = importing ? 'none' : 'block';
@@ -1435,21 +1468,31 @@ async function createVm(){
   const err=document.getElementById('vm-err'); err.style.display='none';
   const name=document.getElementById('vm-name').value.trim();
   if(!name){err.textContent='Nom requis';err.style.display='block';return;}
-  const importing = document.querySelector('input[name="vm-disk-mode"]:checked').value==='import';
-  const importDisk = document.getElementById('vm-import-path').value.trim();
-  if(importing && !importDisk){err.textContent='Sélectionnez un disque à importer';err.style.display='block';return;}
   const body={
     name,
     bios:document.getElementById('vm-bios').value,
     vcpus:parseInt(document.getElementById('vm-cpu').value)||2,
     memMB:parseInt(document.getElementById('vm-mem').value)||2048,
-    diskGB:parseInt(document.getElementById('vm-disk').value)||20,
     iso:document.getElementById('vm-iso').value,
     network:document.getElementById('vm-network').value,
     usbDevices:[...document.querySelectorAll('.vm-usb-cb:checked')].map(c=>c.value)
   };
-  if(importing) body.importDisk = importDisk;
   const btn=document.getElementById('vm-submit'); btn.disabled=true;
+  if(vmEditing){
+    const r=await api('PUT','/api/vms/'+encodeURIComponent(vmEditing),body);
+    btn.disabled=false;
+    if(!r?.ok){err.textContent=r?.error||'Erreur';err.style.display='block';return;}
+    toast('VM','VM modifiée ✓');
+    document.getElementById('vm-form').style.display='none';
+    resetVmForm();
+    loadVms();
+    return;
+  }
+  const importing = document.querySelector('input[name="vm-disk-mode"]:checked').value==='import';
+  const importDisk = document.getElementById('vm-import-path').value.trim();
+  if(importing && !importDisk){err.textContent='Sélectionnez un disque à importer';err.style.display='block';btn.disabled=false;return;}
+  body.diskGB=parseInt(document.getElementById('vm-disk').value)||20;
+  if(importing) body.importDisk = importDisk;
   const r=await api('POST','/api/vms',body);
   btn.disabled=false;
   if(!r?.ok){err.textContent=r?.error||'Erreur';err.style.display='block';return;}
