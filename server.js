@@ -1302,6 +1302,28 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
       apt-get install -y smbclient 2>&1 | tail -3
     fi
 
+    # Bit setuid perdu sur sudo/polkit sur au moins un NAS installé (cause
+    # exacte inconnue) — casse "sudo" ET tout ce qui passe par polkit. Ce
+    # bloc tourne dans le process gravity-webui (root), donc pas besoin de
+    # sudo pour le corriger.
+    for f in /usr/bin/sudo /usr/lib/policykit-1/polkit-agent-helper-1; do
+      if [ -f "$f" ] && [ ! -u "$f" ]; then
+        echo "Setuid manquant sur $f, restauration..."
+        chown root:root "$f" && chmod u+s "$f"
+      fi
+    done
+
+    # "error creating bridge interface virbr0: Operation not permitted" au
+    # démarrage d'une VM sur au moins un NAS — coïncide avec l'installation
+    # d'AppArmor ci-dessus (2026-08-11), qui active tous les profils fournis
+    # par les paquets déjà installés, dont celui de libvirtd. Passage en mode
+    # complain (log sans bloquer) plutôt que désactivation complète.
+    modprobe bridge 2>/dev/null || true
+    if command -v aa-complain &>/dev/null && [ -f /etc/apparmor.d/usr.sbin.libvirtd ]; then
+      aa-complain /usr/sbin/libvirtd 2>/dev/null && echo "Profil AppArmor libvirtd passé en mode complain" || true
+      systemctl restart libvirtd 2>/dev/null || true
+    fi
+
     # Ports UDP de découverte réseau (NetBIOS + WS-Discovery) — ufw n'ouvrait
     # que du TCP avant le 2026-08-11, rendant le NAS invisible dans "Réseau"
     # Windows malgré une connexion directe fonctionnelle
