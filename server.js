@@ -688,8 +688,15 @@ function buildUsbBlock(usbDevices) {
   }).join("");
 }
 
-function buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock}) {
-  return `<domain type='${domainType}'><name>${name}</name>${uuid ? `<uuid>${uuid}</uuid>` : ""}<memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${diskFile}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
+function buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock, bios}) {
+  // Le chipset q35 (UEFI) n'a pas de contrôleur IDE (PIIX) comme le chipset
+  // pc (Legacy/BIOS) — "IDE controllers are unsupported for this QEMU binary
+  // or machine type" à la définition si on garde bus='ide' en UEFI. SATA
+  // fonctionne sur les deux chipsets, mais IDE reste le choix historique
+  // pour Legacy (compatibilité la plus large avec de vieux OS invités).
+  const diskBus = bios === "uefi" ? "sata" : "ide";
+  const diskDev = bios === "uefi" ? "sda" : "hda";
+  return `<domain type='${domainType}'><name>${name}</name>${uuid ? `<uuid>${uuid}</uuid>` : ""}<memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${diskFile}'/><target dev='${diskDev}' bus='${diskBus}'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
 }
 
 app.get("/api/vms", auth, async (req,res) => {
@@ -740,7 +747,7 @@ app.post("/api/vms", auth, async (req,res) => {
     // Passthrough USB — usbDevices: ["vendorId:productId", ...] (depuis /api/usb)
     const usbBlock = buildUsbBlock(usbDevices);
 
-    const xml = buildDomainXml({name:safeName, domainType, emulator, memKB, vcpus, osBlock, diskFile:dp, cdrom, network, usbBlock});
+    const xml = buildDomainXml({name:safeName, domainType, emulator, memKB, vcpus, osBlock, diskFile:dp, cdrom, network, usbBlock, bios});
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
     fs.writeFileSync(xmlPath, xml);
     // Le disque (création ou import/conversion) tourne en job asynchrone —
@@ -791,7 +798,7 @@ app.put("/api/vms/:n", auth, async (req,res) => {
     const {domainType, emulator} = await detectDomainTypeAndEmulator();
     const osBlock = await buildOsBlock(name, bios, bootDev);
     const usbBlock = buildUsbBlock(usbDevices);
-    const xml = buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock});
+    const xml = buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock, bios});
     const xmlPath = `/tmp/${name}-edit-${Date.now()}.xml`;
     fs.writeFileSync(xmlPath, xml);
     await virsh(`define ${sh(xmlPath)}`);
