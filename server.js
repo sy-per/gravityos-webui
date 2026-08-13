@@ -1302,6 +1302,18 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
       apt-get install -y smbclient 2>&1 | tail -3
     fi
 
+    # dnsmasq requis par le reseau NAT "default" de libvirt (DHCP des VMs) --
+    # jamais installe car libvirt-daemon-system a ete installe avec
+    # --no-install-recommends (build-iso.sh) et dnsmasq-base n'est qu'une
+    # recommandation du paquet, pas une dependance stricte. Cause reelle de
+    # "network 'default' is not active" au demarrage d'une VM, trouvee apres
+    # plusieurs pistes fausses (reseau non defini, permissions, AppArmor).
+    if ! command -v dnsmasq &>/dev/null; then
+      echo "Installation de dnsmasq-base (requis pour le reseau NAT des VMs)..."
+      apt-get install -y dnsmasq-base 2>&1 | tail -3
+      virsh --connect qemu:///system net-start default 2>/dev/null && echo "Reseau libvirt default demarre ✓" || true
+    fi
+
     # Bit setuid perdu sur sudo/polkit sur au moins un NAS installé (cause
     # exacte inconnue) — casse "sudo" ET tout ce qui passe par polkit. Ce
     # bloc tourne dans le process gravity-webui (root), donc pas besoin de
