@@ -628,15 +628,38 @@ async function vmLiveStat(name){
   } catch { return { memUsedMB:null, cpuPct:null }; }
 }
 
+// Réseau NAT par défaut de libvirt — normalement fourni par le paquet
+// libvirt-daemon-system et défini/autostart par gravity-first-boot.sh, mais
+// certains systèmes (session live/test, premier boot jamais passé) n'ont
+// AUCUN réseau "default" défini du tout (pas juste inactif) : `virsh net-list
+// --all` y est vide, et `net-start default` échoue avec "Network not found:
+// no network with matching name 'default'" plutôt que l'erreur "not active"
+// habituelle.
+const DEFAULT_NETWORK_XML = `<network><name>default</name><forward mode='nat'><nat><port start='1024' end='65535'/></nat></forward><bridge name='virbr0' stp='on' delay='0'/><ip address='192.168.122.1' netmask='255.255.255.0'><dhcp><range start='192.168.122.2' end='192.168.122.254'/></dhcp></ip></network>`;
+
 // Démarre tout réseau libvirt référencé par la VM mais actuellement inactif —
 // évite l'échec "Requested operation is not valid: network 'default' is not
-// active" au clic sur "Démarrer" (le réseau default n'est censé être autostart
-// qu'au premier boot, gravity-first-boot.sh, mais peut rester inactif si ce
-// script n'a jamais tourné sur ce système, ex. session live/VM de test).
+// active" au clic sur "Démarrer". Si le réseau "default" n'est même pas
+// défini (cas ci-dessus), le recrée d'abord avec la config NAT standard.
 async function ensureVmNetworksActive(name) {
   const xml = await virsh(`dumpxml ${sh(name)}`);
   const nets = [...new Set([...xml.matchAll(/<source network='([^']+)'/g)].map(m => m[1]))];
-  for (const net of nets) await virsh(`net-start ${sh(net)}`).catch(() => {});
+  for (const net of nets) {
+    try {
+      await virsh(`net-start ${sh(net)}`);
+    } catch (e) {
+      if (net !== "default" || !/Network not found/.test(e.message)) continue;
+      const xmlPath = `/tmp/default-network-${Date.now()}.xml`;
+      fs.writeFileSync(xmlPath, DEFAULT_NETWORK_XML);
+      try {
+        await virsh(`net-define ${sh(xmlPath)}`);
+        await virsh(`net-autostart ${sh(net)}`).catch(() => {});
+        await virsh(`net-start ${sh(net)}`).catch(() => {});
+      } finally {
+        fs.unlinkSync(xmlPath);
+      }
+    }
+  }
 }
 
 async function detectDomainTypeAndEmulator() {
