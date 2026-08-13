@@ -203,10 +203,14 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
   </div>
 
   <div class="grid4" style="margin-bottom:14px">
-    <div class="stat blue"><div class="stat-lbl">CPU</div><div class="stat-val" id="d-cpu">–<span class="stat-unit">%</span></div><div class="stat-bar"><div class="stat-fill" id="d-cpu-bar" style="width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div></div>
+    <div class="stat blue" id="d-cpu-tile" style="cursor:pointer" onclick="toggleCpuDetails()" title="Cliquer pour voir le détail par cœur"><div class="stat-lbl">CPU <span id="cpu-toggle-arrow" style="font-size:10px">▸</span></div><div class="stat-val" id="d-cpu">–<span class="stat-unit">%</span></div><div class="stat-bar"><div class="stat-fill" id="d-cpu-bar" style="width:0%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div></div>
     <div class="stat purple"><div class="stat-lbl">RAM</div><div class="stat-val" id="d-ram">–<span class="stat-unit">%</span></div><div class="stat-bar"><div class="stat-fill" id="d-ram-bar" style="width:0%;background:var(--accent3)"></div></div></div>
     <div class="stat green"><div class="stat-lbl">Réseau ↓</div><div class="stat-val" id="d-net">–<span class="stat-unit">Mo/s</span></div><div class="stat-bar"><div class="stat-fill" id="d-net-bar" style="width:0%;background:var(--green)"></div></div></div>
     <div class="stat amber"><div class="stat-lbl">Température</div><div class="stat-val" id="d-temp">–<span class="stat-unit">°C</span></div><div class="stat-bar"><div class="stat-fill" id="d-temp-bar" style="width:0%;background:var(--amber)"></div></div></div>
+  </div>
+  <div class="card" id="cpu-cores-detail" style="display:none;margin-bottom:14px">
+    <div class="card-title">🧮 CPU par cœur</div>
+    <div id="cpu-cores-list" style="display:grid;grid-template-columns:1fr 1fr;gap:6px 20px"></div>
   </div>
   <div class="grid2" style="margin-bottom:14px">
     <div class="card">
@@ -1011,7 +1015,8 @@ function connectWs(){
     if(d.type!=='metrics') return;
     wsRetries = 0;
     document.getElementById('d-cpu').innerHTML=d.cpu+'<span class="stat-unit">%</span>';
-    document.getElementById('d-cpu-bar').style.width=d.cpu+'%';
+    document.getElementById('d-cpu-bar').style.width=Math.min(d.cpu,100)+'%';
+    if(d.cpuCores?.length) renderCpuCores(d.cpuCores);
     document.getElementById('d-ram').innerHTML=d.ram.pct+'<span class="stat-unit">%</span>';
     document.getElementById('d-ram-bar').style.width=d.ram.pct+'%';
     const mb=Math.round((d.net.rx||0)/1048576);
@@ -1050,9 +1055,19 @@ function drawGraph(){
   ctx.fillStyle=g;ctx.fill();
 }
 
+function toggleCpuDetails(){
+  const el=document.getElementById('cpu-cores-detail');
+  const open=el.style.display==='none';
+  el.style.display=open?'block':'none';
+  document.getElementById('cpu-toggle-arrow').textContent=open?'▾':'▸';
+}
+function renderCpuCores(cores){
+  if(document.getElementById('cpu-cores-detail').style.display==='none') return;
+  document.getElementById('cpu-cores-list').innerHTML=cores.map((pct,i)=>`<div style="display:flex;align-items:center;gap:8px;font-size:12px"><span style="width:56px;flex-shrink:0;color:var(--text2)">CPU ${i}</span><div class="stat-bar" style="flex:1"><div class="stat-fill" style="width:${Math.min(pct,100)}%;background:linear-gradient(90deg,var(--accent),var(--accent2))"></div></div><span style="width:34px;text-align:right;font-weight:600">${pct}%</span></div>`).join('');
+}
 function renderDashDisks(disks){
   const el=document.getElementById('disk-list');if(!el)return;
-  el.innerHTML=disks.slice(0,4).map(d=>`<div class="drow"><span class="dico">💿</span><div class="dinfo"><div class="dname">${d.fs}</div><div class="dsub">${fmt(d.used)} / ${fmt(d.size)}</div><div class="dbar"><div style="width:${d.pct}%;height:100%;background:${d.pct>85?'var(--red)':d.pct>60?'var(--amber)':'var(--accent)'};border-radius:2px"></div></div></div><span style="font-size:13px;font-weight:600">${d.pct}%</span></div>`).join('');
+  el.innerHTML=disks.slice(0,4).map(d=>`<div class="drow"><span class="dico">💽</span><div class="dinfo"><div class="dname">${d.fs}</div><div class="dsub">${fmt(d.used)} / ${fmt(d.size)}</div><div class="dbar"><div style="width:${d.pct}%;height:100%;background:${d.pct>85?'var(--red)':d.pct>60?'var(--amber)':'var(--accent)'};border-radius:2px"></div></div></div><span style="font-size:13px;font-weight:600">${d.pct}%</span></div>`).join('');
 }
 
 function fmt(b){if(!b)return'0 o';const u=['o','Ko','Mo','Go','To'],i=Math.floor(Math.log(b)/Math.log(1024));return(b/Math.pow(1024,i)).toFixed(1)+' '+u[i];}
@@ -1104,7 +1119,7 @@ async function loadStorage(){ loadDisks(); }
 async function loadDisks(){
   const d=await api('GET','/api/disks');
   if(d?.devices) document.getElementById('disk-table').innerHTML=d.devices.filter(x=>x.type==='disk').map(dev=>`<tr><td><span class="mono">/dev/${dev.name}</span></td><td>${dev.size||'?'}</td><td style="color:var(--text2);font-size:11px">${dev.model||'—'}</td><td><span class="badge bx">${dev.protocol||dev.type}</span></td><td><span class="badge bg">OK</span></td><td><button class="btn" onclick="toast('S.M.A.R.T.','Analyse de /dev/${dev.name}...')">Analyser</button></td></tr>`).join('')||'<tr><td colspan="6" style="color:var(--text3)">Aucun disque</td></tr>';
-  if(d?.filesystems) document.getElementById('fs-list').innerHTML=d.filesystems.map(f=>`<div class="drow"><span class="dico">${f.fs.includes('tmp')?'🗃️':'💿'}</span><div class="dinfo"><div class="dname">${f.fs}</div><div class="dsub">${fmt(f.used)} / ${fmt(f.size)}</div><div class="dbar"><div style="width:${f.pct}%;height:100%;background:${f.pct>85?'var(--red)':f.pct>60?'var(--amber)':'var(--accent)'};border-radius:2px"></div></div></div><span style="font-size:13px;font-weight:600;min-width:36px;text-align:right">${f.pct}%</span></div>`).join('');
+  if(d?.filesystems) document.getElementById('fs-list').innerHTML=d.filesystems.map(f=>`<div class="drow"><span class="dico">${f.fs.includes('tmp')?'🗃️':'💽'}</span><div class="dinfo"><div class="dname">${f.fs}</div><div class="dsub">${fmt(f.used)} / ${fmt(f.size)}</div><div class="dbar"><div style="width:${f.pct}%;height:100%;background:${f.pct>85?'var(--red)':f.pct>60?'var(--amber)':'var(--accent)'};border-radius:2px"></div></div></div><span style="font-size:13px;font-weight:600;min-width:36px;text-align:right">${f.pct}%</span></div>`).join('');
 }
 function fmtBytes(n){ if(!n) return '0 Go'; const go=n/1073741824; return go>=1?go.toFixed(1)+' Go':(n/1048576).toFixed(0)+' Mo'; }
 
@@ -1112,6 +1127,7 @@ function fmtBytes(n){ if(!n) return '0 Go'; const go=n/1073741824; return go>=1?
 async function loadVolumes(){
   const vols=await api('GET','/api/storage/volumes');
   document.getElementById('volumes-list').innerHTML=(vols||[]).map(v=>`<div class="rowform" style="align-items:center;background:var(--surface2);padding:10px 12px;border-radius:8px">
+    <span class="dico">💽</span>
     <div style="flex:1">
       <div><strong>${v.name}</strong> ${v.system?'<span class="badge bb">Système</span>':''}</div>
       <div style="color:var(--text2);font-size:11px" class="mono">${v.path} · ${v.device}</div>
@@ -1401,10 +1417,12 @@ async function loadVms(){
   if(d?.isLive){
     vmEl.innerHTML=`<div style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);border-radius:10px;padding:16px;color:var(--amber);font-size:13px">⚠️ ${d.message}</div>`;
   } else if(d?.vms?.length){
-    vmEl.innerHTML=`<div style="display:grid;grid-template-columns:2fr 60px 90px 70px 70px 80px auto;gap:10px;padding:0 0 8px;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px"><span>Nom</span><span>vCPUs</span><span>RAM alloué</span><span>CPU</span><span>RAM util.</span><span>État</span><span>Actions</span></div>`
+    const vmCols='2fr 60px 110px 70px 80px auto';
+    vmEl.innerHTML=`<div style="display:grid;grid-template-columns:${vmCols};gap:10px;padding:0 0 8px;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px"><span>Nom</span><span>vCPUs</span><span>RAM (util./alloué)</span><span>CPU</span><span>État</span><span>Actions</span></div>`
       +d.vms.map(v=>{
         const running=v.state?.includes('run');
-        return `<div class="drow"><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">ID ${v.id||'—'}</div></div><div>${v.vcpus||'?'}</div><div>${v.memMB||'?'} Mo</div><div class="mono">${running&&v.cpuPct!=null?v.cpuPct+'%':'—'}</div><div class="mono">${running&&v.memUsedMB!=null?v.memUsedMB+' Mo':'—'}</div><span class="badge ${running?'bg':v.state?.includes('shut')?'br':'ba'}">${v.state||'?'}</span><div style="display:flex;gap:6px">${running?`<button class="btn btn-primary" onclick="openVmConsole('${v.name}')" title="Console temps réel">🖥️</button><button class="btn" onclick="vmAction('${v.name}','stop')">⏹</button><button class="btn" onclick="vmAction('${v.name}','restart')">↺</button>`:`<button class="btn btn-primary" onclick="vmAction('${v.name}','start')">▶</button><button class="btn" onclick="editVm('${v.name}')" title="Modifier">✎</button>`}<button class="btn btn-danger" onclick="if(confirm('Supprimer ${v.name} ?'))vmAction('${v.name}','delete')">✕</button></div></div>`;
+        const ram = running&&v.memUsedMB!=null ? `${v.memUsedMB}/${v.memMB||'?'} Mo` : `${v.memMB||'?'} Mo`;
+        return `<div style="display:grid;grid-template-columns:${vmCols};gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.04)"><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">ID ${v.id||'—'}</div></div><div>${v.vcpus||'?'}</div><div class="mono">${ram}</div><div class="mono">${running&&v.cpuPct!=null?v.cpuPct+'%':'—'}</div><span class="badge ${running?'bg':v.state?.includes('shut')?'br':'ba'}">${v.state||'?'}</span><div style="display:flex;gap:6px">${running?`<button class="btn btn-primary" onclick="openVmConsole('${v.name}')" title="Console temps réel">🖥️</button><button class="btn" onclick="vmAction('${v.name}','stop')">⏹</button><button class="btn" onclick="vmAction('${v.name}','restart')">↺</button>`:`<button class="btn btn-primary" onclick="vmAction('${v.name}','start')">▶</button><button class="btn" onclick="editVm('${v.name}')" title="Modifier">✎</button>`}<button class="btn btn-danger" onclick="if(confirm('Supprimer ${v.name} ?'))vmAction('${v.name}','delete')">✕</button></div></div>`;
       }).join('');
   } else {
     vmEl.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px 0">Aucune VM — créez-en une ci-dessus</div>';

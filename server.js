@@ -173,7 +173,7 @@ wss.on("connection", (ws, req) => {
   async function push() {
     try {
       const [cpu,mem,net,temp,disk] = await Promise.all([si.currentLoad(),si.mem(),si.networkStats(),si.cpuTemperature(),si.fsSize()]);
-      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), ram:{used:mem.used,total:mem.total,pct:Math.round(mem.used/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
+      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), cpuCores:(cpu.cpus||[]).map(c=>Math.round(c.load)), ram:{used:mem.used,total:mem.total,pct:Math.round(mem.used/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
     } catch {}
   }
   iv = setInterval(push, 2000); push();
@@ -612,7 +612,7 @@ async function virsh(cmd) {
 
 // Stats CPU/RAM en direct pour une VM en cours d'exécution (2 échantillons
 // de cpu.time à 300ms d'écart pour un %CPU instantané, RSS réel via dommemstat)
-async function vmLiveStat(name){
+async function vmLiveStat(name, vcpus){
   try {
     const [mem, cpu1] = await Promise.all([
       execAsync(`virsh --connect qemu:///system dommemstat ${sh(name)} 2>/dev/null`),
@@ -623,7 +623,13 @@ async function vmLiveStat(name){
     await new Promise(r=>setTimeout(r,300));
     const {stdout:cpu2raw} = await execAsync(`virsh --connect qemu:///system domstats ${sh(name)} --cpu-total 2>/dev/null`);
     const cpuTime2 = parseInt((cpu2raw.match(/cpu\.time=(\d+)/)||[])[1] || 0);
-    const cpuPct = Math.max(0, Math.min(999, ((cpuTime2-cpuTime1)/(300*1e6))*100));
+    // cpu.time cumule le temps CPU de tous les vCPUs — sans normaliser par le
+    // nombre de vCPUs, une VM à 2 vCPUs saturés affiche 200% (convention
+    // "top" brute), ce qui déroute plus qu'autre chose dans une liste où
+    // toutes les autres jauges (CPU hôte, RAM) sont sur 0-100%. On ramène
+    // donc ici sur une échelle 0-100% = utilisation moyenne des vCPUs alloués.
+    const rawPct = Math.max(0, ((cpuTime2-cpuTime1)/(300*1e6))*100);
+    const cpuPct = Math.min(100, rawPct / (parseInt(vcpus)||1));
     return { memUsedMB: rssKB ? Math.round(rssKB/1024) : null, cpuPct: Math.round(cpuPct*10)/10 };
   } catch { return { memUsedMB:null, cpuPct:null }; }
 }
@@ -727,7 +733,7 @@ app.get("/api/vms", auth, async (req,res) => {
       let d = vm;
       try{const i=await virsh(`dominfo ${vm.name}`);d={...vm,vcpus:(i.match(/CPU\(s\):\s+(\d+)/)||[])[1]||"?",memMB:Math.round(parseInt((i.match(/Max memory:\s+(\d+)/)||[])[1]||0)/1024)};}catch{}
       if (vm.state?.includes("running")) {
-        const live = await vmLiveStat(vm.name);
+        const live = await vmLiveStat(vm.name, d.vcpus);
         d = { ...d, ...live };
       }
       return d;
