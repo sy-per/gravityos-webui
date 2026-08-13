@@ -601,7 +601,14 @@ app.post("/api/proxy/custom-cert", auth, (req,res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 //  VMs
 // ══════════════════════════════════════════════════════════════════════════════
-async function virsh(cmd) { const{stdout}=await execAsync(`virsh --connect qemu:///system ${cmd} 2>/dev/null`);return stdout.trim(); }
+async function virsh(cmd) {
+  try {
+    const {stdout} = await execAsync(`virsh --connect qemu:///system ${cmd}`);
+    return stdout.trim();
+  } catch(e) {
+    throw new Error((e.stderr || e.message || '').trim());
+  }
+}
 
 // Stats CPU/RAM en direct pour une VM en cours d'exécution (2 échantillons
 // de cpu.time à 300ms d'écart pour un %CPU instantané, RSS réel via dommemstat)
