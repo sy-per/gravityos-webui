@@ -282,12 +282,15 @@ app.get("/api/storage/browse", auth, (req,res)=>{
   if (!isPathAllowed(p)) return res.status(400).json({error:"Chemin non autorisé"});
   try {
     if (!fs.existsSync(p)) return res.status(404).json({error:"Dossier introuvable"});
-    const entries = fs.readdirSync(p, {withFileTypes:true})
-      .filter(e=>e.isDirectory())
-      .map(e=>e.name)
-      .sort((a,b)=>a.localeCompare(b));
+    const all = fs.readdirSync(p, {withFileTypes:true});
+    const entries = all.filter(e=>e.isDirectory()).map(e=>e.name).sort((a,b)=>a.localeCompare(b));
     const parent = BROWSE_ROOTS.includes(path.resolve(p)) ? null : path.dirname(p);
-    res.json({ path:p, parent, roots:BROWSE_ROOTS, entries });
+    const out = { path:p, parent, roots:BROWSE_ROOTS, entries };
+    // Optionnel : lister aussi les fichiers (utilisé par l'import de disque VM)
+    if (req.query.files) {
+      out.files = all.filter(e=>e.isFile()).map(e=>e.name).sort((a,b)=>a.localeCompare(b));
+    }
+    res.json(out);
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post("/api/storage/browse/mkdir", auth, (req,res)=>{
@@ -612,12 +615,27 @@ app.get("/api/vms", auth, async (req,res) => {
 });
 app.post("/api/vms", auth, async (req,res) => {
   if(isLive()) return res.status(400).json({error:"Impossible en Live CD"});
-  const{name,vcpus,memMB,diskGB,iso,network,bios,usbDevices}=req.body;
+  const{name,vcpus,memMB,diskGB,iso,network,bios,usbDevices,importDisk}=req.body;
   if(!name||!vcpus||!memMB) return res.status(400).json({error:"name, vcpus, memMB requis"});
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g,"");
   const dp=`/var/lib/libvirt/images/${safeName}.qcow2`;
   try {
-    await execAsync(`mkdir -p /var/lib/libvirt/images && qemu-img create -f qcow2 "${dp}" ${diskGB||20}G`);
+    await execAsync(`mkdir -p /var/lib/libvirt/images`);
+    // Disque : soit un nouveau qcow2 vide, soit importé/converti depuis un
+    // disque existant (qcow2 réutilisé tel quel, vdi/vmdk/raw convertis via
+    // qemu-img — potentiellement long sur un gros disque, donc en job async)
+    let diskCmd;
+    if (importDisk) {
+      if (!isPathAllowed(importDisk) || !fs.existsSync(importDisk)) return res.status(400).json({error:"Disque à importer introuvable ou hors des volumes autorisés"});
+      const ext = path.extname(importDisk).toLowerCase().replace(".","");
+      const fmtMap = { qcow2:"qcow2", vdi:"vdi", vmdk:"vmdk", img:"raw", raw:"raw" };
+      const srcFmt = fmtMap[ext];
+      diskCmd = srcFmt === "qcow2"
+        ? `cp ${sh(importDisk)} ${sh(dp)}`
+        : `qemu-img convert -p ${srcFmt ? "-f "+srcFmt : ""} -O qcow2 ${sh(importDisk)} ${sh(dp)}`;
+    } else {
+      diskCmd = `qemu-img create -f qcow2 ${sh(dp)} ${diskGB||20}G`;
+    }
     const memKB = parseInt(memMB)*1024;
     const cdrom = iso ? `<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='${iso}'/><target dev='sdb' bus='sata'/><readonly/></disk>` : "";
     const bootDev = iso ? "<boot dev='cdrom'/><boot dev='hd'/>" : "<boot dev='hd'/>";
@@ -649,10 +667,12 @@ app.post("/api/vms", auth, async (req,res) => {
 
     const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
-    require("fs").writeFileSync(xmlPath, xml);
-    const {stdout,stderr} = await execAsync(`virsh --connect qemu:///system define "${xmlPath}"`);
-    require("fs").unlinkSync(xmlPath);
-    res.json({ok:true, disk:dp, message:`VM ${safeName} definie — cliquez ▶ pour demarrer`});
+    fs.writeFileSync(xmlPath, xml);
+    // Le disque (création ou import/conversion) tourne en job asynchrone —
+    // une conversion vdi/vmdk→qcow2 peut prendre plusieurs minutes sur un
+    // gros disque, pas question de bloquer la requête HTTP dessus
+    const jobId = runJob(`${diskCmd} 2>&1 && echo "Disque prêt : ${dp}" && virsh --connect qemu:///system define ${sh(xmlPath)} 2>&1 && rm -f ${sh(xmlPath)} && echo "VM '${safeName}' définie — démarrez-la depuis la liste"`);
+    res.json({ok:true, jobId, disk:dp});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 app.post("/api/vms/:n/start",      auth, async (req,res)=>{try{await virsh(`start ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});

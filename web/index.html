@@ -582,9 +582,27 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
           <div class="grid3">
             <div><div class="flabel">vCPUs</div><input type="text" id="vm-cpu" placeholder="2" style="width:100%"></div>
             <div><div class="flabel">RAM (Mo)</div><input type="text" id="vm-mem" placeholder="2048" style="width:100%"></div>
-            <div><div class="flabel">Disque (Go)</div><input type="text" id="vm-disk" placeholder="20" style="width:100%"></div>
+            <div></div>
           </div>
-          <div class="grid2">
+
+          <div class="flabel">Disque</div>
+          <div style="display:flex;gap:16px;margin-bottom:8px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="vm-disk-mode" value="new" checked onchange="vmDiskModeChanged()"> Nouveau disque vide</label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="radio" name="vm-disk-mode" value="import" onchange="vmDiskModeChanged()"> Importer un disque existant</label>
+          </div>
+          <div id="vm-disk-new">
+            <div class="flabel">Taille (Go)</div>
+            <input type="text" id="vm-disk" placeholder="20" style="width:100%">
+          </div>
+          <div id="vm-disk-import" style="display:none">
+            <div class="flabel">Fichier disque (qcow2 utilisé tel quel · vdi/vmdk/raw convertis automatiquement)</div>
+            <div style="display:flex;gap:8px">
+              <input type="text" id="vm-import-path" placeholder="/srv/volumes/.../disque.vdi" style="flex:1" readonly>
+              <button type="button" class="btn" onclick="openFilePicker(document.getElementById('vm-import-path'))">📁 Parcourir</button>
+            </div>
+          </div>
+
+          <div class="grid2" style="margin-top:10px">
             <div><div class="flabel">ISO de démarrage</div>
               <select id="vm-iso" style="width:100%"><option value="">Sans ISO</option></select></div>
             <div><div class="flabel">Réseau</div>
@@ -888,13 +906,13 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
     </div>
     <div id="dirpicker-path" class="mono" style="font-size:11px;color:var(--text2);margin-bottom:8px;word-break:break-all"></div>
     <div id="dirpicker-list" style="flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:6px;margin-bottom:10px;min-height:180px"></div>
-    <div style="display:flex;gap:8px;margin-bottom:10px">
+    <div id="dirpicker-mkdir-row" style="display:flex;gap:8px;margin-bottom:10px">
       <input type="text" id="dirpicker-newname" placeholder="Nouveau dossier..." style="flex:1">
       <button class="btn" onclick="dirPickerMkdir()">+ Créer</button>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn" onclick="closeDirPicker()">Annuler</button>
-      <button class="btn btn-primary" onclick="dirPickerSelect()">Sélectionner ce dossier</button>
+      <button class="btn btn-primary" id="dirpicker-select-btn" onclick="dirPickerSelect()">Sélectionner ce dossier</button>
     </div>
   </div>
 </div>
@@ -1389,10 +1407,18 @@ async function loadVms(){
 }
 async function vmAction(name,action){const url=action==='delete'?`/api/vms/${name}`:`/api/vms/${name}/${action}`;const method=action==='delete'?'DELETE':'POST';const r=await api(method,url);toast('VM',r?.ok?`${name}: ${action} ✓`:r?.error||'Erreur');loadVms();}
 function toggleVmForm(){const f=document.getElementById('vm-form');f.style.display=f.style.display==='none'?'block':'none'; if(f.style.display==='block') loadVms();}
+function vmDiskModeChanged(){
+  const importing = document.querySelector('input[name="vm-disk-mode"]:checked').value==='import';
+  document.getElementById('vm-disk-new').style.display = importing ? 'none' : 'block';
+  document.getElementById('vm-disk-import').style.display = importing ? 'block' : 'none';
+}
 async function createVm(){
   const err=document.getElementById('vm-err'); err.style.display='none';
   const name=document.getElementById('vm-name').value.trim();
   if(!name){err.textContent='Nom requis';err.style.display='block';return;}
+  const importing = document.querySelector('input[name="vm-disk-mode"]:checked').value==='import';
+  const importDisk = document.getElementById('vm-import-path').value.trim();
+  if(importing && !importDisk){err.textContent='Sélectionnez un disque à importer';err.style.display='block';return;}
   const body={
     name,
     bios:document.getElementById('vm-bios').value,
@@ -1403,13 +1429,12 @@ async function createVm(){
     network:document.getElementById('vm-network').value,
     usbDevices:[...document.querySelectorAll('.vm-usb-cb:checked')].map(c=>c.value)
   };
+  if(importing) body.importDisk = importDisk;
   const btn=document.getElementById('vm-submit'); btn.disabled=true;
   const r=await api('POST','/api/vms',body);
   btn.disabled=false;
   if(!r?.ok){err.textContent=r?.error||'Erreur';err.style.display='block';return;}
-  toast('VM',r.message||'VM créée ✓');
-  toggleVmForm();
-  loadVms();
+  pollJob(r.jobId,'vm-log',()=>{loadVms();toast('VM','VM créée ✓');});
 }
 
 // ── ISOs ──────────────────────────────────────────────────────────────────────
@@ -1765,13 +1790,26 @@ function toast(t,b){const n=document.getElementById('notif');document.getElement
 
 // ── Sélecteur de dossier (volumes Docker) ────────────────────────────────────
 let dirPickerTargetInput = null;
+let dirPickerMode = 'folder'; // 'folder' (choisir/créer un dossier) ou 'file' (choisir un fichier, ex: disque VM)
 async function openDirPicker(btn){
+  dirPickerMode = 'folder';
   dirPickerTargetInput = btn.closest('.rowform').querySelector('input');
+  document.getElementById('dirpicker-select-btn').style.display='';
+  document.getElementById('dirpicker-mkdir-row').style.display='flex';
   document.getElementById('dirpicker-overlay').style.display='flex';
   await dirPickerLoad(dirPickerTargetInput.value.trim() || '/srv/volumes');
 }
+async function openFilePicker(inputEl){
+  dirPickerMode = 'file';
+  dirPickerTargetInput = inputEl;
+  document.getElementById('dirpicker-select-btn').style.display='none';
+  document.getElementById('dirpicker-mkdir-row').style.display='none';
+  document.getElementById('dirpicker-overlay').style.display='flex';
+  await dirPickerLoad('/srv/volumes');
+}
 async function dirPickerLoad(p){
-  const r = await api('GET','/api/storage/browse?path='+encodeURIComponent(p));
+  const filesParam = dirPickerMode==='file' ? '&files=1' : '';
+  const r = await api('GET','/api/storage/browse?path='+encodeURIComponent(p)+filesParam);
   if(!r || r.ok===false){
     if(p!=='/srv/volumes'){ toast('Stockage', r?.error||'Dossier introuvable'); return dirPickerLoad('/srv/volumes'); }
     return;
@@ -1785,6 +1823,12 @@ async function dirPickerLoad(p){
     const full=(r.path.endsWith('/')?r.path:r.path+'/')+name;
     return `<div class="drow" style="cursor:pointer;padding:6px 8px" onclick="dirPickerLoad('${esc(full)}')">📁 ${name}</div>`;
   }).join('');
+  if(dirPickerMode==='file' && r.files){
+    html += r.files.map(name=>{
+      const full=(r.path.endsWith('/')?r.path:r.path+'/')+name;
+      return `<div class="drow" style="cursor:pointer;padding:6px 8px" onclick="dirPickerSelectFile('${esc(full)}')">💿 ${name}</div>`;
+    }).join('');
+  }
   list.innerHTML = html || '<div style="color:var(--text3);font-size:12px;padding:8px">Dossier vide</div>';
 }
 async function dirPickerMkdir(){
@@ -1800,6 +1844,10 @@ async function dirPickerMkdir(){
 function dirPickerSelect(){
   const p=document.getElementById('dirpicker-path').dataset.path;
   if(dirPickerTargetInput) dirPickerTargetInput.value=p;
+  closeDirPicker();
+}
+function dirPickerSelectFile(fullPath){
+  if(dirPickerTargetInput) dirPickerTargetInput.value=fullPath;
   closeDirPicker();
 }
 function closeDirPicker(){
