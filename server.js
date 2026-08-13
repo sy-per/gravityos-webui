@@ -11,6 +11,7 @@ const path     = require("path");
 const fs       = require("fs");
 const crypto   = require("crypto");
 let Dockerode; try { Dockerode = require("dockerode"); } catch {}
+let multer; try { multer = require("multer"); } catch {}
 
 const execAsync = promisify(exec);
 const app    = express();
@@ -268,7 +269,7 @@ app.get("/api/disks",  auth, async (req,res) => { const [b,f]=await Promise.all(
 app.get("/api/mdstat", auth, async (req,res) => { try{const{stdout}=await execAsync("cat /proc/mdstat");res.json({raw:stdout});}catch{res.json({raw:""}); } });
 
 const VOL_ROOT = "/srv/volumes";
-const BROWSE_ROOTS = [VOL_ROOT, "/srv/shares"];
+const BROWSE_ROOTS = [VOL_ROOT, "/srv/shares", "/var/lib/libvirt/images"];
 function isPathAllowed(p){
   const resolved = path.resolve(p);
   return BROWSE_ROOTS.some(root => resolved===root || resolved.startsWith(root+path.sep));
@@ -602,13 +603,37 @@ app.post("/api/proxy/custom-cert", auth, (req,res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 async function virsh(cmd) { const{stdout}=await execAsync(`virsh --connect qemu:///system ${cmd} 2>/dev/null`);return stdout.trim(); }
 
+// Stats CPU/RAM en direct pour une VM en cours d'exécution (2 échantillons
+// de cpu.time à 300ms d'écart pour un %CPU instantané, RSS réel via dommemstat)
+async function vmLiveStat(name){
+  try {
+    const [mem, cpu1] = await Promise.all([
+      execAsync(`virsh --connect qemu:///system dommemstat ${sh(name)} 2>/dev/null`),
+      execAsync(`virsh --connect qemu:///system domstats ${sh(name)} --cpu-total 2>/dev/null`)
+    ]);
+    const rssKB = parseInt((mem.stdout.match(/rss\s+(\d+)/)||[])[1] || 0);
+    const cpuTime1 = parseInt((cpu1.stdout.match(/cpu\.time=(\d+)/)||[])[1] || 0);
+    await new Promise(r=>setTimeout(r,300));
+    const {stdout:cpu2raw} = await execAsync(`virsh --connect qemu:///system domstats ${sh(name)} --cpu-total 2>/dev/null`);
+    const cpuTime2 = parseInt((cpu2raw.match(/cpu\.time=(\d+)/)||[])[1] || 0);
+    const cpuPct = Math.max(0, Math.min(999, ((cpuTime2-cpuTime1)/(300*1e6))*100));
+    return { memUsedMB: rssKB ? Math.round(rssKB/1024) : null, cpuPct: Math.round(cpuPct*10)/10 };
+  } catch { return { memUsedMB:null, cpuPct:null }; }
+}
+
 app.get("/api/vms", auth, async (req,res) => {
   if (isLive()) return res.json({isLive:true,vms:[],message:"KVM indisponible en Live CD — installez GravityOS sur disque"});
   try {
     const raw = await virsh("list --all");
     const vms = raw.split("\n").slice(2).filter(Boolean).map(l=>{const p=l.trim().split(/\s{2,}/);return{id:p[0],name:p[1],state:p[2]};}).filter(v=>v.name);
     const detailed = await Promise.all(vms.map(async vm=>{
-      try{const i=await virsh(`dominfo ${vm.name}`);return{...vm,vcpus:(i.match(/CPU\(s\):\s+(\d+)/)||[])[1]||"?",memMB:Math.round(parseInt((i.match(/Max memory:\s+(\d+)/)||[])[1]||0)/1024)};}catch{return vm;}
+      let d = vm;
+      try{const i=await virsh(`dominfo ${vm.name}`);d={...vm,vcpus:(i.match(/CPU\(s\):\s+(\d+)/)||[])[1]||"?",memMB:Math.round(parseInt((i.match(/Max memory:\s+(\d+)/)||[])[1]||0)/1024)};}catch{}
+      if (vm.state?.includes("running")) {
+        const live = await vmLiveStat(vm.name);
+        d = { ...d, ...live };
+      }
+      return d;
     }));
     res.json({isLive:false,vms:detailed});
   } catch(e) { res.json({isLive:false,vms:[],error:e.message}); }
@@ -680,7 +705,56 @@ app.post("/api/vms/:n/stop",       auth, async (req,res)=>{try{await virsh(`shut
 app.post("/api/vms/:n/force-stop", auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/restart",    auth, async (req,res)=>{try{await virsh(`reboot ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.delete("/api/vms/:n",          auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`).catch(()=>{});await virsh(`undefine ${req.params.n} --remove-all-storage`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+
+// ── Console VM temps réel (noVNC dans le navigateur, via un pont websockify) ─
+// Chaque VM utilise déjà <graphics type='vnc' port='-1'/> (port assigné par
+// libvirt) ; websockify fait le pont TCP brut ↔ WebSocket pour que le canvas
+// noVNC (servi en statique depuis le paquet Debian, pas de CDN) puisse s'y
+// connecter. Un seul pont par VM, réutilisé s'il tourne déjà.
+const vncBridges = new Map(); // nom de VM -> { wsPort, proc }
+app.get("/api/vms/:n/console", auth, async (req,res) => {
+  const name = req.params.n;
+  try {
+    const state = (await virsh(`domstate ${sh(name)}`)).trim();
+    if (state !== "running") return res.status(400).json({error:"La VM doit être démarrée pour ouvrir la console"});
+    const existing = vncBridges.get(name);
+    if (existing) return res.json({ok:true, wsPort:existing.wsPort});
+
+    const display = (await virsh(`vncdisplay ${sh(name)}`)).trim(); // ex: "127.0.0.1:0" ou ":0"
+    const dispNum = parseInt(display.split(":").pop(), 10);
+    if (isNaN(dispNum)) return res.status(500).json({error:"Port VNC introuvable pour cette VM"});
+    const vncPort = 5900 + dispNum;
+    const wsPort = 6900 + (vncBridges.size % 100); // pool 6900-6999, réutilisé si une VM est arrêtée entre-temps
+
+    const proc = spawn("websockify", [String(wsPort), `127.0.0.1:${vncPort}`], { stdio: "ignore" });
+    proc.on("exit", () => vncBridges.delete(name));
+    vncBridges.set(name, { wsPort, proc });
+    res.json({ok:true, wsPort});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+// Sert les fichiers statiques noVNC (canvas VNC en JS pur, installés localement
+// par le paquet Debian "novnc" — pas de dépendance CDN)
+if (fs.existsSync("/usr/share/novnc")) app.use("/novnc", express.static("/usr/share/novnc"));
 app.get("/api/isos", auth, (req,res)=>{try{const d="/var/lib/libvirt/images";fs.mkdirSync(d,{recursive:true});res.json(fs.readdirSync(d).filter(f=>f.endsWith(".iso")).map(f=>({name:f,path:path.join(d,f),size:fs.statSync(path.join(d,f)).size})));}catch{res.json([]);}});
+// Envoi direct depuis l'ordinateur de l'utilisateur (ISO ou disque qcow2/vdi/vmdk)
+// — atterrit dans /var/lib/libvirt/images, visible à la fois dans la liste
+// ISOs et dans le sélecteur "importer un disque" de la création de VM
+if (multer) {
+  fs.mkdirSync("/var/lib/libvirt/images", {recursive:true});
+  const upload = multer({
+    storage: multer.diskStorage({
+      destination: (req,file,cb)=>cb(null, "/var/lib/libvirt/images"),
+      filename: (req,file,cb)=>cb(null, file.originalname.replace(/[^a-zA-Z0-9._-]/g,"_"))
+    }),
+    limits: { fileSize: 20 * 1024 * 1024 * 1024 } // 20 Go max (ISO/disques peuvent être volumineux)
+  });
+  app.post("/api/vms/upload", auth, upload.single("file"), (req,res)=>{
+    if (!req.file) return res.status(400).json({error:"Aucun fichier reçu"});
+    res.json({ok:true, name:req.file.filename, path:req.file.path, size:req.file.size});
+  });
+} else {
+  app.post("/api/vms/upload", auth, (req,res)=> res.status(500).json({error:"Module d'upload indisponible — relancez 'Mettre à jour' pour l'installer"}) );
+}
 app.post("/api/isos/download", auth, (req,res)=>{
   const { url, name } = req.body;
   if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({error:"URL invalide (http/https requis)"});
@@ -1173,6 +1247,14 @@ systemctl restart shellinabox 2>/dev/null || true
 TERMCFG
     chmod +x /usr/local/bin/gravity-configure-terminal
     /usr/local/bin/gravity-configure-terminal && echo "Terminal connecté auto sur le compte admin ✓"
+
+    # noVNC + websockify requis pour la console VM temps réel (absents avant le 2026-08-13)
+    if ! command -v websockify &>/dev/null || [ ! -d /usr/share/novnc ]; then
+      echo "Installation de noVNC + websockify (console VM temps réel)..."
+      apt-get update -qq 2>&1 | tail -2
+      apt-get install -y novnc websockify 2>&1 | tail -3
+    fi
+    ufw allow 6900:6999/tcp 2>/dev/null || true
 
     echo "Correctifs système appliqués ✓"
 

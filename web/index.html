@@ -637,7 +637,17 @@ canvas#netgraph{width:100%;height:60px;display:block;border-radius:var(--rx)}
   <!-- ISOs -->
   <div class="vmsec" id="vmsec-isos" style="display:none">
     <div class="card">
-      <div class="card-title">📀 Télécharger une image ISO</div>
+      <div class="card-title">💻 Envoyer depuis cet ordinateur</div>
+      <div style="font-size:11.5px;color:var(--text2);margin-bottom:10px">ISO ou disque (qcow2/vdi/vmdk) — atterrit dans le même espace, réutilisable pour créer une VM.</div>
+      <input type="file" id="vm-upload-file" accept=".iso,.qcow2,.vdi,.vmdk,.img,.raw" style="display:none" onchange="uploadVmFile()">
+      <button class="btn btn-primary" onclick="document.getElementById('vm-upload-file').click()">📤 Choisir un fichier à envoyer</button>
+      <div id="vm-upload-status" style="display:none;margin-top:10px">
+        <div style="font-size:12px;color:var(--text2);margin-bottom:4px" id="vm-upload-label"></div>
+        <div class="dbar"><div id="vm-upload-bar" style="width:0%;height:100%;background:var(--accent);border-radius:2px;transition:width .2s"></div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">📀 Télécharger une image ISO depuis une URL</div>
       <div class="grid2">
         <div><div class="flabel">URL de l'ISO</div><input type="text" id="iso-url" placeholder="https://.../debian-12.iso" style="width:100%"></div>
         <div><div class="flabel">Nom du fichier (optionnel)</div><input type="text" id="iso-name" placeholder="debian-12.iso" style="width:100%"></div>
@@ -1389,8 +1399,11 @@ async function loadVms(){
   if(d?.isLive){
     vmEl.innerHTML=`<div style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);border-radius:10px;padding:16px;color:var(--amber);font-size:13px">⚠️ ${d.message}</div>`;
   } else if(d?.vms?.length){
-    vmEl.innerHTML=`<div style="display:grid;grid-template-columns:2fr 60px 80px 80px auto;gap:10px;padding:0 0 8px;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px"><span>Nom</span><span>vCPUs</span><span>RAM</span><span>État</span><span>Actions</span></div>`
-      +d.vms.map(v=>`<div class="drow"><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">ID ${v.id||'—'}</div></div><div>${v.vcpus||'?'}</div><div>${v.memMB||'?'} Mo</div><span class="badge ${v.state?.includes('run')?'bg':v.state?.includes('shut')?'br':'ba'}">${v.state||'?'}</span><div style="display:flex;gap:6px">${v.state?.includes('run')?`<button class="btn" onclick="vmAction('${v.name}','stop')">⏹</button><button class="btn" onclick="vmAction('${v.name}','restart')">↺</button>`:`<button class="btn btn-primary" onclick="vmAction('${v.name}','start')">▶</button>`}<button class="btn btn-danger" onclick="if(confirm('Supprimer ${v.name} ?'))vmAction('${v.name}','delete')">✕</button></div></div>`).join('');
+    vmEl.innerHTML=`<div style="display:grid;grid-template-columns:2fr 60px 90px 70px 70px 80px auto;gap:10px;padding:0 0 8px;font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px"><span>Nom</span><span>vCPUs</span><span>RAM alloué</span><span>CPU</span><span>RAM util.</span><span>État</span><span>Actions</span></div>`
+      +d.vms.map(v=>{
+        const running=v.state?.includes('run');
+        return `<div class="drow"><div class="dinfo"><div class="dname">${v.name}</div><div class="dsub">ID ${v.id||'—'}</div></div><div>${v.vcpus||'?'}</div><div>${v.memMB||'?'} Mo</div><div class="mono">${running&&v.cpuPct!=null?v.cpuPct+'%':'—'}</div><div class="mono">${running&&v.memUsedMB!=null?v.memUsedMB+' Mo':'—'}</div><span class="badge ${running?'bg':v.state?.includes('shut')?'br':'ba'}">${v.state||'?'}</span><div style="display:flex;gap:6px">${running?`<button class="btn btn-primary" onclick="openVmConsole('${v.name}')" title="Console temps réel">🖥️</button><button class="btn" onclick="vmAction('${v.name}','stop')">⏹</button><button class="btn" onclick="vmAction('${v.name}','restart')">↺</button>`:`<button class="btn btn-primary" onclick="vmAction('${v.name}','start')">▶</button>`}<button class="btn btn-danger" onclick="if(confirm('Supprimer ${v.name} ?'))vmAction('${v.name}','delete')">✕</button></div></div>`;
+      }).join('');
   } else {
     vmEl.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px 0">Aucune VM — créez-en une ci-dessus</div>';
   }
@@ -1406,6 +1419,12 @@ async function loadVms(){
   if(usbBox) usbBox.innerHTML=(usb||[]).map(u=>`<label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" class="vm-usb-cb" value="${u.id}"> ${u.name} <span class="mono" style="color:var(--text3)">${u.id}</span></label>`).join('') || '<div style="color:var(--text3);font-size:12px">Aucun périphérique USB détecté</div>';
 }
 async function vmAction(name,action){const url=action==='delete'?`/api/vms/${name}`:`/api/vms/${name}/${action}`;const method=action==='delete'?'DELETE':'POST';const r=await api(method,url);toast('VM',r?.ok?`${name}: ${action} ✓`:r?.error||'Erreur');loadVms();}
+async function openVmConsole(name){
+  const r=await api('GET','/api/vms/'+encodeURIComponent(name)+'/console');
+  if(!r?.ok){toast('VM',r?.error||'Erreur lors de l\'ouverture de la console');return;}
+  const url=`/novnc/vnc_lite.html?host=${location.hostname}&port=${r.wsPort}&autoconnect=true&resize=scale&reconnect=true&title=${encodeURIComponent(name)}`;
+  window.open(url,'_blank');
+}
 function toggleVmForm(){const f=document.getElementById('vm-form');f.style.display=f.style.display==='none'?'block':'none'; if(f.style.display==='block') loadVms();}
 function vmDiskModeChanged(){
   const importing = document.querySelector('input[name="vm-disk-mode"]:checked').value==='import';
@@ -1438,6 +1457,35 @@ async function createVm(){
 }
 
 // ── ISOs ──────────────────────────────────────────────────────────────────────
+function uploadVmFile(){
+  const input=document.getElementById('vm-upload-file');
+  const file=input.files[0];
+  if(!file) return;
+  const statusBox=document.getElementById('vm-upload-status');
+  const label=document.getElementById('vm-upload-label');
+  const bar=document.getElementById('vm-upload-bar');
+  statusBox.style.display='block';
+  label.textContent=`Envoi de "${file.name}" (${fmt(file.size)})...`;
+  bar.style.width='0%';
+  const form=new FormData(); form.append('file', file);
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/vms/upload');
+  xhr.withCredentials=true;
+  xhr.upload.onprogress=e=>{ if(e.lengthComputable){ const pct=Math.round(e.loaded/e.total*100); bar.style.width=pct+'%'; label.textContent=`Envoi de "${file.name}"... ${pct}%`; } };
+  xhr.onload=()=>{
+    input.value='';
+    if(xhr.status>=200 && xhr.status<300){
+      label.textContent=`"${file.name}" envoyé ✓`; bar.style.width='100%';
+      toast('Import','Fichier envoyé ✓ — disponible dans la liste ISOs et le sélecteur de disque VM');
+      loadIsos();
+    } else {
+      let msg='Erreur'; try{ msg=JSON.parse(xhr.responseText).error||msg; }catch{}
+      label.textContent='Erreur : '+msg; toast('Import', msg);
+    }
+  };
+  xhr.onerror=()=>{ label.textContent='Erreur réseau pendant l\'envoi'; toast('Import','Erreur réseau'); };
+  xhr.send(form);
+}
 async function loadIsos(){
   const isos=await api('GET','/api/isos');
   document.getElementById('isos-table').innerHTML=(isos||[]).map(i=>`<tr><td>${i.name}</td><td class="mono">${fmt(i.size)}</td><td><button class="btn btn-danger" onclick="deleteIso('${i.name}')">✕</button></td></tr>`).join('')||'<tr><td colspan="3" style="color:var(--text3)">Aucune ISO</td></tr>';
