@@ -1396,7 +1396,7 @@ function vmsTab(name){
 }
 
 async function loadVms(){
-  const [d,usb,nets,isos]=await Promise.all([api('GET','/api/vms'),api('GET','/api/usb'),api('GET','/api/networks'),api('GET','/api/isos')]);
+  const [d,usb,nets,isos,hostIface]=await Promise.all([api('GET','/api/vms'),api('GET','/api/usb'),api('GET','/api/networks'),api('GET','/api/isos'),api('GET','/api/host/primary-iface')]);
   const vmEl=document.getElementById('vm-list');
   if(d?.isLive){
     vmEl.innerHTML=`<div style="background:rgba(245,166,35,.08);border:1px solid rgba(245,166,35,.2);border-radius:10px;padding:16px;color:var(--amber);font-size:13px">⚠️ ${d.message}</div>`;
@@ -1413,9 +1413,15 @@ async function loadVms(){
   else document.getElementById('usb-list').innerHTML='<div style="font-size:12px;color:var(--text3)">Aucun périphérique USB</div>';
   if(nets?.length) document.getElementById('net-list').innerHTML=nets.map(n=>`<div class="drow" style="justify-content:space-between"><div><div class="dname" style="font-size:13px">${n.name}</div></div><span class="badge ${n.state==='active'?'bg':'bx'}">${n.state||'?'}</span></div>`).join('');
   if(isos?.length){const sel=document.getElementById('vm-iso');sel.innerHTML='<option value="">Sans ISO</option>'+isos.map(i=>`<option value="${i.path}">${i.name} (${fmt(i.size)})</option>`).join('');}
-  // Réseaux disponibles pour la VM (select dédié du formulaire de création)
+  // Réseaux disponibles pour la VM (select dédié du formulaire de création).
+  // Le pont réseau (même réseau/IP que le NAS, ex. 192.168.2.x) est proposé
+  // en premier — et donc sélectionné par défaut — plutôt que le NAT libvirt
+  // (192.168.122.x) qui isole les VMs du réseau local.
   const netSel=document.getElementById('vm-network');
-  if(netSel) netSel.innerHTML=(nets?.length?nets:[{name:'default',state:'active'}]).map(n=>`<option value="${n.name}">${n.name}${n.state!=='active'?' (inactif)':''}</option>`).join('');
+  if(netSel){
+    const bridgeOpt = hostIface?.iface ? `<option value="__bridge__">🔗 Pont réseau (${hostIface.iface}) — même réseau que le NAS</option>` : '';
+    netSel.innerHTML = bridgeOpt + (nets?.length?nets:[{name:'default',state:'active'}]).map(n=>`<option value="${n.name}">NAT libvirt : ${n.name}${n.state!=='active'?' (inactif)':''}</option>`).join('');
+  }
   // Cases à cocher USB pour passthrough
   const usbBox=document.getElementById('vm-usb-list');
   if(usbBox) usbBox.innerHTML=(usb||[]).map(u=>`<label style="display:flex;align-items:center;gap:8px;font-size:13px"><input type="checkbox" class="vm-usb-cb" value="${u.id}"> ${u.name} <span class="mono" style="color:var(--text3)">${u.id}</span></label>`).join('') || '<div style="color:var(--text3);font-size:12px">Aucun périphérique USB détecté</div>';

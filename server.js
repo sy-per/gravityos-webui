@@ -662,6 +662,19 @@ async function ensureVmNetworksActive(name) {
   }
 }
 
+// Interface physique portant la route par défaut du NAS — utilisée pour le
+// mode "Pont réseau" des VMs (macvtap type='direct' mode='bridge' : la VM
+// obtient une IP du même routeur/réseau que le NAS, ex. 192.168.2.x, sans
+// passer par le NAT libvirt 192.168.122.x ni créer un vrai bridge Linux sur
+// l'hôte qui toucherait la config réseau du NAS lui-même — risqué à faire
+// automatiquement sur un NAS géré à distance).
+async function detectPrimaryInterface() {
+  try {
+    const {stdout} = await execAsync("ip route show default | awk '{print $5}' | head -1");
+    return stdout.trim() || null;
+  } catch { return null; }
+}
+
 async function detectDomainTypeAndEmulator() {
   let domainType = 'kvm';
   try { await execAsync('test -e /dev/kvm'); } catch { domainType = 'qemu'; }
@@ -688,7 +701,7 @@ function buildUsbBlock(usbDevices) {
   }).join("");
 }
 
-function buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock, bios}) {
+function buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock, bios, bridgeIface}) {
   // Le chipset q35 (UEFI) n'a pas de contrôleur IDE (PIIX) comme le chipset
   // pc (Legacy/BIOS) — "IDE controllers are unsupported for this QEMU binary
   // or machine type" à la définition si on garde bus='ide' en UEFI. SATA
@@ -696,7 +709,13 @@ function buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock
   // pour Legacy (compatibilité la plus large avec de vieux OS invités).
   const diskBus = bios === "uefi" ? "sata" : "ide";
   const diskDev = bios === "uefi" ? "sda" : "hda";
-  return `<domain type='${domainType}'><name>${name}</name>${uuid ? `<uuid>${uuid}</uuid>` : ""}<memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${diskFile}'/><target dev='${diskDev}' bus='${diskBus}'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
+  // "__bridge__" = macvtap en mode pont sur l'interface physique du NAS : la
+  // VM obtient une IP du même routeur/réseau que le NAS (ex. 192.168.2.x)
+  // plutôt que le NAT libvirt (192.168.122.x).
+  const ifaceBlock = (network === "__bridge__" && bridgeIface)
+    ? `<interface type='direct'><source dev='${bridgeIface}' mode='bridge'/><model type='e1000'/></interface>`
+    : `<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface>`;
+  return `<domain type='${domainType}'><name>${name}</name>${uuid ? `<uuid>${uuid}</uuid>` : ""}<memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${diskFile}'/><target dev='${diskDev}' bus='${diskBus}'/></disk>${cdrom}${ifaceBlock}<graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
 }
 
 app.get("/api/vms", auth, async (req,res) => {
@@ -746,8 +765,10 @@ app.post("/api/vms", auth, async (req,res) => {
     const osBlock = await buildOsBlock(safeName, bios, bootDev);
     // Passthrough USB — usbDevices: ["vendorId:productId", ...] (depuis /api/usb)
     const usbBlock = buildUsbBlock(usbDevices);
+    const bridgeIface = network === "__bridge__" ? await detectPrimaryInterface() : null;
+    if (network === "__bridge__" && !bridgeIface) return res.status(400).json({error:"Interface réseau du NAS introuvable pour le pont"});
 
-    const xml = buildDomainXml({name:safeName, domainType, emulator, memKB, vcpus, osBlock, diskFile:dp, cdrom, network, usbBlock, bios});
+    const xml = buildDomainXml({name:safeName, domainType, emulator, memKB, vcpus, osBlock, diskFile:dp, cdrom, network, usbBlock, bios, bridgeIface});
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
     fs.writeFileSync(xmlPath, xml);
     // Le disque (création ou import/conversion) tourne en job asynchrone —
@@ -769,7 +790,7 @@ app.get("/api/vms/:n", auth, async (req,res) => {
     const xml = await virsh(`dumpxml ${sh(req.params.n)}`);
     const vcpus = (xml.match(/<vcpu[^>]*>(\d+)</)||[])[1];
     const memKB = (xml.match(/<currentMemory[^>]*>(\d+)</)||[])[1];
-    const network = (xml.match(/<source network='([^']+)'/)||[])[1];
+    const network = /<interface type='direct'>/.test(xml) ? "__bridge__" : (xml.match(/<source network='([^']+)'/)||[])[1];
     const bios = /machine='q35'/.test(xml) ? 'uefi' : 'legacy';
     const iso = (xml.match(/device='cdrom'[\s\S]*?<source file='([^']+)'/)||[])[1] || "";
     const usbDevices = [...xml.matchAll(/<hostdev[^>]*type='usb'>[\s\S]*?vendor id='0x([0-9a-fA-F]{4})'\/>\s*<product id='0x([0-9a-fA-F]{4})'/g)].map(m=>`${m[1]}:${m[2]}`);
@@ -798,7 +819,9 @@ app.put("/api/vms/:n", auth, async (req,res) => {
     const {domainType, emulator} = await detectDomainTypeAndEmulator();
     const osBlock = await buildOsBlock(name, bios, bootDev);
     const usbBlock = buildUsbBlock(usbDevices);
-    const xml = buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock, bios});
+    const bridgeIface = network === "__bridge__" ? await detectPrimaryInterface() : null;
+    if (network === "__bridge__" && !bridgeIface) return res.status(400).json({error:"Interface réseau du NAS introuvable pour le pont"});
+    const xml = buildDomainXml({name, uuid, domainType, emulator, memKB, vcpus, osBlock, diskFile, cdrom, network, usbBlock, bios, bridgeIface});
     const xmlPath = `/tmp/${name}-edit-${Date.now()}.xml`;
     fs.writeFileSync(xmlPath, xml);
     await virsh(`define ${sh(xmlPath)}`);
@@ -874,6 +897,7 @@ app.delete("/api/isos/:name", auth, (req,res)=>{
 });
 app.get("/api/usb",            auth, async(req,res)=>{try{const{stdout}=await execAsync("lsusb");res.json(stdout.split("\n").filter(Boolean).map(l=>{const m=l.match(/Bus (\d+) Device (\d+): ID (\S+) (.+)/);return m?{bus:m[1],device:m[2],id:m[3],name:m[4]}:null;}).filter(Boolean));}catch{res.json([]);}});
 app.get("/api/networks",       auth, async(req,res)=>{try{const r=await virsh("net-list --all");res.json(r.split("\n").slice(2).filter(Boolean).map(l=>{const p=l.trim().split(/\s{2,}/);return{name:p[0],state:p[1]};}).filter(n=>n.name));}catch{res.json([]);}});
+app.get("/api/host/primary-iface", auth, async(req,res)=>{res.json({iface: await detectPrimaryInterface()});});
 
 // ── Jobs asynchrones génériques (pull d'image, compose, volumes, RAID, backup)
 //    même principe que streamUpdate mais plusieurs jobs concurrents, par id ────
