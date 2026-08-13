@@ -1308,8 +1308,15 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
     # sudo pour le corriger.
     for f in /usr/bin/sudo /usr/lib/policykit-1/polkit-agent-helper-1; do
       if [ -f "$f" ] && [ ! -u "$f" ]; then
-        echo "Setuid manquant sur $f, restauration..."
-        chown root:root "$f" && chmod u+s "$f"
+        echo "Setuid manquant sur $f, diagnostic..."
+        lsattr "$f" 2>&1 || echo "(lsattr indisponible)"
+        chattr -i "$f" 2>&1 || echo "(chattr -i: pas d'attribut immuable ou echec, sans gravite)"
+        if chown root:root "$f" && chmod u+s "$f"; then
+          echo "OK: setuid restaure sur $f"
+        else
+          echo "ECHEC chown/chmod sur $f"
+        fi
+        ls -la "$f"
       fi
     done
 
