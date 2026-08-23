@@ -70,7 +70,7 @@ app.post("/api/auth/login", (req,res) => {
   } else res.status(401).json({ error:"Identifiants incorrects" });
 });
 app.post("/api/auth/logout", (req,res) => { const s=getSid(req); if(s) delete sess[s]; res.setHeader("Set-Cookie","gravity_sid=; Path=/; Max-Age=0"); res.json({ok:true}); });
-app.get("/api/auth/status",  (req,res) => res.json({ authenticated: validSid(getSid(req)), wizardDone: fs.existsSync(WIZARD) }));
+app.get("/api/auth/status",  (req,res) => res.json({ authenticated: validSid(getSid(req)), wizardDone: fs.existsSync(WIZARD), isLive: isLive() }));
 // Rôle effectif de la session WebUI en cours — l'authentification reste un
 // identifiant unique partagé (getCreds().user), donc "l'utilisateur connecté"
 // est toujours ce même compte ; on résout son rôle réel (intégré ou
