@@ -1,0 +1,3 @@
+web/assets/* -text
+web/*.png -text
+web/*.svg -text
