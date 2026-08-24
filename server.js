@@ -1623,6 +1623,15 @@ app.put("/api/vms/:n", auth, async (req,res) => {
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
+// IP actuelle d'une VM — utilisé par les raccourcis "dynamiques" (voir
+// /api/app-shortcuts) pour résoudre l'adresse au moment du clic plutôt que
+// de la figer à la création : une VM a une IP attribuée par DHCP, qui peut
+// changer d'un démarrage à l'autre, contrairement à l'IP du NAS lui-même.
+app.get("/api/vms/:n/ip", auth, async (req,res) => {
+  try { res.json({ ip: await vmIp(req.params.n) }); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
+
 // ── Console VM temps réel (noVNC dans le navigateur, via un pont websockify) ─
 // Chaque VM utilise déjà <graphics type='vnc' port='-1'/> (port assigné par
 // libvirt) ; websockify fait le pont TCP brut ↔ WebSocket pour que le canvas
@@ -2494,14 +2503,23 @@ async function nasIp() {
 app.get("/api/app-shortcuts", auth, (req,res)=> res.json(loadAppShortcuts()));
 
 app.post("/api/app-shortcuts", auth, async(req,res)=>{
-  const { name, ip, port, icon, https } = req.body;
+  const { name, ip, port, icon, https, vmName } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({error:"Nom requis"});
   const safePort = parseInt(port,10);
   if (!safePort || safePort<1 || safePort>65535) return res.status(400).json({error:"Port invalide"});
   try {
-    const safeIp = (ip && String(ip).trim()) || await nasIp();
     const scheme = https ? "https" : "http";
-    const entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: `${scheme}://${safeIp}:${safePort}`, icon: icon || null };
+    let entry;
+    if (vmName) {
+      // Raccourci "dynamique" pour une VM : pas d'IP figée à la création
+      // (attribuée par DHCP, peut changer d'un démarrage à l'autre) — le
+      // frontend résout l'IP réelle via GET /api/vms/:n/ip au moment du
+      // clic. port/https/vmName stockés, "url" absent tant que non résolu.
+      entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), vmName: String(vmName), port: safePort, https: !!https, icon: icon || null };
+    } else {
+      const safeIp = (ip && String(ip).trim()) || await nasIp();
+      entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: `${scheme}://${safeIp}:${safePort}`, icon: icon || null };
+    }
     const list = loadAppShortcuts();
     list.push(entry);
     saveAppShortcuts(list);
