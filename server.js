@@ -1048,7 +1048,112 @@ app.post("/api/smb/toggle", auth, async (req,res) => {
 app.get("/api/nfs/exports", auth, (req,res) => { try{const r=fs.readFileSync("/etc/exports","utf8");res.json(r.split("\n").filter(l=>l.trim()&&!l.startsWith("#")).map(l=>{const[p,...o]=l.trim().split(/\s+/);return{path:p,options:o.join(" ")};} ));}catch{res.json([]);} });
 app.post("/api/nfs/exports", auth, async (req,res) => { const{path:p,clients,options}=req.body;try{fs.mkdirSync(p,{recursive:true});fs.appendFileSync("/etc/exports",`\n${p}  ${clients||"*"}(${options||"rw,sync,no_subtree_check"})\n`);await execAsync("exportfs -ra");res.json({ok:true});}catch(e){res.status(500).json({error:e.message});} });
 app.get("/api/ftp/status", auth, async (req,res) => { try{const{stdout}=await execAsync("systemctl is-active vsftpd");res.json({active:stdout.trim()==="active"});}catch{res.json({active:false});} });
-app.post("/api/ftp/toggle", auth, async (req,res) => { try{const{stdout}=await execAsync("systemctl is-active vsftpd");const cmd=stdout.trim()==="active"?"stop":"start";await execAsync(`systemctl ${cmd} vsftpd`);res.json({ok:true,running:cmd==="start"});}catch(e){res.status(500).json({error:e.message});} });
+// Bug corrigé le 2026-08-23 : "systemctl is-active" renvoie un code de
+// sortie non-nul (donc une promesse rejetée) quand le service est déjà
+// arrêté — sans le .catch() ci-dessous, activer vsftpd depuis l'arrêt
+// échouait toujours (l'utilisateur ne pouvait jamais l'allumer), même
+// pattern déjà correctement géré pour /api/smb/toggle juste au-dessus.
+app.post("/api/ftp/toggle", auth, async (req,res) => {
+  try {
+    const { stdout } = await execAsync("systemctl is-active vsftpd").catch(()=>({stdout:"inactive"}));
+    const cmd = stdout.trim()==="active" ? "stop" : "start";
+    await execAsync(`systemctl ${cmd} vsftpd`);
+    res.json({ok:true, running: cmd==="start"});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ── FTP — identification (utilisateur/mot de passe dédiés) ───────────────────
+// vsftpd.conf embarque userlist_enable=YES + userlist_deny=NO : seul un
+// utilisateur listé dans /etc/vsftpd.userlist peut se connecter, quel que
+// soit son mot de passe système. Le compte est créé sans shell de login
+// (/usr/sbin/nologin) et ajouté au groupe "gravity" pour pouvoir écrire dans
+// /srv/shares (chroot FTP, cf. local_root=/srv/shares dans vsftpd.conf).
+const FTP_USERLIST = "/etc/vsftpd.userlist";
+app.get("/api/ftp/account", auth, (req,res) => {
+  try {
+    const list = fs.readFileSync(FTP_USERLIST,"utf8").split("\n").map(l=>l.trim()).filter(Boolean);
+    res.json({ username: list[0] || null });
+  } catch { res.json({ username: null }); }
+});
+app.post("/api/ftp/account", auth, async (req,res) => {
+  const { username, password } = req.body;
+  if (!username || !/^[a-z][a-z0-9_-]{2,31}$/i.test(username)) return res.status(400).json({error:"Nom d'utilisateur invalide (3-32 caractères alphanumériques)"});
+  if (!password || password.length < 4) return res.status(400).json({error:"Mot de passe trop court (minimum 4 caractères)"});
+  try {
+    await execAsync(`grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells`);
+    // vsftpd exige que le répertoire personnel (passwd) existe réellement sur
+    // le disque (vérification interne avant application de local_root), même
+    // si le contenu servi est ensuite déterminé par local_root=/srv/shares —
+    // useradd -M (sans home) fait donc échouer toute connexion FTP malgré un
+    // compte valide (bug découvert en testant une vraie connexion FTP).
+    const exists = await execAsync(`id ${sh(username)}`).then(()=>true).catch(()=>false);
+    if (!exists) await execAsync(`useradd -m -s /usr/sbin/nologin -G gravity ${sh(username)}`);
+    else await execAsync(`usermod -aG gravity ${sh(username)}`);
+    await execAsync(`echo ${sh(`${username}:${password}`)} | chpasswd`);
+    fs.writeFileSync(FTP_USERLIST, username+"\n");
+    res.json({ok:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── WebDAV (rclone serve webdav) — désactivé par défaut après installation ──
+const WEBDAV_ENV = "/etc/gravity/webdav.env";
+function readWebdavEnv() {
+  try {
+    const conf = fs.readFileSync(WEBDAV_ENV,"utf8");
+    return {
+      username: conf.match(/^RCLONE_USER=(.*)$/m)?.[1]?.trim() || "gravity",
+      password: conf.match(/^RCLONE_PASS=(.*)$/m)?.[1]?.trim() || "gravity",
+    };
+  } catch { return { username:"gravity", password:"gravity" }; }
+}
+app.get("/api/webdav/status", auth, async (req,res) => {
+  try {
+    const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
+    const ip = (await execAsync("hostname -I 2>/dev/null").catch(()=>({stdout:"?"}))).stdout.trim().split(" ")[0];
+    res.json({ active: stdout.trim()==="active", ip, port: 8081 });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+app.post("/api/webdav/toggle", auth, async (req,res) => {
+  try {
+    const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
+    const cmd = stdout.trim()==="active" ? "stop" : "start";
+    await execAsync(`systemctl ${cmd} gravity-webdav`);
+    res.json({ok:true, running: cmd==="start"});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+app.get("/api/webdav/account", auth, (req,res) => {
+  const { username } = readWebdavEnv();
+  res.json({ username });
+});
+app.post("/api/webdav/account", auth, async (req,res) => {
+  const { username, password } = req.body;
+  if (!username || !/^[a-z][a-z0-9_-]{2,31}$/i.test(username)) return res.status(400).json({error:"Nom d'utilisateur invalide (3-32 caractères alphanumériques)"});
+  if (!password || password.length < 4) return res.status(400).json({error:"Mot de passe trop court (minimum 4 caractères)"});
+  try {
+    fs.mkdirSync(path.dirname(WEBDAV_ENV), {recursive:true});
+    fs.writeFileSync(WEBDAV_ENV, `RCLONE_USER=${username}\nRCLONE_PASS=${password}\n`);
+    fs.chmodSync(WEBDAV_ENV, 0o600);
+    await execAsync("systemctl is-active gravity-webdav").then(()=>execAsync("systemctl restart gravity-webdav")).catch(()=>{});
+    res.json({ok:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// ── DLNA (minidlna) — désactivé par défaut après installation ───────────────
+app.get("/api/dlna/status", auth, async (req,res) => {
+  try {
+    const { stdout } = await execAsync("systemctl is-active minidlna").catch(()=>({stdout:"inactive"}));
+    const ip = (await execAsync("hostname -I 2>/dev/null").catch(()=>({stdout:"?"}))).stdout.trim().split(" ")[0];
+    res.json({ active: stdout.trim()==="active", ip });
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+app.post("/api/dlna/toggle", auth, async (req,res) => {
+  try {
+    const { stdout } = await execAsync("systemctl is-active minidlna").catch(()=>({stdout:"inactive"}));
+    const cmd = stdout.trim()==="active" ? "stop" : "start";
+    await execAsync(`systemctl ${cmd} minidlna`);
+    res.json({ok:true, running: cmd==="start"});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
 
 // ── Reverse Proxy — façon Nginx Proxy Manager ────────────────────────────────
 // (Domaines multiples, WebSockets, blocage exploits, cache assets, SSL
@@ -3010,12 +3115,58 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
 
     # openssh-server requis par l'onglet Paramètres > Terminal (activation
     # SSH + port) — déjà dans la liste de paquets de l'ISO, ce correctif ne
-    # sert qu'aux NAS déjà installés avant son ajout
+    # sert qu'aux NAS déjà installés avant son ajout. Volontairement PAS
+    # activé automatiquement (systemctl enable --now) : SSH doit rester
+    # désactivé par défaut, à activer soi-même via Paramètres > Terminal.
     if ! command -v sshd &>/dev/null; then
-      echo "Installation d'openssh-server (requis pour l'onglet Terminal)..."
+      echo "Installation d'openssh-server (requis pour l'onglet Terminal, désactivé par défaut)..."
       apt-get install -y openssh-server 2>&1 | tail -3
-      systemctl enable --now ssh 2>/dev/null || true
+      systemctl disable --now ssh 2>/dev/null || true
       ufw allow 22/tcp 2>/dev/null || true
+    fi
+
+    # pam_shells (config PAM par défaut de vsftpd) rejette toute connexion FTP
+    # dont le shell n'est pas listé dans /etc/shells — requis pour les comptes
+    # FTP créés en /usr/sbin/nologin depuis Paramètres > Services
+    grep -qxF "/usr/sbin/nologin" /etc/shells || echo "/usr/sbin/nologin" >> /etc/shells
+
+    # rclone (WebDAV) + minidlna (DLNA) requis par l'onglet Paramètres >
+    # Services — déjà dans la liste de paquets de l'ISO, ce correctif ne sert
+    # qu'aux NAS déjà installés avant leur ajout. Volontairement PAS activés
+    # automatiquement : désactivés par défaut, à activer depuis la WebUI.
+    if ! command -v rclone &>/dev/null; then
+      echo "Installation de rclone (requis pour le WebDAV, désactivé par défaut)..."
+      apt-get install -y rclone 2>&1 | tail -3
+      mkdir -p /etc/gravity
+      if [ ! -f /etc/gravity/webdav.env ]; then
+        printf 'RCLONE_USER=gravity\nRCLONE_PASS=gravity\n' > /etc/gravity/webdav.env
+        chmod 600 /etc/gravity/webdav.env
+      fi
+      cat > /etc/systemd/system/gravity-webdav.service <<'WEBDAVUNIT'
+[Unit]
+Description=GravityOS WebDAV (rclone)
+After=network.target
+
+[Service]
+EnvironmentFile=-/etc/gravity/webdav.env
+ExecStart=/usr/bin/rclone serve webdav /srv/shares --addr :8081 --user \${RCLONE_USER} --pass \${RCLONE_PASS} --vfs-cache-mode writes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+WEBDAVUNIT
+      systemctl daemon-reload
+      systemctl disable gravity-webdav 2>/dev/null || true
+      ufw allow 8081/tcp 2>/dev/null || true
+    fi
+    if ! command -v minidlnad &>/dev/null; then
+      echo "Installation de minidlna (requis pour le DLNA, désactivé par défaut)..."
+      apt-get install -y minidlna 2>&1 | tail -3
+      sed -i "s|^media_dir=.*|media_dir=/srv/shares|" /etc/minidlna.conf 2>/dev/null || echo "media_dir=/srv/shares" >> /etc/minidlna.conf
+      sed -i "s|^friendly_name=.*|friendly_name=GravityOS|" /etc/minidlna.conf 2>/dev/null || echo "friendly_name=GravityOS" >> /etc/minidlna.conf
+      systemctl disable --now minidlna 2>/dev/null || true
+      ufw allow 8200/tcp 2>/dev/null || true
+      ufw allow 1900/udp 2>/dev/null || true
     fi
 
     # systemd-timesyncd requis par l'onglet Options régional > Service NTP
