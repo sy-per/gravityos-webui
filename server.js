@@ -3398,6 +3398,18 @@ WEBDAVUNIT
       systemctl enable --now systemd-timesyncd 2>/dev/null || true
     fi
 
+    # Module tun requis par le réseau virtuel "default" de libvirt (bridge
+    # virbr0 + interfaces TAP des VM) — sans lui, toute VM branchée sur ce
+    # réseau échouait au démarrage ("Unable to open /dev/net/tun, is tun
+    # module loaded?"), signalé par un utilisateur réel. Chargé tout de
+    # suite (utile immédiatement, pas juste au prochain redémarrage) et
+    # persisté pour survivre aux redémarrages suivants.
+    if [ ! -e /dev/net/tun ]; then
+      echo "Chargement du module tun (requis pour le réseau virtuel des VM)..."
+      modprobe tun 2>/dev/null || true
+    fi
+    [ -f /etc/modules-load.d/gravity-tun.conf ] || echo "tun" > /etc/modules-load.d/gravity-tun.conf
+
     # Volume 1 partagé (Documents/Images/ISO/Téléchargements) — avant le
     # 2026-08-23, ces dossiers vivaient dans le /home Linux de l'admin,
     # invisibles/non partagés pour les autres comptes NAS. Migration
