@@ -2297,8 +2297,22 @@ app.get("/api/containers", auth, async(req,res)=>{
     }));
   } catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post("/api/containers/:id/start",   auth, async(req,res)=>{try{await docker.getContainer(req.params.id).start();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/containers/:id/stop",    auth, async(req,res)=>{try{await docker.getContainer(req.params.id).stop();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+// Docker répond HTTP 304 (pas une vraie erreur, "déjà dans l'état demandé")
+// quand on démarre un conteneur déjà démarré ou qu'on en arrête un déjà
+// arrêté — dockerode le rejette quand même comme n'importe quel code non-2xx,
+// ce qui remontait un "Action impossible" trompeur à l'utilisateur alors que
+// le conteneur était en réalité déjà dans l'état voulu (souvent une simple
+// course entre la liste affichée et le clic — le conteneur a redémarré tout
+// seul entre-temps, ex. politique "restart" en boucle de crash). Traité
+// comme un succès plutôt qu'une erreur.
+app.post("/api/containers/:id/start", auth, async(req,res)=>{
+  try{await docker.getContainer(req.params.id).start();res.json({ok:true});}
+  catch(e){ if(e.statusCode===304) return res.json({ok:true}); res.status(500).json({error:e.message}); }
+});
+app.post("/api/containers/:id/stop", auth, async(req,res)=>{
+  try{await docker.getContainer(req.params.id).stop();res.json({ok:true});}
+  catch(e){ if(e.statusCode===304) return res.json({ok:true}); res.status(500).json({error:e.message}); }
+});
 app.post("/api/containers/:id/restart", auth, async(req,res)=>{try{await docker.getContainer(req.params.id).restart();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.delete("/api/containers/:id",       auth, async(req,res)=>{try{await docker.getContainer(req.params.id).remove({force:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.get("/api/containers/:id/logs", auth, async(req,res)=>{
@@ -2562,7 +2576,30 @@ async function nasIp() {
   } catch { return "127.0.0.1"; }
 }
 
-app.get("/api/app-shortcuts", auth, (req,res)=> res.json(loadAppShortcuts()));
+// État "en cours d'exécution" par raccourci — pour griser l'icône d'une VM
+// ou d'une app du Magasin éteinte (demande explicite de l'utilisateur),
+// plutôt que de laisser l'icône identique qu'elle soit joignable ou non.
+// Uniquement calculé pour les raccourcis rattachés à une VM ou une app du
+// Magasin (les seuls dont l'état peut être vérifié de façon fiable) —
+// "running" reste absent pour un raccourci manuel/URL classique.
+app.get("/api/app-shortcuts", auth, async(req,res)=>{
+  try {
+    const list = loadAppShortcuts();
+    const containers = list.some(s=>s.storeAppId) && docker
+      ? await docker.listContainers({all:true}).catch(()=>[])
+      : [];
+    const withStatus = await Promise.all(list.map(async(s)=>{
+      if (s.vmName) return { ...s, running: await vmIsRunning(s.vmName).catch(()=>false) };
+      if (s.storeAppId) {
+        const project = `store-${s.storeAppId}`;
+        const running = containers.some(c => c.Labels?.["com.docker.compose.project"] === project && c.State === "running");
+        return { ...s, running };
+      }
+      return s;
+    }));
+    res.json(withStatus);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 
 app.post("/api/app-shortcuts", auth, async(req,res)=>{
   const { id, name, ip, port, icon, https, vmName, dynamic, url } = req.body;
