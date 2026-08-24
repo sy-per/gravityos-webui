@@ -118,6 +118,16 @@ app.get("/install.html",(req,res) => res.sendFile(path.join(__dirname,"web","ins
 // desktop selon la réponse de GET /api/auth/status — plus de redirection
 // serveur ni de pages HTML séparées pour /login.html ou /wizard.html.
 app.use(express.static(path.join(__dirname,"web")));
+// Fichiers statiques noVNC (canvas VNC en JS pur, installés localement par le
+// paquet Debian "novnc" — pas de dépendance CDN), utilisés pour ouvrir la
+// console d'une VM en plein écran dans un nouvel onglet (vnc.html) en plus
+// du canvas intégré à l'app. DOIT être enregistré avant le catch-all SPA
+// ci-dessous : Express matche les routes dans l'ordre d'enregistrement, et
+// le catch-all interceptait déjà /novnc/vnc.html avant qu'il n'atteigne
+// jamais ce middleware — /novnc n'était donc jamais réellement joignable
+// malgré son existence, bug découvert en testant l'ouverture réelle de
+// vnc.html dans le navigateur (retombait sur index.html au lieu du fichier).
+if (fs.existsSync("/usr/share/novnc")) app.use("/novnc", express.static("/usr/share/novnc"));
 // Toute route non-API qui ne correspond à aucun fichier statique retombe sur
 // la SPA (utile si on ajoute un jour du routing côté client, ex. /files).
 app.get(/^(?!\/api\/).*/, (req,res) => res.sendFile(path.join(__dirname,"web","index.html")));
@@ -1358,6 +1368,31 @@ async function virsh(cmd) {
   }
 }
 
+// Interface physique principale du NAS (celle de la route par défaut) —
+// utilisée pour le mode réseau "pont direct" d'une VM (macvtap), qui la
+// place directement sur le même sous-réseau que le NAS plutôt que sur le
+// réseau NAT isolé de libvirt (192.168.122.0/24 par défaut, jamais joignable
+// depuis le reste du LAN sans redirection de port) — signalé comme
+// surprenant par un utilisateur ("l'IP de la VM n'est pas dans le même
+// sous-réseau que le NAS").
+async function primaryIface() {
+  try {
+    const { stdout } = await execAsync("ip route show default 2>/dev/null");
+    return (stdout.match(/dev (\S+)/) || [])[1] || null;
+  } catch { return null; }
+}
+// "__bridge__" est un identifiant réservé (jamais un vrai nom de réseau
+// libvirt) qui sélectionne le mode pont direct plutôt qu'un réseau NAT.
+const BRIDGE_NETWORK_ID = "__bridge__";
+async function buildInterfaceXml(network) {
+  if (network === BRIDGE_NETWORK_ID) {
+    const iface = await primaryIface();
+    if (!iface) throw new Error("Interface réseau physique introuvable — pont direct impossible");
+    return `<interface type='direct'><source dev='${iface}' mode='bridge'/><model type='virtio'/></interface>`;
+  }
+  return `<interface type='network'><source network='${network || "default"}'/><model type='e1000'/></interface>`;
+}
+
 // Stats CPU/RAM en direct pour une VM en cours d'exécution (2 échantillons
 // de cpu.time à 300ms d'écart pour un %CPU instantané, RSS réel via dommemstat)
 async function vmLiveStat(name){
@@ -1376,14 +1411,22 @@ async function vmLiveStat(name){
   } catch { return { memUsedMB:null, cpuPct:null }; }
 }
 
-// IP obtenue via bail DHCP libvirt (ne fonctionne que si la VM est démarrée
-// et utilise le réseau NAT/bridge géré par libvirt — pas de fallback ARP)
+// IP d'une VM — la source par défaut ("lease") ne fonctionne que pour le
+// réseau NAT géré par libvirt (bail dnsmasq) : une VM en pont direct
+// (macvtap, voir buildInterfaceXml) obtient son IP du DHCP du LAN, invisible
+// à libvirt, donc toujours vide sans repli. --source arp (table ARP/voisinage
+// de l'hôte) est le seul moyen sans agent invité installé dans la VM — n'a
+// une valeur qu'après que la VM ait déjà émis du trafic sur le réseau
+// (rien d'instantané au premier démarrage, contrairement au bail DHCP).
 async function vmIp(name){
-  try {
-    const {stdout} = await execAsync(`virsh --connect qemu:///system domifaddr ${sh(name)} 2>/dev/null`);
-    const m = stdout.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/\d+/);
-    return m ? m[1] : null;
-  } catch { return null; }
+  for (const source of ["lease", "arp"]) {
+    try {
+      const {stdout} = await execAsync(`virsh --connect qemu:///system domifaddr ${sh(name)} --source ${source} 2>/dev/null`);
+      const m = stdout.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/\d+/);
+      if (m) return m[1];
+    } catch {}
+  }
+  return null;
 }
 // Taille virtuelle du disque principal (Go) — lu via qemu-img sur le fichier
 // qcow2 attaché, indépendant de l'état running/stopped de la VM
@@ -1405,7 +1448,9 @@ async function vmDiskGB(name){
 async function vmDevicesFromXml(name) {
   try {
     const xml = await virsh(`dumpxml ${sh(name)}`);
-    const network = (xml.match(/<interface type='network'>[\s\S]*?<source network='([^']*)'/)||[])[1] || null;
+    const network = /<interface type='direct'>/.test(xml)
+      ? BRIDGE_NETWORK_ID
+      : (xml.match(/<interface type='network'>[\s\S]*?<source network='([^']*)'/)||[])[1] || null;
     const iso = (xml.match(/<disk type='file' device='cdrom'>[\s\S]*?<source file='([^']*)'/)||[])[1] || null;
     const usbDevices = [...xml.matchAll(/<hostdev mode='subsystem' type='usb'>[\s\S]*?<vendor id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<product id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<\/hostdev>/g)]
       .map(m => `${m[1]}:${m[2]}`);
@@ -1499,7 +1544,8 @@ app.post("/api/vms", auth, async (req,res) => {
     // lecteur CD-ROM (déjà en bus='sata', dev='sdb' plus bas) et n'avoir qu'un
     // seul chemin de code plutôt qu'un bus conditionnel en plus du chipset.
     const diskTarget = "<target dev='sda' bus='sata'/>";
-    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/>${diskTarget}</disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
+    const interfaceXml = await buildInterfaceXml(network);
+    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/>${diskTarget}</disk>${cdrom}${interfaceXml}<graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
     fs.writeFileSync(xmlPath, xml);
     // Le disque (création ou import/conversion) tourne en job asynchrone —
@@ -1578,15 +1624,20 @@ app.put("/api/vms/:n", auth, async (req,res) => {
     if (network) {
       if (!/^[a-zA-Z0-9_-]+$/.test(network)) return res.status(400).json({error:"Nom de réseau invalide"});
       const xml = await virsh(`dumpxml ${sh(name)}`);
-      // "virsh dumpxml" insère une ligne <mac address='...'/> auto-générée
-      // entre <interface> et <source> (absente du XML qu'on écrit nous-mêmes
-      // à la création) — [\s\S]*? (non-greedy) l'ignore plutôt que de
-      // supposer <source> immédiatement après <interface>, bug découvert en
-      // testant l'édition sur une vraie VM déjà définie.
-      if (!/<interface type='network'>[\s\S]*?<source network='[^']*'/.test(xml)) {
+      // Remplace tout le bloc <interface>...</interface> (pas juste
+      // l'attribut "network" comme avant) : passer du réseau NAT libvirt au
+      // pont direct (macvtap) ou inversement change le type d'interface
+      // lui-même, pas seulement sa source. Le MAC existant est préservé
+      // (réinjecté dans le nouveau bloc) pour ne pas changer d'adresse
+      // matérielle à chaque édition — évite une nouvelle demande DHCP.
+      const ifaceMatch = xml.match(/<interface type='(?:network|direct)'>[\s\S]*?<\/interface>/);
+      if (!ifaceMatch) {
         return res.status(400).json({error:"Interface réseau non reconnue dans le XML de cette VM — modification manuelle requise"});
       }
-      const updated = xml.replace(/(<interface type='network'>[\s\S]*?<source network=')[^']*(')/, `$1${network}$2`);
+      const mac = (ifaceMatch[0].match(/<mac address='([^']*)'\/>/)||[])[1];
+      let interfaceXml = await buildInterfaceXml(network);
+      if (mac) interfaceXml = interfaceXml.replace(/^(<interface[^>]*>)/, `$1<mac address='${mac}'/>`);
+      const updated = xml.replace(ifaceMatch[0], interfaceXml);
       const xmlPath = `/tmp/${name}-edit-${Date.now()}.xml`;
       fs.writeFileSync(xmlPath, updated);
       await virsh(`define ${sh(xmlPath)}`);
@@ -1672,9 +1723,6 @@ app.get("/api/vms/:n/console", auth, async (req,res) => {
     res.json({ok:true, wsPort});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
-// Sert les fichiers statiques noVNC (canvas VNC en JS pur, installés localement
-// par le paquet Debian "novnc" — pas de dépendance CDN)
-if (fs.existsSync("/usr/share/novnc")) app.use("/novnc", express.static("/usr/share/novnc"));
 // Les ISOs vivent désormais dans le dossier personnel (~/ISO), pas
 // /var/lib/libvirt/images — cohérent avec l'app Fichiers et son raccourci ISO
 app.get("/api/isos", auth, (req,res)=>{try{const d=isoDir();fs.mkdirSync(d,{recursive:true});res.json(fs.readdirSync(d).filter(f=>f.endsWith(".iso")).map(f=>({name:f,path:path.join(d,f),size:fs.statSync(path.join(d,f)).size})));}catch{res.json([]);}});
