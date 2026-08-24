@@ -1342,7 +1342,21 @@ app.post("/api/proxy/custom-cert", auth, (req,res) => {
 // — cassait silencieusement le parsing regex de vcpus/memMB dans GET
 // /api/vms depuis le début (jamais remarqué : "?"/"—" affichés sans erreur),
 // même famille de bug que le "Listing..." d'apt corrigé plus tôt.
-async function virsh(cmd) { const{stdout}=await execAsync(`LC_ALL=C virsh --connect qemu:///system ${cmd} 2>/dev/null`);return stdout.trim(); }
+// "2>/dev/null" jetait le vrai message d'erreur de virsh — un échec ne
+// remontait alors que "Command failed: virsh ... start 'x'" sans aucune
+// explication (bug signalé par l'utilisateur : VM refusant de démarrer
+// sans qu'on puisse savoir pourquoi). stderr est maintenant conservé et
+// remonté dans l'erreur pour que les endpoints renvoient un message
+// diagnosticable — les appelants qui attendent un échec silencieux
+// utilisent déjà .catch(), donc rien ne change pour eux.
+async function virsh(cmd) {
+  try {
+    const { stdout } = await execAsync(`LC_ALL=C virsh --connect qemu:///system ${cmd}`);
+    return stdout.trim();
+  } catch (e) {
+    throw new Error((e.stderr || "").trim() || e.message);
+  }
+}
 
 // Stats CPU/RAM en direct pour une VM en cours d'exécution (2 échantillons
 // de cpu.time à 300ms d'écart pour un %CPU instantané, RSS réel via dommemstat)
@@ -2503,22 +2517,32 @@ async function nasIp() {
 app.get("/api/app-shortcuts", auth, (req,res)=> res.json(loadAppShortcuts()));
 
 app.post("/api/app-shortcuts", auth, async(req,res)=>{
-  const { name, ip, port, icon, https, vmName } = req.body;
+  const { name, ip, port, icon, https, vmName, url } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({error:"Nom requis"});
-  const safePort = parseInt(port,10);
-  if (!safePort || safePort<1 || safePort>65535) return res.status(400).json({error:"Port invalide"});
   try {
-    const scheme = https ? "https" : "http";
     let entry;
-    if (vmName) {
-      // Raccourci "dynamique" pour une VM : pas d'IP figée à la création
-      // (attribuée par DHCP, peut changer d'un démarrage à l'autre) — le
-      // frontend résout l'IP réelle via GET /api/vms/:n/ip au moment du
-      // clic. port/https/vmName stockés, "url" absent tant que non résolu.
-      entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), vmName: String(vmName), port: safePort, https: !!https, icon: icon || null };
+    if (url) {
+      // Mode "URL" : l'utilisateur maîtrise tout (chemin, port non
+      // standard...) — aucune reconstruction, juste une validation basique.
+      let parsed;
+      try { parsed = new URL(String(url)); } catch { return res.status(400).json({error:"URL invalide"}); }
+      if (!["http:","https:"].includes(parsed.protocol)) return res.status(400).json({error:"Seuls http:// et https:// sont acceptés"});
+      entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: parsed.toString(), icon: icon || null };
     } else {
-      const safeIp = (ip && String(ip).trim()) || await nasIp();
-      entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: `${scheme}://${safeIp}:${safePort}`, icon: icon || null };
+      const safePort = parseInt(port,10);
+      if (!safePort || safePort<1 || safePort>65535) return res.status(400).json({error:"Port invalide"});
+      if (vmName) {
+        // Mode "dynamique" pour une VM : pas d'IP figée à la création
+        // (attribuée par DHCP, peut changer d'un démarrage à l'autre) — le
+        // frontend résout l'IP réelle via GET /api/vms/:n/ip au moment du
+        // clic. port/https/vmName stockés, "url" absent tant que non résolu.
+        entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), vmName: String(vmName), port: safePort, https: !!https, icon: icon || null };
+      } else {
+        // Mode "IP manuelle"
+        const scheme = https ? "https" : "http";
+        const safeIp = (ip && String(ip).trim()) || await nasIp();
+        entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: `${scheme}://${safeIp}:${safePort}`, icon: icon || null };
+      }
     }
     const list = loadAppShortcuts();
     list.push(entry);
