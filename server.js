@@ -1477,7 +1477,15 @@ app.post("/api/vms", auth, async (req,res) => {
       return `<hostdev mode='subsystem' type='usb'><source><vendor id='0x${vendor}'/><product id='0x${product}'/></source></hostdev>`;
     }).join("");
 
-    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/><target dev='hda' bus='ide'/></disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
+    // Le chipset q35 (requis par UEFI/OVMF) n'a pas de contrôleur IDE — bus='ide'
+    // échoue à la définition ("IDE controllers are unsupported for this QEMU
+    // binary or machine type"), bug découvert via un vrai échec de création
+    // UEFI signalé par l'utilisateur. i440fx (legacy) supporte IDE nativement,
+    // mais autant utiliser SATA dans les deux cas pour rester cohérent avec le
+    // lecteur CD-ROM (déjà en bus='sata', dev='sdb' plus bas) et n'avoir qu'un
+    // seul chemin de code plutôt qu'un bus conditionnel en plus du chipset.
+    const diskTarget = "<target dev='sda' bus='sata'/>";
+    const xml = `<domain type='${domainType}'><name>${safeName}</name><memory unit='KiB'>${memKB}</memory><currentMemory unit='KiB'>${memKB}</currentMemory><vcpu>${vcpus}</vcpu><os>${osBlock}</os><features><acpi/><apic/></features><clock offset='utc'/><on_poweroff>destroy</on_poweroff><on_reboot>restart</on_reboot><on_crash>destroy</on_crash><devices><emulator>${emulator}</emulator><disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='${dp}'/>${diskTarget}</disk>${cdrom}<interface type='network'><source network='${network||"default"}'/><model type='e1000'/></interface><graphics type='vnc' port='-1' listen='0.0.0.0'/><video><model type='vga' vram='16384'/></video><console type='pty'><target type='serial'/></console>${usbBlock}</devices></domain>`;
     const xmlPath = `/tmp/${safeName}-${Date.now()}.xml`;
     fs.writeFileSync(xmlPath, xml);
     // Le disque (création ou import/conversion) tourne en job asynchrone —
@@ -1493,7 +1501,31 @@ app.post("/api/vms/:n/force-stop", auth, async (req,res)=>{try{await virsh(`dest
 app.post("/api/vms/:n/restart",    auth, async (req,res)=>{try{await virsh(`reboot ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/suspend",    auth, async (req,res)=>{try{await virsh(`suspend ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/resume",     auth, async (req,res)=>{try{await virsh(`resume ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.delete("/api/vms/:n",          auth, async (req,res)=>{try{await virsh(`destroy ${sh(req.params.n)}`).catch(()=>{});await virsh(`undefine ${sh(req.params.n)} --remove-all-storage`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.delete("/api/vms/:n", auth, async (req,res)=>{
+  const name = req.params.n;
+  try {
+    await virsh(`destroy ${sh(name)}`).catch(()=>{});
+    // "--remove-all-storage" ne fait RIEN sur les disques de GravityOS : ils
+    // sont écrits directement par qemu-img (voir POST /api/vms), jamais
+    // enregistrés dans un pool de stockage libvirt, et libvirt refuse de
+    // gérer un stockage qu'il ne "possède" pas ("Storage volume ... is not
+    // managed by libvirt") — silencieusement ignoré, le fichier .qcow2 reste
+    // sur le disque à chaque suppression de VM depuis le début du projet.
+    // Bug découvert en supprimant réellement des VM de test (fichiers
+    // orphelins accumulés dans /var/lib/libvirt/images/). Fix : on relève
+    // nous-mêmes le(s) chemin(s) du disque principal depuis le XML (device=
+    // 'disk' uniquement, jamais un cdrom — une ISO n'appartient pas à la VM)
+    // et on les supprime à la main après le undefine.
+    // "--nvram" est en plus requis pour une VM UEFI (sinon : "Impossible de
+    // redéfinir le domaine avec nvram"), bug également découvert en testant
+    // la suppression d'une vraie VM UEFI créée par l'assistant.
+    const xml = await virsh(`dumpxml ${sh(name)}`).catch(()=>"");
+    const diskPaths = [...xml.matchAll(/<disk type='file' device='disk'>[\s\S]*?<source file='([^']*)'/g)].map(m=>m[1]);
+    await virsh(`undefine ${sh(name)} --nvram`);
+    for (const p of diskPaths) { if (isPathAllowed(p)) fs.rmSync(p, {force:true}); }
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 
 // Édition d'une VM déjà définie — jusqu'ici seule la création et les
 // actions start/stop/etc existaient, aucun moyen de modifier une VM après
