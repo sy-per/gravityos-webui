@@ -1385,6 +1385,21 @@ async function vmDiskGB(name){
   } catch { return null; }
 }
 
+// Réseau/ISO/USB actuels d'une VM — lus depuis dumpxml pour pré-remplir
+// l'assistant d'édition avec l'état réel plutôt que de deviner à partir des
+// seuls paramètres de création (une VM peut avoir été éditée depuis).
+async function vmDevicesFromXml(name) {
+  try {
+    const xml = await virsh(`dumpxml ${sh(name)}`);
+    const network = (xml.match(/<interface type='network'>[\s\S]*?<source network='([^']*)'/)||[])[1] || null;
+    const iso = (xml.match(/<disk type='file' device='cdrom'>[\s\S]*?<source file='([^']*)'/)||[])[1] || null;
+    const usbDevices = [...xml.matchAll(/<hostdev mode='subsystem' type='usb'>[\s\S]*?<vendor id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<product id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<\/hostdev>/g)]
+      .map(m => `${m[1]}:${m[2]}`);
+    const bios = /<loader readonly='yes' type='pflash'>/.test(xml) ? "uefi" : "legacy";
+    return { network, iso, usbDevices, bios };
+  } catch { return { network:null, iso:null, usbDevices:[], bios:"legacy" }; }
+}
+
 app.get("/api/vms", auth, async (req,res) => {
   if (isLive()) return res.json({isLive:true,vms:[],message:"KVM indisponible en Live CD — installez GravityOS sur disque"});
   try {
@@ -1395,6 +1410,8 @@ app.get("/api/vms", auth, async (req,res) => {
       try{const i=await virsh(`dominfo ${vm.name}`);d={...vm,vcpus:(i.match(/CPU\(s\):\s+(\d+)/)||[])[1]||"?",memMB:Math.round(parseInt((i.match(/Max memory:\s+(\d+)/)||[])[1]||0)/1024)};}catch{}
       const diskGB = await vmDiskGB(vm.name);
       if (diskGB!=null) d = { ...d, diskGB };
+      const devices = await vmDevicesFromXml(vm.name);
+      d = { ...d, ...devices };
       if (vm.state?.includes("running")) {
         const [live, ip] = await Promise.all([vmLiveStat(vm.name), vmIp(vm.name)]);
         d = { ...d, ...live, ip };
@@ -1478,23 +1495,28 @@ app.post("/api/vms/:n/suspend",    auth, async (req,res)=>{try{await virsh(`susp
 app.post("/api/vms/:n/resume",     auth, async (req,res)=>{try{await virsh(`resume ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.delete("/api/vms/:n",          auth, async (req,res)=>{try{await virsh(`destroy ${sh(req.params.n)}`).catch(()=>{});await virsh(`undefine ${sh(req.params.n)} --remove-all-storage`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 
-// Édition d'une VM déjà définie (vCPU/mémoire/réseau) — jusqu'ici seule la
-// création et les actions start/stop/etc existaient, aucun moyen de
-// modifier une VM après coup. --config seul (jamais --live) : simple et
-// prévisible, s'applique au prochain démarrage plutôt que de risquer un
-// hot-plug qui échoue silencieusement selon le pilote invité. setvcpus/
-// setmem exigent que --maximum soit posé avant la valeur courante (l'ordre
-// inverse échoue si la nouvelle valeur dépasse l'ancien maximum). Le réseau
-// n'a pas d'équivalent "setXxx" dans virsh : on relit le XML, on remplace
-// l'attribut network de l'unique <interface type='network'> (format que
-// GravityOS génère toujours lui-même à la création, voir POST /api/vms),
-// puis on redéfinit — même technique que la création, pas de nouvel outil.
+// Édition d'une VM déjà définie — jusqu'ici seule la création et les
+// actions start/stop/etc existaient, aucun moyen de modifier une VM après
+// coup. vCPU/mémoire/réseau exigent la VM arrêtée (--config seul, jamais
+// --live : simple et prévisible, s'applique au prochain démarrage plutôt
+// que de risquer un hot-plug qui échoue silencieusement selon le pilote
+// invité) ; ISO et USB restent modifiables même VM allumée (--config
+// --live à la fois : persiste ET prend effet immédiatement), demande
+// explicite de l'utilisateur ("si elle est en cours l'édition est possible
+// que sur les USB et iso de démarrage").
+async function vmIsRunning(name) {
+  return (await virsh(`domstate ${sh(name)}`)).trim() === "running";
+}
 app.put("/api/vms/:n", auth, async (req,res) => {
   if (isLive()) return res.status(400).json({error:"Impossible en Live CD"});
   const name = req.params.n;
   if (!/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de VM invalide"});
-  const { vcpus, memMB, network } = req.body;
+  const { vcpus, memMB, network, iso, usbDevices } = req.body;
   try {
+    const running = await vmIsRunning(name);
+    if (running && (vcpus || memMB || network)) {
+      return res.status(400).json({error:"Arrêtez la VM pour modifier vCPU/mémoire/réseau — seuls l'ISO et l'USB restent modifiables pendant l'exécution"});
+    }
     if (vcpus) {
       const n = parseInt(vcpus, 10);
       if (!n || n < 1 || n > 32) return res.status(400).json({error:"vCPU invalide (1-32)"});
@@ -1523,6 +1545,47 @@ app.put("/api/vms/:n", auth, async (req,res) => {
       fs.writeFileSync(xmlPath, updated);
       await virsh(`define ${sh(xmlPath)}`);
       fs.rmSync(xmlPath, {force:true});
+    }
+    // ISO de démarrage — target 'sdb' fixe (bus sata), convention utilisée
+    // partout ailleurs dans le fichier (POST /api/vms). "change-media"
+    // exige qu'un lecteur CD-ROM existe déjà dans le XML (créé avec une ISO
+    // au départ) ; sinon on en attache un nouveau. iso==="" éjecte sans
+    // rien attacher (VM créée sans ISO au départ, rien à éjecter).
+    if (iso !== undefined) {
+      if (iso && !isPathAllowed(iso)) return res.status(400).json({error:"ISO hors des volumes autorisés"});
+      const liveFlags = running ? "--live --config" : "--config";
+      const xml = await virsh(`dumpxml ${sh(name)}`);
+      const hasCdrom = /<disk type='file' device='cdrom'>/.test(xml);
+      if (iso) {
+        if (hasCdrom) await virsh(`change-media ${sh(name)} sdb --update ${sh(iso)} ${liveFlags}`);
+        else await virsh(`attach-disk ${sh(name)} ${sh(iso)} sdb --type cdrom --mode readonly ${liveFlags}`);
+      } else if (hasCdrom) {
+        await virsh(`change-media ${sh(name)} sdb --eject ${liveFlags}`).catch(()=>{});
+      }
+    }
+    // USB passthrough — comparaison de la liste souhaitée avec les hostdev
+    // USB actuellement présents dans le XML (format vendorId:productId,
+    // même identifiant que /api/usb et POST /api/vms), attache/détache un
+    // par un les différences plutôt que de tout redéfinir d'un coup (plus
+    // sûr en live : un detach-device sur un device absent échoue proprement
+    // sans toucher au reste).
+    if (Array.isArray(usbDevices)) {
+      const liveFlags = running ? "--live --config" : "--config";
+      const xml = await virsh(`dumpxml ${sh(name)}`);
+      const current = [...xml.matchAll(/<hostdev mode='subsystem' type='usb'>[\s\S]*?<vendor id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<product id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<\/hostdev>/g)]
+        .map(m => `${m[1]}:${m[2]}`);
+      const desired = usbDevices.filter(d => /^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$/.test(d));
+      const toAdd = desired.filter(d => !current.includes(d));
+      const toRemove = current.filter(d => !desired.includes(d));
+      for (const d of [...toAdd, ...toRemove]) {
+        const [vendor, product] = d.split(":");
+        const devXml = `<hostdev mode='subsystem' type='usb'><source><vendor id='0x${vendor}'/><product id='0x${product}'/></source></hostdev>`;
+        const devPath = `/tmp/${name}-usb-${vendor}${product}-${Date.now()}.xml`;
+        fs.writeFileSync(devPath, devXml);
+        const action = toAdd.includes(d) ? "attach-device" : "detach-device";
+        await virsh(`${action} ${sh(name)} ${sh(devPath)} ${liveFlags}`).catch(()=>{});
+        fs.rmSync(devPath, {force:true});
+      }
     }
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
