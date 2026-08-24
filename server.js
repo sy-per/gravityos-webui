@@ -2986,9 +2986,15 @@ function streamUpdate(cmd, res) {
 // Vérifier les mises à jour système disponibles
 app.get("/api/updates/system/check", auth, async(req,res) => {
   try {
-    await execAsync("apt-get update -qq 2>/dev/null");
-    const {stdout} = await execAsync("apt list --upgradable 2>/dev/null | grep -v 'Listing' | wc -l");
-    const {stdout:pkgs} = await execAsync("apt list --upgradable 2>/dev/null | grep -v 'Listing' | head -20");
+    // LANG=fr_FR.UTF-8 par défaut sur GravityOS (locale de l'ISO) : sans
+    // LC_ALL=C, l'en-tête informatif d'apt ("Listing... Done") s'affiche en
+    // français ("Listage... Fait") et n'est plus filtré par le grep -v
+    // 'Listing' ci-dessous (qui ne matche que l'anglais) — cette ligne
+    // trainait alors dans la liste comme un faux "paquet", comptée dans le
+    // total sans jamais correspondre à une vraie mise à jour installable.
+    await execAsync("LC_ALL=C apt-get update -qq 2>/dev/null");
+    const {stdout} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | wc -l");
+    const {stdout:pkgs} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | head -20");
     const count = parseInt(stdout.trim()) || 0;
     res.json({count, packages: pkgs.trim().split("\n").filter(Boolean)});
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -3273,11 +3279,29 @@ TERMCFG
     fi
 
     echo ""
-    systemctl restart gravity-webui 2>/dev/null || true
-
-    echo ""
     echo "=== GravityOS mis a jour! ==="
     git log -1 --format='Version: %h - %s (%cr)' 2>/dev/null || true
+
+    # Redemarrage differe et decouple du cgroup courant : "systemctl restart
+    # gravity-webui" tue tout le cgroup du service (KillMode par defaut =
+    # control-group), qui contient CE script (spawn() par le node de
+    # gravity-webui.service) — l'executer directement ici tuait le script
+    # avant qu'il ait fini d'ecrire "=== DONE ===", ET coupait node pendant
+    # RestartSec=5s pile pendant que le frontend interrogeait /api/updates/log
+    # (d'ou le "Bad Gateway" au clic sur Installer). systemd-run cree un
+    # transient unit hors du cgroup de gravity-webui : le redemarrage reel
+    # n'a lieu que 3s plus tard, une fois ce script (et son "DONE") termines
+    # normalement et lus par le frontend.
+    # --unit doit etre unique a chaque appel (PID + timestamp) : un nom fixe
+    # entre en collision si deux mises a jour se suivent de pres (le
+    # transient unit precedent n'a pas encore ete nettoye par systemd), ce
+    # qui fait echouer systemd-run et retombe sur le fallback direct —
+    # exactement le bug qu'on cherche a eviter. Bug decouvert en relancant
+    # une deuxieme mise a jour juste apres la premiere en test reel.
+    echo ""
+    echo "Redemarrage du service dans quelques secondes..."
+    systemd-run --on-active=3 --unit="gravity-webui-restart-$$-$(date +%s)" --description="Redemarrage differe apres mise a jour" /usr/bin/systemctl restart gravity-webui 2>/dev/null \
+      || systemctl restart gravity-webui 2>/dev/null || true
   `;
   streamUpdate(cmd, res);
 });
