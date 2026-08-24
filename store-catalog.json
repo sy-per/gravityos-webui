@@ -6813,5 +6813,63 @@
     "composeYaml": "services:\n  hbbs:\n    container_name: hbbs\n    image: rustdesk/rustdesk-server:1.1.16@sha256:8ecdab65deb7c84652a626380e31d11a8f1fbafd97916d57f95c20628f943c00\n    ports:\n      - 21115:21115\n      - 21116:21116\n      - 21116:21116/udp\n      - 21118:21118\n    command: hbbs\n    volumes:\n      - /srv/volumes/volume1/AppData/rustdesk-server/data/hbbs:/root\n    network_mode: host\n    depends_on:\n      - hbbr\n    restart: on-failure\n  hbbr:\n    container_name: hbbr\n    image: rustdesk/rustdesk-server:1.1.16@sha256:8ecdab65deb7c84652a626380e31d11a8f1fbafd97916d57f95c20628f943c00\n    ports:\n      - 21117:21117\n      - 21119:21119\n    command: hbbr\n    volumes:\n      - /srv/volumes/volume1/AppData/rustdesk-server/data/hbbr:/root\n    network_mode: host\n    restart: on-failure\n  web:\n    image: nginx:1.27@sha256:124b44bfc9ccd1f3cedf4b592d4d1e8bddb78b51ec2ed5056c52d3692baebc19\n    restart: on-failure\n    volumes:\n      - /srv/volumes/volume1/AppData/rustdesk-server/data/www:/usr/share/nginx/html:ro\n    ports:\n      - 21080:80\n",
     "needsReview": [],
     "excluded": false
+  },
+  {
+    "id": "nextcloud",
+    "name": "Nextcloud",
+    "tagline": "Productivity platform that keeps you in control",
+    "description": "Nextcloud puts your data at your fingertips, under your control. Store your documents, calendar, contacts and photos on your Umbrel instead of some company's data center. Features:\n\n- Mobile and desktop sync \n- Versioning and undelete \n- Galleries and activity feed \n- File editing and preview support for PDF, images, text files, Open Document, Word files and more. \n- Smooth performance and easy user interface. \n- Fine-grained control over access to data and sharing capabilities by user and by group.\n\nNote: After logging in to Nextcloud please change the password to something secure before sharing the address with anyone.",
+    "category": "files",
+    "version": "34.0.3",
+    "developer": "Nextcloud GmbH",
+    "website": "https://nextcloud.com",
+    "repo": "https://github.com/nextcloud/server",
+    "icon": "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/nextcloud/icon.svg",
+    "gallery": [
+      "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/nextcloud/1.jpg",
+      "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/nextcloud/2.jpg",
+      "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/nextcloud/3.jpg"
+    ],
+    "hostPorts": [
+      8081
+    ],
+    "secretVars": [
+      "APP_PASSWORD"
+    ],
+    "urlVars": [
+      "DEVICE_HOSTNAME"
+    ],
+    "hasUserFacingPassword": true,
+    "usesHostNetwork": false,
+    "composeYaml": "services:\n  db:\n    image: mariadb:10.6.21@sha256:8a16204dc96c08ed0ee2c52c0f9324aa5d2dd0e43ad23a471d447a39f75765b5\n    user: 1000:1000\n    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW\n    restart: on-failure\n    volumes:\n      - /srv/volumes/volume1/AppData/nextcloud/data/db:/var/lib/mysql\n    environment:\n      - MYSQL_ROOT_PASSWORD=moneyprintergobrrr\n      - MYSQL_PASSWORD=moneyprintergobrrr\n      - MYSQL_DATABASE=nextcloud\n      - MYSQL_USER=nextcloud\n      - MARIADB_AUTO_UPGRADE=1\n    healthcheck:\n      test:\n        - CMD\n        - healthcheck.sh\n        - --connect\n        - --innodb_initialized\n      start_period: 10s\n      interval: 10s\n      timeout: 5s\n      retries: 3\n  redis:\n    image: redis:6.2.2-buster@sha256:e10f55f92478715698a2cef97c2bbdc48df2a05081edd884938903aa60df6396\n    user: 1000:1000\n    restart: on-failure\n    volumes:\n      - /srv/volumes/volume1/AppData/nextcloud/data/redis:/data\n  web:\n    image: nextcloud:34.0.3-apache@sha256:365baea128b5e0f45a8dc5111c9234b926f1e6082b4c14d75ae650324ce5d65c\n    restart: on-failure\n    volumes:\n      - /srv/volumes/volume1/AppData/nextcloud/data/nextcloud:/var/www/html\n    environment:\n      - MYSQL_HOST=db\n      - REDIS_HOST=redis\n      - MYSQL_PASSWORD=moneyprintergobrrr\n      - MYSQL_DATABASE=nextcloud\n      - MYSQL_USER=nextcloud\n      - TRUSTED_PROXIES=172.16.0.0/12\n      - NEXTCLOUD_ADMIN_USER=umbrel\n      - NEXTCLOUD_ADMIN_PASSWORD=${APP_PASSWORD}\n      - NEXTCLOUD_TRUSTED_DOMAINS=${DEVICE_HOSTNAME}:8081 web\n      - PHP_UPLOAD_LIMIT=1024G\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_started\n    ports:\n      - 8081:80\n  cron:\n    image: nextcloud:34.0.3-apache@sha256:365baea128b5e0f45a8dc5111c9234b926f1e6082b4c14d75ae650324ce5d65c\n    restart: on-failure\n    volumes:\n      - /srv/volumes/volume1/AppData/nextcloud/data/nextcloud:/var/www/html\n    entrypoint: /cron.sh\n    depends_on:\n      db:\n        condition: service_healthy\n      redis:\n        condition: service_started\n",
+    "needsReview": [],
+    "excluded": false
+  },
+  {
+    "id": "home-assistant",
+    "name": "Home Assistant",
+    "tagline": "Home automation that puts local control & privacy first",
+    "description": "Open source home automation that puts local control and privacy first. Powered by a worldwide community of tinkerers and DIY enthusiasts. Once started, Home Assistant will automatically scan your network for known devices and allow you to easily set them up. Home Assistant integrates with over a thousand different devices and services.\n\nOnce you have integrated all your devices at home, you can unleash Home Assistant's advanced automation engine to make your home work for you. Do things like:\n- Turn on the light when the sun sets or when coming home\n- Get an alert when you leave your garage door open\n\nHome Assistant keeps your data local, no need for a cloud. Home Assistant communicates with your devices locally, and will fallback to pulling in data from the cloud if there is no other option. No data is stored in the cloud, and everything is processed locally.\n\nNote: The USB adapter discovery feature (e.g., for Zigbee dongles connected directly to the device running Umbrel) may not work reliably for Umbrel users on Raspberry Pi.",
+    "category": "automation",
+    "version": "2026.8.3",
+    "developer": "Home Assistant",
+    "website": "https://home-assistant.io",
+    "repo": "https://github.com/home-assistant/core",
+    "icon": "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/home-assistant/icon.svg",
+    "gallery": [
+      "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/home-assistant/1.jpg",
+      "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/home-assistant/2.jpg",
+      "https://raw.githubusercontent.com/getumbrel/umbrel-apps-gallery/master/home-assistant/3.jpg"
+    ],
+    "hostPorts": [
+      8123
+    ],
+    "secretVars": [],
+    "urlVars": [],
+    "hasUserFacingPassword": false,
+    "usesHostNetwork": true,
+    "composeYaml": "services:\n  server:\n    image: homeassistant/home-assistant:2026.8.3@sha256:14931c6b13756317849f46da1d01b45937a1150db66c081cfe529d48215943fe\n    network_mode: host\n    privileged: true\n    volumes:\n      - /srv/volumes/volume1/AppData/home-assistant/data:/config\n      - /srv/volumes/volume1/Téléchargements:/media\n      - /dev:/dev\n      - /run/dbus:/run/dbus:ro\n",
+    "needsReview": [],
+    "excluded": false
   }
 ]

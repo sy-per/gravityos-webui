@@ -2259,6 +2259,26 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
     const dir = storeDir(id);
     fs.mkdirSync(dir, {recursive:true});
     fs.writeFileSync(path.join(dir, "docker-compose.yml"), app_.composeYaml);
+    // Beaucoup d'apps du catalogue (héritées d'umbrel-apps) font tourner un
+    // service avec "user: 1000:1000" sur un volume bind-mount sous
+    // AppData/<id>/... (convention umbrelOS) — si ce sous-dossier précis
+    // n'existe pas encore, Docker le crée lui-même en root au moment du
+    // bind-mount (peu importe le propriétaire d'un dossier parent déjà
+    // chown), et le conteneur non-root ne peut plus y écrire ("Permission
+    // denied"). umbrelOS pré-crée ces dossiers avec le bon propriétaire ;
+    // GravityOS ne le faisait pas encore — bug découvert en installant
+    // réellement Nextcloud (mariadb en crash-loop, "data/db" recréé en root
+    // par Docker car un chown fait seulement sur AppData/<id> avant "compose
+    // up" ne suffit pas : "data/db" n'existait pas encore à ce moment-là).
+    // Fix : extraire CHAQUE chemin hôte de bind-mount du compose (regex sur
+    // les lignes "- /srv/volumes/...:..."), les créer un par un avant
+    // "compose up", puis chown -R une fois tous les sous-dossiers présents.
+    // uid 1000 = premier compte NAS créé (convention Debian/GravityOS, cf.
+    // `useradd` dans build-iso.sh), cohérent avec l'hypothèse uid 1000 des
+    // apps umbrel.
+    const bindMountPaths = [...app_.composeYaml.matchAll(/^\s*-\s+(\/srv\/volumes\/\S+?):/gm)].map(m => m[1]);
+    for (const p of bindMountPaths) fs.mkdirSync(p, {recursive:true});
+    await execAsync(`chown -R 1000:1000 ${sh(`/srv/volumes/volume1/AppData/${id}`)}`).catch(()=>{});
     const generated = generateSecrets(app_.secretVars);
     if (app_.urlVars?.length) {
       const ip = await nasIp();
