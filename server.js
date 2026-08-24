@@ -3406,7 +3406,14 @@ WEBDAVUNIT
     # persisté pour survivre aux redémarrages suivants.
     if [ ! -e /dev/net/tun ]; then
       echo "Chargement du module tun (requis pour le réseau virtuel des VM)..."
-      modprobe tun 2>/dev/null || true
+      # Pas de "2>/dev/null || true" ici : un modprobe qui échoue vraiment
+      # (module absent du noyau, /lib/modules désynchronisé...) doit
+      # apparaître dans ce journal au lieu d'être avalé en silence — sinon
+      # "Mettre à jour" prétend avoir réussi alors que /dev/net/tun manque
+      # toujours, symptôme observé chez un utilisateur réel malgré ce
+      # correctif déjà appliqué une première fois.
+      modprobe tun
+      ls -la /dev/net/tun 2>&1 || echo "ATTENTION: /dev/net/tun toujours absent après modprobe — voir dmesg"
     fi
     [ -f /etc/modules-load.d/gravity-tun.conf ] || echo "tun" > /etc/modules-load.d/gravity-tun.conf
 
