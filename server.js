@@ -1337,7 +1337,12 @@ app.post("/api/proxy/custom-cert", auth, (req,res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 //  VMs
 // ══════════════════════════════════════════════════════════════════════════════
-async function virsh(cmd) { const{stdout}=await execAsync(`virsh --connect qemu:///system ${cmd} 2>/dev/null`);return stdout.trim(); }
+// LC_ALL=C forcé : sous la locale fr_FR.UTF-8 par défaut de GravityOS,
+// "virsh dominfo" traduit ses libellés ("CPU :" au lieu de "CPU(s):", etc.)
+// — cassait silencieusement le parsing regex de vcpus/memMB dans GET
+// /api/vms depuis le début (jamais remarqué : "?"/"—" affichés sans erreur),
+// même famille de bug que le "Listing..." d'apt corrigé plus tôt.
+async function virsh(cmd) { const{stdout}=await execAsync(`LC_ALL=C virsh --connect qemu:///system ${cmd} 2>/dev/null`);return stdout.trim(); }
 
 // Stats CPU/RAM en direct pour une VM en cours d'exécution (2 échantillons
 // de cpu.time à 300ms d'écart pour un %CPU instantané, RSS réel via dommemstat)
@@ -1465,13 +1470,63 @@ app.post("/api/vms", auth, async (req,res) => {
     res.json({ok:true, jobId, disk:dp});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
-app.post("/api/vms/:n/start",      auth, async (req,res)=>{try{await virsh(`start ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/vms/:n/stop",       auth, async (req,res)=>{try{await virsh(`shutdown ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/vms/:n/force-stop", auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/vms/:n/restart",    auth, async (req,res)=>{try{await virsh(`reboot ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/vms/:n/suspend",    auth, async (req,res)=>{try{await virsh(`suspend ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.post("/api/vms/:n/resume",     auth, async (req,res)=>{try{await virsh(`resume ${req.params.n}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
-app.delete("/api/vms/:n",          auth, async (req,res)=>{try{await virsh(`destroy ${req.params.n}`).catch(()=>{});await virsh(`undefine ${req.params.n} --remove-all-storage`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/vms/:n/start",      auth, async (req,res)=>{try{await virsh(`start ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/vms/:n/stop",       auth, async (req,res)=>{try{await virsh(`shutdown ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/vms/:n/force-stop", auth, async (req,res)=>{try{await virsh(`destroy ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/vms/:n/restart",    auth, async (req,res)=>{try{await virsh(`reboot ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/vms/:n/suspend",    auth, async (req,res)=>{try{await virsh(`suspend ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post("/api/vms/:n/resume",     auth, async (req,res)=>{try{await virsh(`resume ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.delete("/api/vms/:n",          auth, async (req,res)=>{try{await virsh(`destroy ${sh(req.params.n)}`).catch(()=>{});await virsh(`undefine ${sh(req.params.n)} --remove-all-storage`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+
+// Édition d'une VM déjà définie (vCPU/mémoire/réseau) — jusqu'ici seule la
+// création et les actions start/stop/etc existaient, aucun moyen de
+// modifier une VM après coup. --config seul (jamais --live) : simple et
+// prévisible, s'applique au prochain démarrage plutôt que de risquer un
+// hot-plug qui échoue silencieusement selon le pilote invité. setvcpus/
+// setmem exigent que --maximum soit posé avant la valeur courante (l'ordre
+// inverse échoue si la nouvelle valeur dépasse l'ancien maximum). Le réseau
+// n'a pas d'équivalent "setXxx" dans virsh : on relit le XML, on remplace
+// l'attribut network de l'unique <interface type='network'> (format que
+// GravityOS génère toujours lui-même à la création, voir POST /api/vms),
+// puis on redéfinit — même technique que la création, pas de nouvel outil.
+app.put("/api/vms/:n", auth, async (req,res) => {
+  if (isLive()) return res.status(400).json({error:"Impossible en Live CD"});
+  const name = req.params.n;
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de VM invalide"});
+  const { vcpus, memMB, network } = req.body;
+  try {
+    if (vcpus) {
+      const n = parseInt(vcpus, 10);
+      if (!n || n < 1 || n > 32) return res.status(400).json({error:"vCPU invalide (1-32)"});
+      await virsh(`setvcpus ${sh(name)} ${n} --config --maximum`);
+      await virsh(`setvcpus ${sh(name)} ${n} --config`);
+    }
+    if (memMB) {
+      const kb = parseInt(memMB, 10) * 1024;
+      if (!kb || kb < 256*1024) return res.status(400).json({error:"Mémoire invalide (minimum 256 Mo)"});
+      await virsh(`setmaxmem ${sh(name)} ${kb} --config`);
+      await virsh(`setmem ${sh(name)} ${kb} --config`);
+    }
+    if (network) {
+      if (!/^[a-zA-Z0-9_-]+$/.test(network)) return res.status(400).json({error:"Nom de réseau invalide"});
+      const xml = await virsh(`dumpxml ${sh(name)}`);
+      // "virsh dumpxml" insère une ligne <mac address='...'/> auto-générée
+      // entre <interface> et <source> (absente du XML qu'on écrit nous-mêmes
+      // à la création) — [\s\S]*? (non-greedy) l'ignore plutôt que de
+      // supposer <source> immédiatement après <interface>, bug découvert en
+      // testant l'édition sur une vraie VM déjà définie.
+      if (!/<interface type='network'>[\s\S]*?<source network='[^']*'/.test(xml)) {
+        return res.status(400).json({error:"Interface réseau non reconnue dans le XML de cette VM — modification manuelle requise"});
+      }
+      const updated = xml.replace(/(<interface type='network'>[\s\S]*?<source network=')[^']*(')/, `$1${network}$2`);
+      const xmlPath = `/tmp/${name}-edit-${Date.now()}.xml`;
+      fs.writeFileSync(xmlPath, updated);
+      await virsh(`define ${sh(xmlPath)}`);
+      fs.rmSync(xmlPath, {force:true});
+    }
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 
 // ── Console VM temps réel (noVNC dans le navigateur, via un pont websockify) ─
 // Chaque VM utilise déjà <graphics type='vnc' port='-1'/> (port assigné par
@@ -2344,13 +2399,14 @@ async function nasIp() {
 app.get("/api/app-shortcuts", auth, (req,res)=> res.json(loadAppShortcuts()));
 
 app.post("/api/app-shortcuts", auth, async(req,res)=>{
-  const { name, ip, port, icon } = req.body;
+  const { name, ip, port, icon, https } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({error:"Nom requis"});
   const safePort = parseInt(port,10);
   if (!safePort || safePort<1 || safePort>65535) return res.status(400).json({error:"Port invalide"});
   try {
     const safeIp = (ip && String(ip).trim()) || await nasIp();
-    const entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: `http://${safeIp}:${safePort}`, icon: icon || null };
+    const scheme = https ? "https" : "http";
+    const entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: `${scheme}://${safeIp}:${safePort}`, icon: icon || null };
     const list = loadAppShortcuts();
     list.push(entry);
     saveAppShortcuts(list);
