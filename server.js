@@ -2565,9 +2565,10 @@ async function nasIp() {
 app.get("/api/app-shortcuts", auth, (req,res)=> res.json(loadAppShortcuts()));
 
 app.post("/api/app-shortcuts", auth, async(req,res)=>{
-  const { name, ip, port, icon, https, vmName, url } = req.body;
+  const { id, name, ip, port, icon, https, vmName, dynamic, url } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({error:"Nom requis"});
   try {
+    const baseId = id || crypto.randomBytes(6).toString("hex");
     let entry;
     if (url) {
       // Mode "URL" : l'utilisateur maîtrise tout (chemin, port non
@@ -2575,25 +2576,32 @@ app.post("/api/app-shortcuts", auth, async(req,res)=>{
       let parsed;
       try { parsed = new URL(String(url)); } catch { return res.status(400).json({error:"URL invalide"}); }
       if (!["http:","https:"].includes(parsed.protocol)) return res.status(400).json({error:"Seuls http:// et https:// sont acceptés"});
-      entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: parsed.toString(), icon: icon || null };
+      entry = { id: baseId, name: String(name).trim(), url: parsed.toString(), icon: icon || null };
     } else {
       const safePort = parseInt(port,10);
       if (!safePort || safePort<1 || safePort>65535) return res.status(400).json({error:"Port invalide"});
-      if (vmName) {
+      if (dynamic && vmName) {
         // Mode "dynamique" pour une VM : pas d'IP figée à la création
         // (attribuée par DHCP, peut changer d'un démarrage à l'autre) — le
         // frontend résout l'IP réelle via GET /api/vms/:n/ip au moment du
         // clic. port/https/vmName stockés, "url" absent tant que non résolu.
-        entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), vmName: String(vmName), port: safePort, https: !!https, icon: icon || null };
+        entry = { id: baseId, name: String(name).trim(), vmName: String(vmName), dynamic: true, port: safePort, https: !!https, icon: icon || null };
       } else {
         // Mode "IP manuelle"
         const scheme = https ? "https" : "http";
         const safeIp = (ip && String(ip).trim()) || await nasIp();
-        entry = { id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), url: `${scheme}://${safeIp}:${safePort}`, icon: icon || null };
+        entry = { id: baseId, name: String(name).trim(), url: `${scheme}://${safeIp}:${safePort}`, icon: icon || null };
       }
     }
+    // "vmName" sert aussi de simple étiquette de provenance (même hors mode
+    // dynamique) pour que l'assistant d'édition d'une VM puisse retrouver le
+    // raccourci déjà créé pour elle, peu importe le mode choisi — sans ça,
+    // rouvrir l'édition et cocher la case à nouveau créait un doublon à
+    // chaque fois (signalé par un utilisateur réel).
+    if (vmName && !entry.vmName) entry.vmName = String(vmName);
     const list = loadAppShortcuts();
-    list.push(entry);
+    const idx = list.findIndex(s => s.id === baseId);
+    if (idx !== -1) list[idx] = entry; else list.push(entry);
     saveAppShortcuts(list);
     res.json({ok:true, shortcut:entry});
   } catch(e){ res.status(500).json({error:e.message}); }
