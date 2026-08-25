@@ -2319,6 +2319,35 @@ app.get("/api/containers/:id/logs", auth, async(req,res)=>{
   try { const {stdout} = await execAsync(`docker logs --tail 300 ${sh(req.params.id)} 2>&1`); res.type("text/plain").send(stdout); }
   catch(e){ res.status(500).json({error:e.message}); }
 });
+// Détail complet d'un conteneur — onglets "Général" (infos) et
+// "Configuration" (formulaire pré-rempli, éditable seulement si le
+// conteneur n'appartient à aucun stack et est arrêté) du détail conteneur.
+app.get("/api/containers/:id/inspect", auth, async(req,res)=>{
+  if(!docker) return res.status(500).json({error:"Docker indisponible"});
+  try {
+    const c = docker.getContainer(req.params.id);
+    const d = await c.inspect();
+    const portBindings = d.HostConfig?.PortBindings || {};
+    const ports = Object.entries(portBindings).flatMap(([containerPort, bindings]) =>
+      (bindings || []).map(b => ({ host: b.HostPort, container: containerPort.split("/")[0], proto: containerPort.split("/")[1] || "tcp" })));
+    const volumes = (d.Mounts || []).filter(m => m.Type === "bind").map(m => ({ host: m.Source, container: m.Destination, ro: !m.RW }));
+    const env = (d.Config?.Env || []).map(e => { const i = e.indexOf("="); return { key: e.slice(0,i), value: e.slice(i+1) }; });
+    res.json({
+      id: d.Id.slice(0,12),
+      name: d.Name.replace(/^\//,""),
+      image: d.Config?.Image,
+      state: d.State?.Status,
+      created: d.Created,
+      startedAt: d.State?.StartedAt,
+      restartPolicy: d.HostConfig?.RestartPolicy?.Name || "no",
+      restartCount: d.RestartCount,
+      network: Object.keys(d.NetworkSettings?.Networks || {})[0] || null,
+      command: (d.Config?.Cmd || []).join(" "),
+      composeProject: d.Config?.Labels?.["com.docker.compose.project"] || null,
+      ports, volumes, env,
+    });
+  } catch(e){ res.status(404).json({error:"Conteneur introuvable"}); }
+});
 
 // Créer un conteneur (wizard) — image + nom + ports + volumes + env + politique de redémarrage
 // Vérifie si un port hôte est déjà occupé (autre conteneur, ou tout autre
@@ -2439,6 +2468,41 @@ app.post("/api/docker/compose/:name/down", auth, (req,res)=>{
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
+async function stackHasRunningContainer(name) {
+  if (!docker) return false;
+  const cs = await docker.listContainers({all:true}).catch(()=>[]);
+  return cs.some(c => c.Labels?.["com.docker.compose.project"] === name && c.State === "running");
+}
+// Édition du docker-compose.yml d'un projet — seulement autorisée à l'arrêt
+// (demande explicite de l'utilisateur, onglet "Configuration" du détail
+// projet) : modifier le fichier d'un projet en cours d'exécution le
+// désynchroniserait de ce qui tourne réellement tant que "up -d" n'est pas
+// relancé, ce qui prêterait à confusion dans l'UI.
+app.put("/api/docker/compose/:name", auth, async(req,res)=>{
+  const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
+  const { content } = req.body;
+  if(!content || !content.trim()) return res.status(400).json({error:"Contenu docker-compose.yml requis"});
+  try {
+    const dir = path.join(COMPOSE_DIR, name);
+    const file = path.join(dir, "docker-compose.yml");
+    if(!fs.existsSync(file)) return res.status(404).json({error:"Stack introuvable"});
+    if(await stackHasRunningContainer(name)) return res.status(409).json({error:"Arrêtez le projet avant de modifier sa configuration"});
+    fs.writeFileSync(file, content);
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+// Journal d'un projet — logs agrégés de tous ses services (pas seulement
+// ceux du dernier démarrage) : plus utile au quotidien que le seul log de
+// création, et disponible même après un redémarrage du backend (les jobs
+// en mémoire ne survivent pas à un restart).
+app.get("/api/docker/compose/:name/logs", auth, async(req,res)=>{
+  try {
+    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+    const {stdout} = await execAsync(`cd ${sh(dir)} && ${composeCmd()} logs --no-color --tail 300 2>&1`);
+    res.type("text/plain").send(stdout);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  MAGASIN — catalogue d'apps converties depuis umbrel-apps (voir
@@ -2475,6 +2539,14 @@ function writeEnvFile(dir, values) {
   if (lines.length) fs.writeFileSync(path.join(dir, ".env"), lines.join("\n") + "\n");
 }
 
+// Chemin par défaut où umbrel-apps range les données persistantes d'une app
+// une fois converti côté GravityOS (voir convert.js, remapPaths) — sert de
+// préfixe reconnu pour permettre à l'utilisateur de rediriger ces
+// bind-mounts vers un autre volume/dossier au moment de l'installation
+// (case "dossier des données" du wizard) sans avoir à réécrire tout le YAML.
+function defaultAppDataDir(id) { return `/srv/volumes/volume1/AppData/${id}`; }
+function appUsesPersistentData(app_) { return app_.composeYaml.includes(`/srv/volumes/volume1/AppData/${app_.id}`); }
+
 app.get("/api/store/apps", auth, (req,res)=>{
   try {
     const catalog = loadStoreCatalog();
@@ -2482,6 +2554,7 @@ app.get("/api/store/apps", auth, (req,res)=>{
       ...app,
       composeYaml: undefined, // pas besoin côté liste, alourdit la réponse
       installed: fs.existsSync(path.join(storeDir(app.id), "docker-compose.yml")),
+      hasPersistentData: appUsesPersistentData(app),
     })));
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2490,10 +2563,25 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
   const app_ = loadStoreCatalog().find(a => a.id === id);
   if (!app_) return res.status(404).json({error:"Application introuvable dans le catalogue"});
+  // Case "Créer un raccourci" décochée par défaut (même logique que pour une
+  // VM ou un conteneur créé à la main — demande explicite de l'utilisateur,
+  // qui ne veut plus qu'une icône soit imposée en fin d'installation).
+  const createShortcut = req.body?.createShortcut === true;
+  // Dossier de données alternatif choisi dans le wizard (ex: un autre volume
+  // que volume1) — doit rester sous /srv/volumes/ pour éviter d'écrire n'importe
+  // où sur le système via ce champ.
+  let dataDir = defaultAppDataDir(id);
+  if (req.body?.dataDir && typeof req.body.dataDir === "string") {
+    const candidate = path.normalize(req.body.dataDir);
+    if (candidate.startsWith("/srv/volumes/")) dataDir = candidate;
+  }
   try {
     const dir = storeDir(id);
     fs.mkdirSync(dir, {recursive:true});
-    fs.writeFileSync(path.join(dir, "docker-compose.yml"), app_.composeYaml);
+    const composeYaml = dataDir === defaultAppDataDir(id)
+      ? app_.composeYaml
+      : app_.composeYaml.split(defaultAppDataDir(id)).join(dataDir);
+    fs.writeFileSync(path.join(dir, "docker-compose.yml"), composeYaml);
     // Beaucoup d'apps du catalogue (héritées d'umbrel-apps) font tourner un
     // service avec "user: 1000:1000" sur un volume bind-mount sous
     // AppData/<id>/... (convention umbrelOS) — si ce sous-dossier précis
@@ -2511,9 +2599,9 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
     // uid 1000 = premier compte NAS créé (convention Debian/GravityOS, cf.
     // `useradd` dans build-iso.sh), cohérent avec l'hypothèse uid 1000 des
     // apps umbrel.
-    const bindMountPaths = [...app_.composeYaml.matchAll(/^\s*-\s+(\/srv\/volumes\/\S+?):/gm)].map(m => m[1]);
+    const bindMountPaths = [...composeYaml.matchAll(/^\s*-\s+(\/srv\/volumes\/\S+?):/gm)].map(m => m[1]);
     for (const p of bindMountPaths) fs.mkdirSync(p, {recursive:true});
-    await execAsync(`chown -R 1000:1000 ${sh(`/srv/volumes/volume1/AppData/${id}`)}`).catch(()=>{});
+    await execAsync(`chown -R 1000:1000 ${sh(dataDir)}`).catch(()=>{});
     const generated = generateSecrets(app_.secretVars);
     if (app_.urlVars?.length) {
       const ip = await nasIp();
@@ -2524,7 +2612,7 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
       fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ password: generated.APP_PASSWORD }));
     }
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d 2>&1`, async (ok) => {
-      if (!ok || !app_.hostPorts?.[0]) return;
+      if (!ok || !createShortcut || !app_.hostPorts?.[0]) return;
       const ip = await nasIp();
       const list = loadAppShortcuts();
       if (!list.some(s => s.storeAppId === id)) {
@@ -2547,10 +2635,26 @@ app.get("/api/store/apps/:id/credentials", auth, (req,res)=>{
 app.post("/api/store/apps/:id/uninstall", auth, async(req,res)=>{
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
   const dir = storeDir(id);
-  if (!fs.existsSync(path.join(dir, "docker-compose.yml"))) return res.status(404).json({error:"Application non installée"});
+  const composeFile = path.join(dir, "docker-compose.yml");
+  if (!fs.existsSync(composeFile)) return res.status(404).json({error:"Application non installée"});
   try {
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -rf ${sh(dir)}`, (ok) => {
-      if (ok) saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== id));
+    // Images utilisées par CETTE app, capturées avant "down" (le fichier
+    // compose disparaît avec "rm -rf dir" une fois la désinstallation faite).
+    const images = [...fs.readFileSync(composeFile, "utf8").matchAll(/^\s*image:\s*(\S+)\s*$/gm)].map(m => m[1]);
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -rf ${sh(dir)}`, async (ok) => {
+      if (!ok) return;
+      saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== id));
+      // Une image encore utilisée ailleurs (autre app du Magasin partageant
+      // la même image de base, conteneur créé à la main...) ne doit pas être
+      // supprimée — seulement celles devenues orphelines après ce "down".
+      if (!docker || !images.length) return;
+      try {
+        const remaining = await docker.listContainers({all:true});
+        for (const image of images) {
+          const stillUsed = remaining.some(c => c.Image === image);
+          if (!stillUsed) await docker.getImage(image).remove({force:true}).catch(()=>{});
+        }
+      } catch {}
     });
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
