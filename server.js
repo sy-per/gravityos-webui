@@ -3175,6 +3175,160 @@ app.post("/api/settings/import-config", auth, (req,res)=>{
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  PLANIFICATION — tâches génériques (commande shell ou script) exécutées sur
+//  un horaire, façon "Planificateur des tâches" Synology. Système volontairement
+//  séparé des tâches de sauvegarde ci-dessus (modèle différent : ici une simple
+//  commande, pas de destination/scope/rétention) — demande explicite de
+//  l'utilisateur pour un onglet Réglages dédié, indépendant de l'app Sauvegarde.
+// ══════════════════════════════════════════════════════════════════════════════
+const SCHEDULED_TASKS_FILE = `${CFG}/scheduled-tasks.json`;
+function loadScheduledTasks(){ try{ return JSON.parse(fs.readFileSync(SCHEDULED_TASKS_FILE,"utf8")); } catch { return []; } }
+function saveScheduledTasks(t){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(SCHEDULED_TASKS_FILE, JSON.stringify(t,null,2)); }
+
+// Calcule la prochaine exécution. Contrairement aux tâches de sauvegarde
+// (INTERVAL_MS relatif au dernier lancement, l'heure choisie n'étant en
+// réalité jamais utilisée pour le calcul), ici l'heure configurée compte
+// vraiment — cohérent avec le vrai Planificateur des tâches Synology pris en
+// référence par l'utilisateur (ex: "tous les jours à 2h", pas "toutes les 24h
+// depuis le dernier lancement").
+function nextScheduledRun(t){
+  if (t.enabled === false) return null;
+  const now = new Date();
+  if (t.scheduleInterval === "Personnalisé") {
+    const base = t.lastRun ? new Date(t.lastRun) : new Date(t.createdAt || now);
+    return new Date(base.getTime() + Math.max(1, parseInt(t.intervalMinutes,10)||60) * 60000);
+  }
+  const [h,m] = /^\d{2}:\d{2}$/.test(t.scheduleTime) ? t.scheduleTime.split(":").map(Number) : [2,0];
+  const candidate = new Date(now);
+  candidate.setSeconds(0,0);
+  candidate.setHours(h,m,0,0);
+  if (t.scheduleInterval === "Hebdomadaire") {
+    const targetDay = Number.isInteger(t.weekday) ? t.weekday : 0;
+    const diff = (targetDay - candidate.getDay() + 7) % 7;
+    candidate.setDate(candidate.getDate() + diff);
+    if (candidate <= now) candidate.setDate(candidate.getDate() + 7);
+  } else if (t.scheduleInterval === "Mensuel") {
+    const targetDay = Math.min(Math.max(parseInt(t.dayOfMonth,10)||1,1), 28);
+    candidate.setDate(targetDay);
+    if (candidate <= now) { candidate.setMonth(candidate.getMonth()+1); candidate.setDate(targetDay); }
+  } else if (candidate <= now) {
+    candidate.setDate(candidate.getDate() + 1); // Quotidien
+  }
+  return candidate;
+}
+function scheduledTaskIsDue(t){
+  if (t.enabled === false || t.status === "running") return false;
+  const next = nextScheduledRun(t);
+  return !!next && next.getTime() <= Date.now();
+}
+function scheduledTaskView(t){
+  return {
+    id: t.id, name: t.name, enabled: t.enabled !== false, status: t.status || "idle",
+    kind: t.kind, command: t.kind === "command" ? t.command : undefined, scriptPath: t.kind === "script" ? t.scriptPath : undefined,
+    scheduleInterval: t.scheduleInterval, scheduleTime: t.scheduleTime, weekday: t.weekday, dayOfMonth: t.dayOfMonth, intervalMinutes: t.intervalMinutes,
+    lastRun: t.lastRun || null, lastOk: t.lastOk ?? null,
+    nextRun: nextScheduledRun(t)?.toISOString() || null,
+    history: (t.history||[]).slice().reverse().map(h => ({ date:h.date, ok:h.ok, durationMs:h.durationMs })),
+    lastLog: (t.history && t.history.length) ? t.history[t.history.length-1].log : "",
+  };
+}
+function startScheduledTaskRun(taskId){
+  const tasks = loadScheduledTasks();
+  const t = tasks.find(x=>x.id===taskId);
+  if (!t || t.status === "running") return;
+  t.status = "running";
+  saveScheduledTasks(tasks);
+  const startedAt = Date.now();
+  const cmd = t.kind === "script" ? `bash ${sh(t.scriptPath)} 2>&1` : `bash -lc ${sh(t.command)} 2>&1`;
+  runJob(cmd, (ok, log) => {
+    const tasks2 = loadScheduledTasks();
+    const t2 = tasks2.find(x=>x.id===taskId);
+    if (!t2) return;
+    t2.status = "idle";
+    t2.lastRun = new Date().toISOString();
+    t2.lastOk = ok;
+    t2.history = [...(t2.history||[]), { date:t2.lastRun, ok, durationMs: Date.now()-startedAt, log: log.slice(-8000) }].slice(-20);
+    saveScheduledTasks(tasks2);
+  });
+}
+// Vérifie toutes les minutes si une tâche planifiée est due (même mécanisme
+// "cron léger" que les tâches de sauvegarde ci-dessus)
+setInterval(() => {
+  for (const t of loadScheduledTasks()) if (scheduledTaskIsDue(t)) startScheduledTaskRun(t.id);
+}, 60000);
+
+function validateScheduledTaskPayload(body){
+  const { name, kind, command, scriptPath, scheduleInterval, scheduleTime, weekday, dayOfMonth, intervalMinutes } = body;
+  if (!name || !String(name).trim()) throw new Error("Nom requis");
+  if (!["command","script"].includes(kind)) throw new Error("Type invalide");
+  if (kind === "command" && (!command || !String(command).trim())) throw new Error("Commande requise");
+  if (kind === "script") {
+    if (!scriptPath || !String(scriptPath).trim()) throw new Error("Chemin du script requis");
+    if (!isPathAllowed(scriptPath)) throw new Error("Chemin non autorisé");
+  }
+  if (!["Quotidien","Hebdomadaire","Mensuel","Personnalisé"].includes(scheduleInterval)) throw new Error("Fréquence invalide");
+  if (scheduleInterval !== "Personnalisé" && !/^\d{2}:\d{2}$/.test(scheduleTime)) throw new Error("Heure invalide (HH:MM)");
+  if (scheduleInterval === "Hebdomadaire" && !(Number.isInteger(weekday) && weekday>=0 && weekday<=6)) throw new Error("Jour de la semaine invalide");
+  if (scheduleInterval === "Mensuel" && !(Number.isInteger(dayOfMonth) && dayOfMonth>=1 && dayOfMonth<=28)) throw new Error("Jour du mois invalide (1-28)");
+  if (scheduleInterval === "Personnalisé" && !(parseInt(intervalMinutes,10) >= 1)) throw new Error("Intervalle (minutes) invalide");
+}
+
+app.get("/api/scheduled-tasks", auth, (req,res) => res.json(loadScheduledTasks().map(scheduledTaskView)));
+app.post("/api/scheduled-tasks", auth, (req,res) => {
+  try { validateScheduledTaskPayload(req.body); } catch(e){ return res.status(400).json({error:e.message}); }
+  const { name, kind, command, scriptPath, scheduleInterval, scheduleTime, weekday, dayOfMonth, intervalMinutes } = req.body;
+  const tasks = loadScheduledTasks();
+  tasks.push({
+    id: crypto.randomBytes(6).toString("hex"), name: String(name).trim(), kind,
+    command: kind === "command" ? command : undefined,
+    scriptPath: kind === "script" ? scriptPath : undefined,
+    scheduleInterval, scheduleTime: scheduleTime || "02:00",
+    weekday: scheduleInterval === "Hebdomadaire" ? weekday : undefined,
+    dayOfMonth: scheduleInterval === "Mensuel" ? dayOfMonth : undefined,
+    intervalMinutes: scheduleInterval === "Personnalisé" ? parseInt(intervalMinutes,10) : undefined,
+    enabled: true, status: "idle", lastRun: null, lastOk: null, history: [],
+    createdAt: new Date().toISOString(),
+  });
+  saveScheduledTasks(tasks);
+  res.json({ok:true});
+});
+app.put("/api/scheduled-tasks/:id", auth, (req,res) => {
+  const tasks = loadScheduledTasks();
+  const t = tasks.find(x=>x.id===req.params.id);
+  if (!t) return res.status(404).json({error:"Tâche introuvable"});
+  if (t.status === "running") return res.status(409).json({error:"Impossible de modifier une tâche en cours d'exécution"});
+  try { validateScheduledTaskPayload(req.body); } catch(e){ return res.status(400).json({error:e.message}); }
+  const { name, kind, command, scriptPath, scheduleInterval, scheduleTime, weekday, dayOfMonth, intervalMinutes } = req.body;
+  Object.assign(t, {
+    name: String(name).trim(), kind,
+    command: kind === "command" ? command : undefined,
+    scriptPath: kind === "script" ? scriptPath : undefined,
+    scheduleInterval, scheduleTime: scheduleTime || "02:00",
+    weekday: scheduleInterval === "Hebdomadaire" ? weekday : undefined,
+    dayOfMonth: scheduleInterval === "Mensuel" ? dayOfMonth : undefined,
+    intervalMinutes: scheduleInterval === "Personnalisé" ? parseInt(intervalMinutes,10) : undefined,
+  });
+  saveScheduledTasks(tasks);
+  res.json({ok:true});
+});
+app.post("/api/scheduled-tasks/:id/enabled", auth, (req,res) => {
+  const tasks = loadScheduledTasks();
+  const t = tasks.find(x=>x.id===req.params.id);
+  if (!t) return res.status(404).json({error:"Tâche introuvable"});
+  t.enabled = !!req.body.enabled;
+  saveScheduledTasks(tasks);
+  res.json({ok:true});
+});
+app.post("/api/scheduled-tasks/:id/run", auth, (req,res) => {
+  const t = loadScheduledTasks().find(x=>x.id===req.params.id);
+  if (!t) return res.status(404).json({error:"Tâche introuvable"});
+  if (t.status === "running") return res.status(409).json({error:"Cette tâche est déjà en cours"});
+  startScheduledTaskRun(t.id);
+  res.json({ok:true});
+});
+app.delete("/api/scheduled-tasks/:id", auth, (req,res) => { saveScheduledTasks(loadScheduledTasks().filter(t=>t.id!==req.params.id)); res.json({ok:true}); });
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  RÔLES — deux rôles intégrés (Administrateur/Utilisateur, dérivés du groupe
 //  réel "sudo") + rôles personnalisés stockés, avec pour chacun une liste de
 //  volumes visibles et d'applications accessibles. Purement une couche de
