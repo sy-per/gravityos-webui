@@ -2260,7 +2260,25 @@ function composeCmd() {
   catch { COMPOSE_CMD = "docker-compose"; }
   return COMPOSE_CMD;
 }
-const COMPOSE_DIR = "/srv/docker/compose";
+// Sous Volume 1 (et non plus /srv/docker/compose, un dossier hors des volumes
+// donc invisible/inaccessible depuis l'app Fichiers) — demande explicite de
+// l'utilisateur, notamment pour retrouver facilement le docker-compose.yml et
+// les données persistantes d'une app du Magasin (ex: /srv/volumes/volume1/
+// Docker/store-romm). S'applique à TOUS les projets Compose, pas seulement
+// ceux du Magasin (mêmes stacks listées dans l'onglet "Projets" de l'app
+// Docker) — cohérence : un seul et même dossier de stockage pour tous.
+const COMPOSE_DIR = path.join(volume1Path(), "Docker");
+// Migration one-shot : une installation existante peut avoir ses stacks sous
+// l'ancien chemin — on les déplace plutôt que de les rendre invisibles.
+(function migrateComposeDir(){
+  const legacy = "/srv/docker/compose";
+  try {
+    if (fs.existsSync(legacy) && !fs.existsSync(COMPOSE_DIR)) {
+      fs.mkdirSync(path.dirname(COMPOSE_DIR), {recursive:true});
+      fs.renameSync(legacy, COMPOSE_DIR);
+    }
+  } catch (e) { console.error("Migration COMPOSE_DIR échouée:", e.message); }
+})();
 
 // ── Conteneurs ──────────────────────────────────────────────────────────────
 app.get("/api/containers", auth, async(req,res)=>{
@@ -2539,13 +2557,18 @@ function writeEnvFile(dir, values) {
   if (lines.length) fs.writeFileSync(path.join(dir, ".env"), lines.join("\n") + "\n");
 }
 
-// Chemin par défaut où umbrel-apps range les données persistantes d'une app
-// une fois converti côté GravityOS (voir convert.js, remapPaths) — sert de
-// préfixe reconnu pour permettre à l'utilisateur de rediriger ces
-// bind-mounts vers un autre volume/dossier au moment de l'installation
-// (case "dossier des données" du wizard) sans avoir à réécrire tout le YAML.
-function defaultAppDataDir(id) { return `/srv/volumes/volume1/AppData/${id}`; }
-function appUsesPersistentData(app_) { return app_.composeYaml.includes(`/srv/volumes/volume1/AppData/${app_.id}`); }
+// Préfixe figé dans composeYaml par convert.js (voir remapPaths) au moment de
+// la conversion du catalogue umbrel-apps — sert à repérer/remplacer les
+// bind-mounts de données persistantes, quel que soit le dossier réellement
+// choisi à l'installation (catalogue partagé par toutes les installations,
+// donc ce préfixe ne peut pas être changé rétroactivement dans le catalogue
+// lui-même). Le dossier proposé par défaut au wizard, lui, est
+// storeDir(id) — même dossier que le docker-compose.yml (demande explicite
+// de l'utilisateur : un seul dossier par app sous Volume 1, pas un dossier
+// "AppData" séparé et surtout pas /srv/docker/compose, invisible depuis
+// l'app Fichiers).
+function catalogAppDataPrefix(id) { return `/srv/volumes/volume1/AppData/${id}`; }
+function appUsesPersistentData(app_) { return app_.composeYaml.includes(catalogAppDataPrefix(app_.id)); }
 
 app.get("/api/store/apps", auth, (req,res)=>{
   try {
@@ -2563,24 +2586,22 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
   const app_ = loadStoreCatalog().find(a => a.id === id);
   if (!app_) return res.status(404).json({error:"Application introuvable dans le catalogue"});
-  // Case "Créer un raccourci" décochée par défaut (même logique que pour une
-  // VM ou un conteneur créé à la main — demande explicite de l'utilisateur,
-  // qui ne veut plus qu'une icône soit imposée en fin d'installation).
-  const createShortcut = req.body?.createShortcut === true;
+  // Case "Créer un raccourci" cochée par défaut (demande explicite de
+  // l'utilisateur — la case reste décochable pour ne pas en créer).
+  const createShortcut = req.body?.createShortcut !== false;
   // Dossier de données alternatif choisi dans le wizard (ex: un autre volume
   // que volume1) — doit rester sous /srv/volumes/ pour éviter d'écrire n'importe
-  // où sur le système via ce champ.
-  let dataDir = defaultAppDataDir(id);
+  // où sur le système via ce champ. Par défaut : même dossier que le
+  // docker-compose.yml (storeDir), pas un "AppData" séparé.
+  const dir = storeDir(id);
+  let dataDir = dir;
   if (req.body?.dataDir && typeof req.body.dataDir === "string") {
     const candidate = path.normalize(req.body.dataDir);
     if (candidate.startsWith("/srv/volumes/")) dataDir = candidate;
   }
   try {
-    const dir = storeDir(id);
     fs.mkdirSync(dir, {recursive:true});
-    const composeYaml = dataDir === defaultAppDataDir(id)
-      ? app_.composeYaml
-      : app_.composeYaml.split(defaultAppDataDir(id)).join(dataDir);
+    const composeYaml = app_.composeYaml.split(catalogAppDataPrefix(id)).join(dataDir);
     fs.writeFileSync(path.join(dir, "docker-compose.yml"), composeYaml);
     // Beaucoup d'apps du catalogue (héritées d'umbrel-apps) font tourner un
     // service avec "user: 1000:1000" sur un volume bind-mount sous
