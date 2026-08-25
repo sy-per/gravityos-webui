@@ -3302,6 +3302,7 @@ function scheduledTaskIsDue(t){
 function scheduledTaskView(t){
   return {
     id: t.id, name: t.name, enabled: t.enabled !== false, status: t.status || "idle",
+    builtin: !!t.builtin, builtinType: t.builtinType,
     kind: t.kind, command: t.kind === "command" ? t.command : undefined, scriptPath: t.kind === "script" ? t.scriptPath : undefined,
     scheduleInterval: t.scheduleInterval, scheduleTime: t.scheduleTime, weekday: t.weekday, dayOfMonth: t.dayOfMonth, intervalMinutes: t.intervalMinutes,
     lastRun: t.lastRun || null, lastOk: t.lastOk ?? null,
@@ -3310,6 +3311,57 @@ function scheduledTaskView(t){
     lastLog: (t.history && t.history.length) ? t.history[t.history.length-1].log : "",
   };
 }
+
+// Vérifie (et télécharge si une nouvelle version existe) les images Docker
+// actuellement utilisées par un conteneur — même principe qu'un Watchtower :
+// "docker pull" ne perturbe pas un conteneur déjà démarré, seul un
+// redémarrage/recréation applique l'image mise à jour (volontairement pas
+// fait ici, demande explicite = "vérifier", pas "appliquer").
+async function checkDockerImageUpdates() {
+  if (!docker) return { count: 0, images: [], log: "Docker indisponible" };
+  const containers = await docker.listContainers({all:true}).catch(()=>[]);
+  const images = [...new Set(containers.map(c => c.Image))];
+  const updated = [];
+  const lines = [];
+  for (const image of images) {
+    try {
+      const before = await docker.getImage(image).inspect().catch(() => null);
+      await execAsync(`docker pull ${sh(image)} 2>&1`);
+      const after = await docker.getImage(image).inspect().catch(() => null);
+      if (before?.Id && after?.Id && before.Id !== after.Id) {
+        updated.push(image);
+        lines.push(`${image} : mise à jour disponible et téléchargée`);
+      } else {
+        lines.push(`${image} : à jour`);
+      }
+    } catch (e) {
+      lines.push(`${image} : erreur (${e.message})`);
+    }
+  }
+  return { count: updated.length, images: updated, log: lines.join("\n") };
+}
+
+// Dispatche l'action réelle d'une tâche système (pas de commande/script
+// utilisateur — voir la case "Système" du Planificateur). Chaque branche
+// retourne {ok, log} comme runJob/runUpdateProcess pour rester compatible
+// avec startScheduledTaskRun ci-dessous.
+async function runBuiltinTask(t) {
+  if (t.builtinType === "auto-update") {
+    const sys = await runUpdateProcess(systemUpdateCmd());
+    const grav = await runUpdateProcess(gravityUpdateCmd());
+    return { ok: sys.ok && grav.ok, log: `${sys.log}\n\n${grav.log}` };
+  }
+  if (t.builtinType === "check-os-updates") {
+    const r = await checkOsUpdatesCore();
+    return { ok: true, log: r.count > 0 ? `${r.count} mise(s) à jour disponible(s) :\n${r.packages.join("\n")}` : "Système à jour." };
+  }
+  if (t.builtinType === "check-docker-updates") {
+    const r = await checkDockerImageUpdates();
+    return { ok: true, log: (r.count > 0 ? `${r.count} image(s) mise(s) à jour :\n${r.images.join("\n")}\n\n` : "Toutes les images sont à jour.\n\n") + r.log };
+  }
+  return { ok: false, log: "Type de tâche système inconnu : " + t.builtinType };
+}
+
 function startScheduledTaskRun(taskId){
   const tasks = loadScheduledTasks();
   const t = tasks.find(x=>x.id===taskId);
@@ -3317,8 +3369,7 @@ function startScheduledTaskRun(taskId){
   t.status = "running";
   saveScheduledTasks(tasks);
   const startedAt = Date.now();
-  const cmd = t.kind === "script" ? `bash ${sh(t.scriptPath)} 2>&1` : `bash -lc ${sh(t.command)} 2>&1`;
-  runJob(cmd, (ok, log) => {
+  const finish = (ok, log) => {
     const tasks2 = loadScheduledTasks();
     const t2 = tasks2.find(x=>x.id===taskId);
     if (!t2) return;
@@ -3327,7 +3378,13 @@ function startScheduledTaskRun(taskId){
     t2.lastOk = ok;
     t2.history = [...(t2.history||[]), { date:t2.lastRun, ok, durationMs: Date.now()-startedAt, log: log.slice(-8000) }].slice(-20);
     saveScheduledTasks(tasks2);
-  });
+  };
+  if (t.kind === "builtin") {
+    runBuiltinTask(t).then(({ok, log}) => finish(ok, log)).catch(e => finish(false, String(e?.message || e)));
+    return;
+  }
+  const cmd = t.kind === "script" ? `bash ${sh(t.scriptPath)} 2>&1` : `bash -lc ${sh(t.command)} 2>&1`;
+  runJob(cmd, finish);
 }
 // Vérifie toutes les minutes si une tâche planifiée est due (même mécanisme
 // "cron léger" que les tâches de sauvegarde ci-dessus)
@@ -3344,6 +3401,18 @@ function validateScheduledTaskPayload(body){
     if (!scriptPath || !String(scriptPath).trim()) throw new Error("Chemin du script requis");
     if (!isPathAllowed(scriptPath)) throw new Error("Chemin non autorisé");
   }
+  if (!["Quotidien","Hebdomadaire","Mensuel","Personnalisé"].includes(scheduleInterval)) throw new Error("Fréquence invalide");
+  if (scheduleInterval !== "Personnalisé" && !/^\d{2}:\d{2}$/.test(scheduleTime)) throw new Error("Heure invalide (HH:MM)");
+  if (scheduleInterval === "Hebdomadaire" && !(Number.isInteger(weekday) && weekday>=0 && weekday<=6)) throw new Error("Jour de la semaine invalide");
+  if (scheduleInterval === "Mensuel" && !(Number.isInteger(dayOfMonth) && dayOfMonth>=1 && dayOfMonth<=28)) throw new Error("Jour du mois invalide (1-28)");
+  if (scheduleInterval === "Personnalisé" && !(parseInt(intervalMinutes,10) >= 1)) throw new Error("Intervalle (minutes) invalide");
+}
+// Sous-ensemble de validateScheduledTaskPayload pour une tâche système
+// (onglet "Système" du Planificateur) : ni commande/script ni suppression
+// possibles pour ces tâches intégrées — seules la fréquence et l'activation
+// sont modifiables (demande explicite de l'utilisateur).
+function validateScheduleFields(body){
+  const { scheduleInterval, scheduleTime, weekday, dayOfMonth, intervalMinutes } = body;
   if (!["Quotidien","Hebdomadaire","Mensuel","Personnalisé"].includes(scheduleInterval)) throw new Error("Fréquence invalide");
   if (scheduleInterval !== "Personnalisé" && !/^\d{2}:\d{2}$/.test(scheduleTime)) throw new Error("Heure invalide (HH:MM)");
   if (scheduleInterval === "Hebdomadaire" && !(Number.isInteger(weekday) && weekday>=0 && weekday<=6)) throw new Error("Jour de la semaine invalide");
@@ -3375,8 +3444,23 @@ app.put("/api/scheduled-tasks/:id", auth, (req,res) => {
   const t = tasks.find(x=>x.id===req.params.id);
   if (!t) return res.status(404).json({error:"Tâche introuvable"});
   if (t.status === "running") return res.status(409).json({error:"Impossible de modifier une tâche en cours d'exécution"});
+  const { scheduleInterval, scheduleTime, weekday, dayOfMonth, intervalMinutes } = req.body;
+  if (t.builtin) {
+    // Tâche système : ni type/commande/script ni nom modifiables, seule la
+    // fréquence compte — payload volontairement plus restreint que pour une
+    // tâche utilisateur.
+    try { validateScheduleFields(req.body); } catch(e){ return res.status(400).json({error:e.message}); }
+    Object.assign(t, {
+      scheduleInterval, scheduleTime: scheduleTime || "02:00",
+      weekday: scheduleInterval === "Hebdomadaire" ? weekday : undefined,
+      dayOfMonth: scheduleInterval === "Mensuel" ? dayOfMonth : undefined,
+      intervalMinutes: scheduleInterval === "Personnalisé" ? parseInt(intervalMinutes,10) : undefined,
+    });
+    saveScheduledTasks(tasks);
+    return res.json({ok:true});
+  }
   try { validateScheduledTaskPayload(req.body); } catch(e){ return res.status(400).json({error:e.message}); }
-  const { name, kind, command, scriptPath, scheduleInterval, scheduleTime, weekday, dayOfMonth, intervalMinutes } = req.body;
+  const { name, kind, command, scriptPath } = req.body;
   Object.assign(t, {
     name: String(name).trim(), kind,
     command: kind === "command" ? command : undefined,
@@ -3404,7 +3488,40 @@ app.post("/api/scheduled-tasks/:id/run", auth, (req,res) => {
   startScheduledTaskRun(t.id);
   res.json({ok:true});
 });
-app.delete("/api/scheduled-tasks/:id", auth, (req,res) => { saveScheduledTasks(loadScheduledTasks().filter(t=>t.id!==req.params.id)); res.json({ok:true}); });
+app.delete("/api/scheduled-tasks/:id", auth, (req,res) => {
+  const tasks = loadScheduledTasks();
+  const t = tasks.find(x=>x.id===req.params.id);
+  if (!t) return res.status(404).json({error:"Tâche introuvable"});
+  if (t.builtin) return res.status(403).json({error:"Cette tâche système ne peut pas être supprimée — désactivez-la plutôt"});
+  saveScheduledTasks(tasks.filter(x=>x.id!==req.params.id));
+  res.json({ok:true});
+});
+
+// Tâches système par défaut, créées une seule fois (si absentes) à chaque
+// démarrage — couvre à la fois l'installation initiale et une mise à niveau
+// depuis une version de GravityOS antérieure à leur ajout (auto-réparant,
+// pas besoin de réinstaller pour les récupérer).
+function seedBuiltinScheduledTasks() {
+  const tasks = loadScheduledTasks();
+  const defaults = [
+    { builtinType: "auto-update", name: "Mise à jour automatique", scheduleInterval: "Hebdomadaire", scheduleTime: "02:00", weekday: 1 },
+    { builtinType: "check-os-updates", name: "Vérification des mises à jour (OS)", scheduleInterval: "Personnalisé", intervalMinutes: 360 },
+    { builtinType: "check-docker-updates", name: "Vérification des mises à jour (Docker)", scheduleInterval: "Quotidien", scheduleTime: "03:00" },
+  ];
+  let changed = false;
+  for (const def of defaults) {
+    if (tasks.some(t => t.builtinType === def.builtinType)) continue;
+    tasks.push({
+      id: crypto.randomBytes(6).toString("hex"), name: def.name, kind: "builtin", builtin: true, builtinType: def.builtinType,
+      scheduleInterval: def.scheduleInterval, scheduleTime: def.scheduleTime, weekday: def.weekday, dayOfMonth: def.dayOfMonth, intervalMinutes: def.intervalMinutes,
+      enabled: true, status: "idle", lastRun: null, lastOk: null, history: [],
+      createdAt: new Date().toISOString(),
+    });
+    changed = true;
+  }
+  if (changed) saveScheduledTasks(tasks);
+}
+seedBuiltinScheduledTasks();
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  RÔLES — deux rôles intégrés (Administrateur/Utilisateur, dérivés du groupe
@@ -3615,37 +3732,50 @@ app.post("/api/users/:username/status", auth, async(req,res)=>{
 let updateLog = [];
 let updateRunning = false;
 
-function streamUpdate(cmd, res) {
-  updateLog = [];
-  updateRunning = true;
-  res.json({ok:true, message:"Mise à jour lancée"});
-  const child = require("child_process").spawn("bash",["-c",cmd],{env:{...process.env,DEBIAN_FRONTEND:"noninteractive",LANG:"C"}});
-  child.stdout.on("data",d=>updateLog.push(d.toString()));
-  child.stderr.on("data",d=>updateLog.push(d.toString()));
-  child.on("close",()=>{ updateRunning=false; updateLog.push("=== DONE ==="); });
+// Séparé de streamUpdate() en deux : ce cœur retourne une Promise résolue à
+// la fin du process, utilisée aussi bien par les endpoints HTTP (fire-and-
+// forget, réponse immédiate) que par la tâche planifiée système "Mise à jour
+// automatique" (qui a besoin d'attendre la fin réelle pour enregistrer un
+// historique correct — voir startScheduledTaskRun/runBuiltinTask plus bas).
+function runUpdateProcess(cmd) {
+  return new Promise((resolve) => {
+    updateLog = [];
+    updateRunning = true;
+    const child = require("child_process").spawn("bash",["-c",cmd],{env:{...process.env,DEBIAN_FRONTEND:"noninteractive",LANG:"C"}});
+    child.stdout.on("data",d=>updateLog.push(d.toString()));
+    child.stderr.on("data",d=>updateLog.push(d.toString()));
+    child.on("close",(code)=>{ updateRunning=false; updateLog.push("=== DONE ==="); resolve({ok: code===0, log: updateLog.join("")}); });
+  });
 }
+function streamUpdate(cmd, res) {
+  runUpdateProcess(cmd);
+  res.json({ok:true, message:"Mise à jour lancée"});
+}
+function systemUpdateCmd() { return "apt-get update -qq && apt-get upgrade -y 2>&1"; }
 
+// Cœur de la vérification des mises à jour système, réutilisé par l'endpoint
+// HTTP et par la tâche planifiée système "Vérification des mises à jour (OS)".
+async function checkOsUpdatesCore() {
+  // LANG=fr_FR.UTF-8 par défaut sur GravityOS (locale de l'ISO) : sans
+  // LC_ALL=C, l'en-tête informatif d'apt ("Listing... Done") s'affiche en
+  // français ("Listage... Fait") et n'est plus filtré par le grep -v
+  // 'Listing' ci-dessous (qui ne matche que l'anglais) — cette ligne
+  // trainait alors dans la liste comme un faux "paquet", comptée dans le
+  // total sans jamais correspondre à une vraie mise à jour installable.
+  await execAsync("LC_ALL=C apt-get update -qq 2>/dev/null");
+  const {stdout} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | wc -l");
+  const {stdout:pkgs} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | head -20");
+  const count = parseInt(stdout.trim()) || 0;
+  return {count, packages: pkgs.trim().split("\n").filter(Boolean)};
+}
 // Vérifier les mises à jour système disponibles
 app.get("/api/updates/system/check", auth, async(req,res) => {
-  try {
-    // LANG=fr_FR.UTF-8 par défaut sur GravityOS (locale de l'ISO) : sans
-    // LC_ALL=C, l'en-tête informatif d'apt ("Listing... Done") s'affiche en
-    // français ("Listage... Fait") et n'est plus filtré par le grep -v
-    // 'Listing' ci-dessous (qui ne matche que l'anglais) — cette ligne
-    // trainait alors dans la liste comme un faux "paquet", comptée dans le
-    // total sans jamais correspondre à une vraie mise à jour installable.
-    await execAsync("LC_ALL=C apt-get update -qq 2>/dev/null");
-    const {stdout} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | wc -l");
-    const {stdout:pkgs} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | head -20");
-    const count = parseInt(stdout.trim()) || 0;
-    res.json({count, packages: pkgs.trim().split("\n").filter(Boolean)});
-  } catch(e){ res.status(500).json({error:e.message}); }
+  try { res.json(await checkOsUpdatesCore()); } catch(e){ res.status(500).json({error:e.message}); }
 });
 
 // Lancer la mise à jour système
 app.post("/api/updates/system/start", auth, (req,res) => {
-  const cmd = "apt-get update -qq && apt-get upgrade -y 2>&1";
-  streamUpdate(cmd, res);
+  streamUpdate(systemUpdateCmd(), res);
 });
 
 // Vérifier les mises à jour GravityOS (via git)
@@ -3666,10 +3796,11 @@ app.get("/api/updates/gravity/check", auth, async(req,res) => {
   } catch(e){ res.json({available:false, message:"Erreur: "+e.message}); }
 });
 
-// Mettre à jour GravityOS via git
-app.post("/api/updates/gravity/start", auth, (req,res) => {
+// Extrait en fonction (au lieu d'inline dans le handler) pour être réutilisé
+// par la tâche planifiée système "Mise à jour automatique".
+function gravityUpdateCmd() {
   const REPO = "https://github.com/sy-per/gravityos-webui.git";
-  const cmd = `
+  return `
     echo "=== GravityOS WebUI Update ==="
     echo "Date: $(date)"
 
@@ -3964,7 +4095,9 @@ TERMCFG
     systemd-run --on-active=3 --unit="gravity-webui-restart-$$-$(date +%s)" --description="Redemarrage differe apres mise a jour" /usr/bin/systemctl restart gravity-webui 2>/dev/null \
       || systemctl restart gravity-webui 2>/dev/null || true
   `;
-  streamUpdate(cmd, res);
+}
+app.post("/api/updates/gravity/start", auth, (req,res) => {
+  streamUpdate(gravityUpdateCmd(), res);
 });
 
 // Lire les logs de mise à jour en cours
