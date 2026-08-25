@@ -2332,6 +2332,12 @@ app.post("/api/containers/:id/stop", auth, async(req,res)=>{
   catch(e){ if(e.statusCode===304) return res.json({ok:true}); res.status(500).json({error:e.message}); }
 });
 app.post("/api/containers/:id/restart", auth, async(req,res)=>{try{await docker.getContainer(req.params.id).restart();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+// "Forcer l'arrêt" — SIGKILL immédiat plutôt que le SIGTERM+délai de grâce de
+// /stop, pour un conteneur qui ne répond plus (demande explicite de l'utilisateur).
+app.post("/api/containers/:id/kill", auth, async(req,res)=>{
+  try{await docker.getContainer(req.params.id).kill();res.json({ok:true});}
+  catch(e){ if(e.statusCode===304 || e.statusCode===409) return res.json({ok:true}); res.status(500).json({error:e.message}); }
+});
 app.delete("/api/containers/:id",       auth, async(req,res)=>{try{await docker.getContainer(req.params.id).remove({force:true});res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.get("/api/containers/:id/logs", auth, async(req,res)=>{
   try { const {stdout} = await execAsync(`docker logs --tail 300 ${sh(req.params.id)} 2>&1`); res.type("text/plain").send(stdout); }
@@ -2491,6 +2497,57 @@ async function stackHasRunningContainer(name) {
   const cs = await docker.listContainers({all:true}).catch(()=>[]);
   return cs.some(c => c.Labels?.["com.docker.compose.project"] === name && c.State === "running");
 }
+// "Forcer l'arrêt" d'un projet — SIGKILL immédiat à tous ses conteneurs
+// (docker compose stop/down envoient un SIGTERM avec délai de grâce).
+app.post("/api/docker/compose/:name/kill", auth, (req,res)=>{
+  try {
+    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} kill 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/docker/compose/:name/restart", auth, (req,res)=>{
+  try {
+    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} restart 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/docker/compose/:name/recreate", auth, (req,res)=>{
+  try {
+    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+// Suppression d'un projet — retire aussi les images devenues orphelines
+// (même logique que la désinstallation d'une app du Magasin) et le
+// raccourci associé s'il en existait un.
+app.delete("/api/docker/compose/:name", auth, async(req,res)=>{
+  const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
+  const dir = path.join(COMPOSE_DIR, name);
+  const composeFile = path.join(dir, "docker-compose.yml");
+  if(!fs.existsSync(composeFile)) return res.status(404).json({error:"Stack introuvable"});
+  try {
+    const images = [...fs.readFileSync(composeFile, "utf8").matchAll(/^\s*image:\s*(\S+)\s*$/gm)].map(m => m[1]);
+    const storeAppId = name.startsWith("store-") ? name.slice(6) : null;
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -rf ${sh(dir)}`, async (ok) => {
+      if (!ok) return;
+      if (storeAppId) saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== storeAppId));
+      if (!docker || !images.length) return;
+      try {
+        const remaining = await docker.listContainers({all:true});
+        for (const image of images) {
+          if (!remaining.some(c => c.Image === image)) await docker.getImage(image).remove({force:true}).catch(()=>{});
+        }
+      } catch {}
+    });
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 // Édition du docker-compose.yml d'un projet — seulement autorisée à l'arrêt
 // (demande explicite de l'utilisateur, onglet "Configuration" du détail
 // projet) : modifier le fichier d'un projet en cours d'exécution le
