@@ -2855,7 +2855,7 @@ app.get("/api/app-shortcuts", auth, async(req,res)=>{
 });
 
 app.post("/api/app-shortcuts", auth, async(req,res)=>{
-  const { id, name, ip, port, icon, https, vmName, dynamic, url } = req.body;
+  const { id, name, ip, port, icon, https, vmName, dynamic, url, storeAppId, hidden } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({error:"Nom requis"});
   try {
     const baseId = id || crypto.randomBytes(6).toString("hex");
@@ -2889,6 +2889,18 @@ app.post("/api/app-shortcuts", auth, async(req,res)=>{
     // rouvrir l'édition et cocher la case à nouveau créait un doublon à
     // chaque fois (signalé par un utilisateur réel).
     if (vmName && !entry.vmName) entry.vmName = String(vmName);
+    // Même principe pour "storeAppId" — posé par le bouton "Modifier" du
+    // détail d'une app du Magasin (recréer/éditer son raccourci), requis
+    // pour que le statut "running" et le nettoyage à la désinstallation
+    // continuent de fonctionner sur un raccourci recréé/édité ici plutôt
+    // qu'automatiquement à l'installation.
+    if (storeAppId) entry.storeAppId = String(storeAppId);
+    // Masque l'icône du menu Applications et du bureau sans supprimer le
+    // raccourci (nom/URL/icône restent en mémoire) — bouton "Modifier" du
+    // détail d'une app du Magasin, demande explicite : pouvoir désactiver
+    // l'icône d'une app qu'on ne veut pas voir dans ces deux endroits sans
+    // perdre la config si on change d'avis ensuite.
+    if (typeof hidden === "boolean") entry.hidden = hidden;
     const list = loadAppShortcuts();
     const idx = list.findIndex(s => s.id === baseId);
     if (idx !== -1) list[idx] = entry; else list.push(entry);
