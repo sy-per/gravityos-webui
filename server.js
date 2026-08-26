@@ -17,6 +17,21 @@ const execAsync = promisify(exec);
 const app    = express();
 const server = http.createServer(app);
 
+// Filet de sécurité — sans ça, Node (≥15) termine TOUT le process sur la
+// moindre rejection de promesse jamais attrapée (ex: un callback "fire and
+// forget" passé à runJob() qui échoue après coup, comme la création du
+// raccourci après une installation Magasin). Un service NAS de fond ne doit
+// jamais tomber pour une erreur async isolée — bug réel découvert : une
+// installation Frigate réussie mais sans raccourci créé, corrélée à des
+// arrêts intempestifs du backend observés pendant cette session de tests.
+// On journalise et on continue, jamais process.exit().
+process.on("unhandledRejection", (reason) => {
+  console.error("Rejection non gérée (le service continue) :", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("Exception non gérée (le service continue) :", err);
+});
+
 // WebSocket server pour les métriques (/)
 const wss = new WebSocketServer({ noServer: true });
 // WebSocket server pour le terminal (/terminal)
@@ -202,6 +217,21 @@ wss.on("connection", (ws, req) => {
 app.get("/api/system", auth, async (req,res) => {
   const [os,cpu,mem,t] = await Promise.all([si.osInfo(),si.cpu(),si.mem(),si.time()]);
   res.json({ os, cpu, mem, uptime:t.uptime, hostname:os.hostname, isLive:isLive() });
+});
+// Processus triés par RAM — pour que l'utilisateur puisse voir concrètement
+// ce qui consomme la mémoire du NAS (demande explicite suite à un système
+// qui sature en RAM sans rien installé), plutôt qu'un simple pourcentage
+// global sans détail exploitable.
+app.get("/api/system/top-processes", auth, async (req,res) => {
+  try {
+    const { list } = await si.processes();
+    const top = list
+      .slice()
+      .sort((a,b) => b.mem - a.mem)
+      .slice(0, 15)
+      .map(p => ({ pid: p.pid, name: p.name, cpu: Math.round((p.cpu||0)*10)/10, memPct: Math.round((p.mem||0)*10)/10, memMB: Math.round((p.memRss||0)/1024) }));
+    res.json(top);
+  } catch(e) { res.status(500).json({error:e.message}); }
 });
 // Interface réseau active (nom + IPv4) — utilisé par l'onglet "Informations
 // générales" des Paramètres, distinct des réseaux libvirt (/api/networks)
@@ -1772,7 +1802,19 @@ app.get("/api/networks",       auth, async(req,res)=>{try{const r=await virsh("n
 // ── Jobs asynchrones génériques (pull d'image, compose, volumes, RAID, backup)
 //    même principe que streamUpdate mais plusieurs jobs concurrents, par id ────
 const jobs = new Map();
+// Une entrée par job jamais nettoyée = fuite mémoire réelle découverte sur
+// cette session : les 23 points d'appel de runJob() (VMs, Docker, Magasin,
+// sauvegardes, tâches planifiées...) accumulaient chacun leur log complet en
+// mémoire pour toute la durée de vie du service, sans jamais être libérés —
+// plausiblement la cause d'un NAS qui sature en RAM même "sans rien
+// installé" après des semaines d'utilisation normale (chaque pull d'image,
+// chaque sauvegarde, chaque vérification planifiée laissant une trace
+// permanente). Purge différée (le temps que l'UI lise l'état final) +
+// plafond dur en garde-fou si un usage inhabituel accélère le rythme.
+const JOB_TTL_MS = 15 * 60 * 1000;
+const JOB_MAX_COUNT = 300;
 function runJob(cmd, onDone) {
+  if (jobs.size >= JOB_MAX_COUNT) jobs.delete(jobs.keys().next().value);
   const jobId = crypto.randomBytes(8).toString("hex");
   // Toujours une première ligne immédiate : sans ça la boîte de log reste
   // vide tant que la commande n'a rien écrit (ex: pull d'une grosse image
@@ -1789,6 +1831,7 @@ function runJob(cmd, onDone) {
     // onDone optionnel : permet à un appelant (ex. tâche de sauvegarde planifiée)
     // de réagir à la fin du job sans avoir à repoller /api/jobs/:id
     onDone?.(code===0, job.log.join(""));
+    setTimeout(() => jobs.delete(jobId), JOB_TTL_MS).unref();
   });
   return jobId;
 }
@@ -2535,15 +2578,19 @@ app.delete("/api/docker/compose/:name", auth, async(req,res)=>{
     const images = [...fs.readFileSync(composeFile, "utf8").matchAll(/^\s*image:\s*(\S+)\s*$/gm)].map(m => m[1]);
     const storeAppId = name.startsWith("store-") ? name.slice(6) : null;
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -rf ${sh(dir)}`, async (ok) => {
-      if (!ok) return;
-      if (storeAppId) saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== storeAppId));
-      if (!docker || !images.length) return;
+      // Callback fire-and-forget (pas de req/res ici, le job est déjà
+      // répondu) : tout englobé dans un seul try/catch — une erreur
+      // isolée (ex: écriture du fichier de raccourcis) ne doit jamais
+      // remonter en rejection non gérée.
       try {
+        if (!ok) return;
+        if (storeAppId) saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== storeAppId));
+        if (!docker || !images.length) return;
         const remaining = await docker.listContainers({all:true});
         for (const image of images) {
           if (!remaining.some(c => c.Image === image)) await docker.getImage(image).remove({force:true}).catch(()=>{});
         }
-      } catch {}
+      } catch (e) { console.error("Nettoyage post-suppression du projet échoué:", e.message); }
     });
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -2690,13 +2737,19 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
       fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ password: generated.APP_PASSWORD }));
     }
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d 2>&1`, async (ok) => {
-      if (!ok || !createShortcut || !app_.hostPorts?.[0]) return;
-      const ip = await nasIp();
-      const list = loadAppShortcuts();
-      if (!list.some(s => s.storeAppId === id)) {
-        list.push({ id: crypto.randomBytes(6).toString("hex"), name: app_.name, url: `http://${ip}:${app_.hostPorts[0]}`, icon: app_.icon, storeAppId: id });
-        saveAppShortcuts(list);
-      }
+      // Callback fire-and-forget — une erreur ici (ex: écriture disque du
+      // fichier de raccourcis) ne doit jamais faire tomber tout le service ;
+      // aussi ce qui explique un cas réel observé : app installée avec succès
+      // mais raccourci manquant malgré la case cochée, sans la moindre trace.
+      try {
+        if (!ok || !createShortcut || !app_.hostPorts?.[0]) return;
+        const ip = await nasIp();
+        const list = loadAppShortcuts();
+        if (!list.some(s => s.storeAppId === id)) {
+          list.push({ id: crypto.randomBytes(6).toString("hex"), name: app_.name, url: `http://${ip}:${app_.hostPorts[0]}`, icon: app_.icon, storeAppId: id });
+          saveAppShortcuts(list);
+        }
+      } catch (e) { console.error(`Création du raccourci Magasin (${id}) échouée:`, e.message); }
     });
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -2720,19 +2773,20 @@ app.post("/api/store/apps/:id/uninstall", auth, async(req,res)=>{
     // compose disparaît avec "rm -rf dir" une fois la désinstallation faite).
     const images = [...fs.readFileSync(composeFile, "utf8").matchAll(/^\s*image:\s*(\S+)\s*$/gm)].map(m => m[1]);
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -rf ${sh(dir)}`, async (ok) => {
-      if (!ok) return;
-      saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== id));
-      // Une image encore utilisée ailleurs (autre app du Magasin partageant
-      // la même image de base, conteneur créé à la main...) ne doit pas être
-      // supprimée — seulement celles devenues orphelines après ce "down".
-      if (!docker || !images.length) return;
       try {
+        if (!ok) return;
+        saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== id));
+        // Une image encore utilisée ailleurs (autre app du Magasin partageant
+        // la même image de base, conteneur créé à la main...) ne doit pas
+        // être supprimée — seulement celles devenues orphelines après ce
+        // "down".
+        if (!docker || !images.length) return;
         const remaining = await docker.listContainers({all:true});
         for (const image of images) {
           const stillUsed = remaining.some(c => c.Image === image);
           if (!stillUsed) await docker.getImage(image).remove({force:true}).catch(()=>{});
         }
-      } catch {}
+      } catch (e) { console.error(`Nettoyage post-désinstallation Magasin (${id}) échoué:`, e.message); }
     });
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
