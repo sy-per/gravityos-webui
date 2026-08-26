@@ -2476,9 +2476,18 @@ app.get("/api/docker/images", auth, async(req,res)=>{
   try {
     const imgs = await docker.listImages();
     res.json(imgs.map(i=>{
-      const tag = i.RepoTags?.[0] || "<none>:<none>";
-      const sep = tag.lastIndexOf(":");
-      return { id:i.Id.replace("sha256:","").slice(0,12), repo:tag.slice(0,sep), tag:tag.slice(sep+1), size:i.Size, created:i.Created };
+      const tag = i.RepoTags?.[0];
+      if (tag) {
+        const sep = tag.lastIndexOf(":");
+        return { id:i.Id.replace("sha256:","").slice(0,12), repo:tag.slice(0,sep), tag:tag.slice(sep+1), size:i.Size, created:i.Created, dangling:false };
+      }
+      // Image "orpheline" — un tag repris par une image plus récente après un
+      // pull (mise à jour), ou couche intermédiaire de build ; RepoTags est
+      // alors vide côté Docker (affiché "<none>:<none>" par `docker images`).
+      // RepoDigests garde trace du dépôt d'origine quand elle existe encore.
+      const digestRef = i.RepoDigests?.[0];
+      const repo = digestRef ? digestRef.slice(0, digestRef.lastIndexOf("@")) : null;
+      return { id:i.Id.replace("sha256:","").slice(0,12), repo, tag:null, size:i.Size, created:i.Created, dangling:true };
     }));
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2487,6 +2496,76 @@ app.post("/api/docker/images/pull", auth, (req,res)=>{
   if(!image || !/^[a-zA-Z0-9._\-\/:]+$/.test(image)) return res.status(400).json({error:"Nom d'image invalide"});
   const jobId = runJob(`docker pull ${sh(image)} 2>&1`);
   res.json({ok:true, jobId});
+});
+// Vérifie si une nouvelle version de l'image est disponible sur le registre —
+// même principe que checkDockerImageUpdates() (tâche planifiée système) : un
+// "docker pull" ne perturbe jamais un conteneur déjà démarré, seule une
+// recréation applique l'image mise à jour (bouton "Mettre à jour" séparé).
+app.get("/api/docker/images/check-update", auth, async(req,res)=>{
+  const ref = req.query.ref;
+  if(!ref || !/^[a-zA-Z0-9._\-\/:]+$/.test(ref)) return res.status(400).json({error:"Image invalide"});
+  if(!docker) return res.status(500).json({error:"Docker indisponible"});
+  try {
+    const before = await docker.getImage(ref).inspect().catch(()=>null);
+    await execAsync(`docker pull ${sh(ref)} 2>&1`);
+    const after = await docker.getImage(ref).inspect().catch(()=>null);
+    res.json({ hasUpdate: !!(before?.Id && after?.Id && before.Id !== after.Id) });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+// Applique la mise à jour déjà téléchargée (voir check-update ci-dessus) à
+// tous les conteneurs qui référencent directement cette image — recrée
+// chaque projet Compose concerné (up -d --force-recreate) et chaque
+// conteneur autonome à l'identique (mêmes ports/volumes/env/politique de
+// redémarrage relus via inspect, comme "Recréer" dans le détail conteneur),
+// pour ne perdre aucun réglage. Si l'image n'est utilisée par aucun
+// conteneur, se contente de la télécharger.
+app.post("/api/docker/images/update", auth, async(req,res)=>{
+  const { ref } = req.body;
+  if(!ref || !/^[a-zA-Z0-9._\-\/:]+$/.test(ref)) return res.status(400).json({error:"Image invalide"});
+  if(!docker) return res.status(500).json({error:"Docker indisponible"});
+  try {
+    const containers = await docker.listContainers({all:true});
+    const affected = containers.filter(c => c.Image === ref);
+    const steps = [`echo "=== Telechargement de ${ref} ===" && docker pull ${sh(ref)}`];
+
+    const projects = [...new Set(
+      affected.filter(c => c.Labels?.["com.docker.compose.project"]).map(c => c.Labels["com.docker.compose.project"])
+    )];
+    for (const project of projects) {
+      const dir = path.join(COMPOSE_DIR, project.replace(/[^a-zA-Z0-9_-]/g,""));
+      if (fs.existsSync(path.join(dir,"docker-compose.yml"))) {
+        steps.push(`echo "=== Recreation du projet ${project} ===" && cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate`);
+      }
+    }
+
+    const standalone = affected.filter(c => !c.Labels?.["com.docker.compose.project"]);
+    for (const c of standalone) {
+      const d = await docker.getContainer(c.Id).inspect();
+      const name = d.Name.replace(/^\//,"");
+      const args = ["run","-d","--name", sh(name), "--restart", sh(d.HostConfig?.RestartPolicy?.Name || "unless-stopped")];
+      const network = Object.keys(d.NetworkSettings?.Networks||{})[0];
+      if (network && network !== "bridge") args.push("--network", sh(network));
+      for (const [containerPort, bindings] of Object.entries(d.HostConfig?.PortBindings || {})) {
+        const proto = containerPort.split("/")[1] || "tcp";
+        for (const b of (bindings||[])) args.push("-p", sh(`${b.HostPort}:${containerPort.split("/")[0]}${proto==="udp"?"/udp":""}`));
+      }
+      for (const m of (d.Mounts||[])) if (m.Type === "bind") args.push("-v", sh(`${m.Source}:${m.Destination}${m.RW ? "" : ":ro"}`));
+      for (const e of (d.Config?.Env||[])) args.push("-e", sh(e));
+      args.push(sh(ref));
+      // Chaque argument de la commande individuellement échappé (pas
+      // rejoint puis poussé tel quel) — le CMD par défaut de nombreuses
+      // images contient des métacaractères shell (ex: nginx = ["nginx",
+      // "-g","daemon off;"], le ";" cassait la commande une fois passée
+      // dans le script bash de ce job, repéré en testant cette fonction).
+      for (const part of (d.Config?.Cmd || [])) args.push(sh(part));
+      steps.push(`echo "=== Recreation du conteneur ${name} ===" && docker stop ${sh(c.Id)} >/dev/null 2>&1; docker rm ${sh(c.Id)} >/dev/null 2>&1; docker ${args.join(" ")}`);
+    }
+
+    // Regroupé dans un bloc { ...; } pour que 2>&1 s'applique à toutes les
+    // étapes (pull + chaque recréation), pas seulement à la dernière.
+    const jobId = runJob("{ " + steps.join(" ; ") + " ; } 2>&1");
+    res.json({ok:true, jobId, containers: affected.length});
+  } catch(e){ res.status(500).json({error:e.message}); }
 });
 app.delete("/api/docker/images/:id", auth, async(req,res)=>{
   try { await docker.getImage(req.params.id).remove({force:true}); res.json({ok:true}); }
