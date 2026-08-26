@@ -204,7 +204,17 @@ wss.on("connection", (ws, req) => {
   async function push() {
     try {
       const [cpu,mem,net,temp,disk] = await Promise.all([si.currentLoad(),si.mem(),si.networkStats(),si.cpuTemperature(),si.fsSize()]);
-      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), ram:{used:mem.used,total:mem.total,pct:Math.round(mem.used/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
+      // mem.used = total - free, ce qui compte le cache disque (pages
+      // Samba/NFS/Docker mises en cache par le noyau) comme "utilisé" alors
+      // que Linux le libère instantanément dès qu'un process en a besoin —
+      // un NAS qui sert des fichiers affiche donc presque toujours un
+      // mem.used proche de 100% même à vide, sans aucune pression mémoire
+      // réelle (signalé par un utilisateur réel : widget à 98% avec 8 Go
+      // alors qu'aucun processus ne consommait plus de 121 Mo). mem.available
+      // (libre + cache récupérable) est la métrique correcte, celle utilisée
+      // par "free -h" (colonne "disponible") et htop.
+      const ramUsed = mem.total - mem.available;
+      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), ram:{used:ramUsed,total:mem.total,pct:Math.round(ramUsed/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
     } catch {}
   }
   iv = setInterval(push, 2000); push();
