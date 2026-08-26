@@ -4648,6 +4648,7 @@
     ],
     "hostPorts": [
       5004,
+      5000,
       8554,
       8555
     ],
@@ -4656,7 +4657,7 @@
     ],
     "hasUserFacingPassword": true,
     "usesHostNetwork": false,
-    "composeYaml": "services:\n  web:\n    privileged: true\n    restart: on-failure\n    image: ghcr.io/blakeblackshear/frigate:0.17.2@sha256:d4351369984d4a9e2a49ac59736f6490856a7ea11f7790040746d21496967010\n    shm_size: 128mb\n    volumes:\n      - /etc/localtime:/etc/localtime:ro\n      - /srv/volumes/volume1/AppData/frigate/data/config:/config\n      - /srv/volumes/volume1/AppData/frigate/data/storage:/media/frigate\n    ports:\n      - 8554:8554\n      - 8555:8555/tcp\n      - 8555:8555/udp\n      - 5004:8971\n    environment:\n      FRIGATE_RTSP_PASSWORD: ${APP_PASSWORD}\n",
+    "composeYaml": "services:\n  web:\n    privileged: true\n    restart: on-failure\n    image: ghcr.io/blakeblackshear/frigate:0.17.2@sha256:d4351369984d4a9e2a49ac59736f6490856a7ea11f7790040746d21496967010\n    shm_size: 128mb\n    volumes:\n      - /etc/localtime:/etc/localtime:ro\n      - /srv/volumes/volume1/AppData/frigate/data/config:/config\n      - /srv/volumes/volume1/AppData/frigate/data/storage:/media/frigate\n    ports:\n      - 8554:8554\n      - 8555:8555/tcp\n      - 8555:8555/udp\n      - 5004:8971\n      - 5000:5000\n    environment:\n      FRIGATE_RTSP_PASSWORD: ${APP_PASSWORD}\n",
     "needsReview": [],
     "excluded": false,
     "usesHttps": true

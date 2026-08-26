@@ -2699,7 +2699,13 @@ app.put("/api/docker/compose/:name", auth, async(req,res)=>{
     if(!fs.existsSync(file)) return res.status(404).json({error:"Stack introuvable"});
     if(await stackHasRunningContainer(name)) return res.status(409).json({error:"Arrêtez le projet avant de modifier sa configuration"});
     fs.writeFileSync(file, content);
-    res.json({ok:true});
+    // Redémarre automatiquement avec la nouvelle config — le projet doit
+    // être arrêté pour être modifiable (contrôle ci-dessus), donc sans ça
+    // l'utilisateur se retrouvait avec des conteneurs recréés à l'ancienne
+    // config puis restait arrêté, nécessitant un "Démarrer" manuel en plus
+    // (retour utilisateur explicite).
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate 2>&1`);
+    res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 // Journal d'un projet — logs agrégés de tous ses services (pas seulement
