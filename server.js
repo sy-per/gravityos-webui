@@ -10,6 +10,7 @@ const { promisify } = require("util");
 const path     = require("path");
 const fs       = require("fs");
 const crypto   = require("crypto");
+const os       = require("os");
 let Dockerode; try { Dockerode = require("dockerode"); } catch {}
 let multer; try { multer = require("multer"); } catch {}
 
@@ -2361,6 +2362,16 @@ const COMPOSE_DIR = path.join(volume1Path(), "Docker");
 })();
 
 // ── Conteneurs ──────────────────────────────────────────────────────────────
+// `docker stats` donne un %CPU relatif à UN seul cœur (convention Linux/
+// Docker, la même que `top` — 100% = un cœur saturé, jusqu'à N×100% sur une
+// machine à N cœurs) : un conteneur peut donc afficher un % plus élevé que
+// le widget "Moniteur de ressources" (qui lui est relatif à la machine
+// entière, `si.currentLoad()`), même s'il consomme en réalité moins que la
+// charge globale — source de confusion réelle signalée par un utilisateur.
+// Ramené ici à la même échelle "machine entière" en divisant par le nombre
+// de cœurs, pour qu'un conteneur seul ne puisse jamais dépasser le %
+// affiché par le widget global.
+const CPU_CORES = os.cpus().length || 1;
 app.get("/api/containers", auth, async(req,res)=>{
   if(!docker) return res.json([]);
   try {
@@ -2372,7 +2383,9 @@ app.get("/api/containers", auth, async(req,res)=>{
       try {
         const {stdout} = await execAsync(`docker stats --no-stream --format "{{.ID}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}" 2>/dev/null`);
         for (const line of stdout.trim().split("\n").filter(Boolean)) {
-          const [id,cpu,mem,memPct] = line.split("|");
+          const [id,rawCpu,mem,memPct] = line.split("|");
+          const cpuNum = parseFloat(rawCpu);
+          const cpu = Number.isFinite(cpuNum) ? `${(cpuNum / CPU_CORES).toFixed(2)}%` : rawCpu;
           statsById[id] = { cpu, mem, memPct };
         }
       } catch {}
