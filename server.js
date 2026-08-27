@@ -603,6 +603,32 @@ app.post("/api/files/rename", auth, async (req,res)=>{
     res.json({ok:true, path:dest});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
+// Lecture/écriture texte — app "Éditeur" (ouverte depuis "Ouvrir avec" du
+// menu contextuel Fichiers sur un fichier texte). Plafond de taille pour ne
+// pas charger un gros binaire par erreur en mémoire comme texte.
+const EDITOR_MAX_SIZE = 5 * 1024 * 1024;
+app.get("/api/files/read", auth, async (req,res)=>{
+  const p = req.query.path;
+  if (!(await filesPathAllowed(p))) return res.status(400).json({error:"Chemin non autorisé"});
+  try {
+    if (!fs.existsSync(p)) return res.status(404).json({error:"Fichier introuvable"});
+    const st = fs.statSync(p);
+    if (!st.isFile()) return res.status(400).json({error:"Ce n'est pas un fichier"});
+    if (st.size > EDITOR_MAX_SIZE) return res.status(413).json({error:"Fichier trop volumineux pour l'éditeur (max 5 Mo)"});
+    res.json({ path: p, content: fs.readFileSync(p, "utf8") });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.put("/api/files/write", auth, async (req,res)=>{
+  const { path:p, content } = req.body;
+  if (typeof content !== "string") return res.status(400).json({error:"Contenu requis"});
+  if (!(await filesPathAllowed(p))) return res.status(400).json({error:"Chemin non autorisé"});
+  try {
+    if (Buffer.byteLength(content, "utf8") > EDITOR_MAX_SIZE) return res.status(413).json({error:"Fichier trop volumineux pour l'éditeur (max 5 Mo)"});
+    if (fs.existsSync(p) && fs.statSync(p).isDirectory()) return res.status(400).json({error:"Ce n'est pas un fichier"});
+    fs.writeFileSync(p, content, "utf8");
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 app.delete("/api/files/item", auth, async (req,res)=>{
   const p = req.query.path;
   if (!(await filesPathAllowed(p))) return res.status(400).json({error:"Chemin non autorisé"});
