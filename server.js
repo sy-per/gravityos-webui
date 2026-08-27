@@ -2305,6 +2305,33 @@ app.post("/api/notifications/email/test", auth, async(req,res)=>{
 //  DOCKER
 // ══════════════════════════════════════════════════════════════════════════════
 
+// Certaines images du catalogue sont épinglées par tag ET par digest dans
+// leur docker-compose.yml (ex: "image: repo:0.17.2@sha256:...") pour figer
+// une version précise sans dépendre d'un tag flottant réécrit en amont côté
+// registre — mais Docker ne crée alors AUCUNE entrée RepoTags pour l'image
+// tirée (seulement RepoDigests), qui apparaît "orpheline" dans l'onglet
+// Images dès la toute première installation, jamais à cause d'un pull
+// répété (cas découvert et confirmé réellement avec Frigate : `docker pull
+// repo:tag@sha256:...` puis `docker images` → tag "<none>"). Un simple
+// "docker tag" sur la référence par digest, déjà résolvable localement une
+// fois l'image tirée, lui redonne son nom lisible.
+function retagPinnedImagesCmd(composeYaml) {
+  const matches = [...composeYaml.matchAll(/image:\s*(\S+):(\S+)@(sha256:[0-9a-f]{64})/g)];
+  return matches.map(([, repo, tag, digest]) => `docker tag ${sh(`${repo}@${digest}`)} ${sh(`${repo}:${tag}`)} 2>/dev/null || true`).join(" ; ");
+}
+function retagPinnedImagesForDir(dir) {
+  try { return retagPinnedImagesCmd(fs.readFileSync(path.join(dir, "docker-compose.yml"), "utf8")); }
+  catch { return ""; }
+}
+// Construit la commande complète d'un "docker compose up" (avec ses
+// éventuels retags) — regroupée dans un bloc { ...; } pour que 2>&1
+// s'applique à toutes les étapes, pas seulement à la dernière.
+function composeUpCmd(dir, composeArgs, retag) {
+  const steps = [`cd ${sh(dir)}`, `${composeCmd()} ${composeArgs}`];
+  if (retag) steps.push(retag);
+  return `{ ${steps.join(" && ")} ; } 2>&1`;
+}
+
 // ── docker compose (v2 "docker compose" si dispo, sinon "docker-compose" v1) ──
 let COMPOSE_CMD = null;
 function composeCmd() {
@@ -2534,7 +2561,8 @@ app.post("/api/docker/images/update", auth, async(req,res)=>{
     for (const project of projects) {
       const dir = path.join(COMPOSE_DIR, project.replace(/[^a-zA-Z0-9_-]/g,""));
       if (fs.existsSync(path.join(dir,"docker-compose.yml"))) {
-        steps.push(`echo "=== Recreation du projet ${project} ===" && cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate`);
+        const retag = retagPinnedImagesForDir(dir);
+        steps.push(`echo "=== Recreation du projet ${project} ===" && cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate${retag ? " && " + retag : ""}`);
       }
     }
 
@@ -2604,7 +2632,7 @@ app.post("/api/docker/compose", auth, (req,res)=>{
     const dir = path.join(COMPOSE_DIR, name);
     fs.mkdirSync(dir,{recursive:true});
     fs.writeFileSync(path.join(dir,"docker-compose.yml"), content);
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d 2>&1`);
+    const jobId = runJob(composeUpCmd(dir, "up -d", retagPinnedImagesCmd(content)));
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2612,7 +2640,7 @@ app.post("/api/docker/compose/:name/up", auth, (req,res)=>{
   try {
     const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d 2>&1`);
+    const jobId = runJob(composeUpCmd(dir, "up -d", retagPinnedImagesForDir(dir)));
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2651,7 +2679,7 @@ app.post("/api/docker/compose/:name/recreate", auth, (req,res)=>{
   try {
     const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate 2>&1`);
+    const jobId = runJob(composeUpCmd(dir, "up -d --force-recreate", retagPinnedImagesForDir(dir)));
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2704,7 +2732,7 @@ app.put("/api/docker/compose/:name", auth, async(req,res)=>{
     // l'utilisateur se retrouvait avec des conteneurs recréés à l'ancienne
     // config puis restait arrêté, nécessitant un "Démarrer" manuel en plus
     // (retour utilisateur explicite).
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate 2>&1`);
+    const jobId = runJob(composeUpCmd(dir, "up -d --force-recreate", retagPinnedImagesCmd(content)));
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -2831,7 +2859,7 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
     if (app_.hasUserFacingPassword && generated.APP_PASSWORD) {
       fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ password: generated.APP_PASSWORD }));
     }
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} up -d 2>&1`, async (ok) => {
+    const jobId = runJob(composeUpCmd(dir, "up -d", retagPinnedImagesCmd(composeYaml)), async (ok) => {
       // Callback fire-and-forget — une erreur ici (ex: écriture disque du
       // fichier de raccourcis) ne doit jamais faire tomber tout le service ;
       // aussi ce qui explique un cas réel observé : app installée avec succès
