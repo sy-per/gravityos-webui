@@ -4026,8 +4026,16 @@ app.get("/api/updates/gravity/check", auth, async(req,res) => {
     // désormais un reset --hard sur origin/main, pas de détection de branche)
     const {stdout} = await execAsync(`git -C /opt/gravity log HEAD..origin/main --oneline 2>/dev/null`).catch(()=>({stdout:""}));
     const commits = stdout.trim().split("\n").filter(Boolean);
-    const {stdout:ver} = await execAsync("git -C /opt/gravity log -1 --format='%h — %s — %cr' 2>/dev/null").catch(()=>({stdout:"inconnu"}));
-    res.json({available: commits.length>0, commits, count: commits.length, currentVersion: ver.trim()});
+    // Affiché "Version actuelle : X.Y — il y a ...". Le numéro de version
+    // vient d'un fichier VERSION à la racine du dépôt (pas encore
+    // incrémenté automatiquement — mis à jour manuellement pour l'instant,
+    // demande explicite de l'utilisateur) plutôt que du hash/message de
+    // commit affichés jusqu'ici, trop techniques pour cet écran.
+    const {stdout:relTime} = await execAsync("git -C /opt/gravity log -1 --format='%cr' 2>/dev/null").catch(()=>({stdout:""}));
+    let version = "?";
+    try { version = fs.readFileSync("/opt/gravity/VERSION", "utf8").trim(); } catch {}
+    const currentVersion = `${version} — ${relTime.trim()}`;
+    res.json({available: commits.length>0, commits, count: commits.length, currentVersion});
   } catch(e){ res.json({available:false, message:"Erreur: "+e.message}); }
 });
 
