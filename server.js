@@ -2683,6 +2683,23 @@ app.post("/api/docker/compose/:name/up", auth, (req,res)=>{
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
+// "Arrêter" un projet — "docker compose stop" (garde les conteneurs, juste
+// éteints, comme le bouton Arrêter d'un conteneur seul) plutôt que "down"
+// (qui les supprime avec leur réseau) : bug réel signalé par un
+// utilisateur — les conteneurs disparaissaient complètement de l'onglet
+// Conteneurs après "Arrêter", donnant l'impression que quelque chose avait
+// cassé, alors que "Démarrer" les recréait ensuite silencieusement.
+app.post("/api/docker/compose/:name/stop", auth, (req,res)=>{
+  try {
+    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} stop 2>&1`);
+    res.json({ok:true, jobId});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+// Conservé pour un usage explicite futur (supprime conteneurs + réseau,
+// sans toucher aux données ni à l'image) — plus utilisé par "Arrêter"
+// depuis le fix ci-dessus.
 app.post("/api/docker/compose/:name/down", auth, (req,res)=>{
   try {
     const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
