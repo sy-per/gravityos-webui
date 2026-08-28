@@ -2741,7 +2741,14 @@ app.post("/api/docker/compose/:name/recreate", auth, (req,res)=>{
 });
 // Suppression d'un projet — retire aussi les images devenues orphelines
 // (même logique que la désinstallation d'une app du Magasin) et le
-// raccourci associé s'il en existait un.
+// raccourci associé s'il en existait un. Ne supprime JAMAIS les données du
+// volume (demande explicite de l'utilisateur, suite à la découverte que la
+// suppression générique d'un projet effaçait aussi son dossier de données
+// bind-monté — ex: .../store-frigate/data/..., stocké au même endroit que
+// le docker-compose.yml) : seuls les fichiers de config Compose du projet
+// sont retirés, tout dossier de données reste en place, orphelin sur le
+// disque. Pour supprimer aussi les données d'une app du Magasin, utiliser
+// "Désinstaller" depuis le Magasin (choix explicite proposé là-bas).
 app.delete("/api/docker/compose/:name", auth, async(req,res)=>{
   const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
   const dir = path.join(COMPOSE_DIR, name);
@@ -2750,7 +2757,8 @@ app.delete("/api/docker/compose/:name", auth, async(req,res)=>{
   try {
     const images = [...fs.readFileSync(composeFile, "utf8").matchAll(/^\s*image:\s*(\S+)\s*$/gm)].map(m => m[1]);
     const storeAppId = name.startsWith("store-") ? name.slice(6) : null;
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -rf ${sh(dir)}`, async (ok) => {
+    const configFiles = [composeFile, path.join(dir,".env"), path.join(dir,"credentials.json")].map(f=>sh(f)).join(" ");
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -f ${configFiles}`, async (ok) => {
       // Callback fire-and-forget (pas de req/res ici, le job est déjà
       // répondu) : tout englobé dans un seul try/catch — une erreur
       // isolée (ex: écriture du fichier de raccourcis) ne doit jamais
@@ -2954,11 +2962,20 @@ app.post("/api/store/apps/:id/uninstall", auth, async(req,res)=>{
   const dir = storeDir(id);
   const composeFile = path.join(dir, "docker-compose.yml");
   if (!fs.existsSync(composeFile)) return res.status(404).json({error:"Application non installée"});
+  // Choix explicite proposé dans le dialogue de désinstallation du Magasin
+  // (case à cocher) — par défaut (champ absent) les données sont
+  // conservées, comportement le plus sûr pour toute intégration existante
+  // (compat scripts/API) qui n'enverrait pas encore ce champ.
+  const deleteData = req.body?.deleteData === true;
   try {
     // Images utilisées par CETTE app, capturées avant "down" (le fichier
-    // compose disparaît avec "rm -rf dir" une fois la désinstallation faite).
+    // compose peut disparaître selon le choix ci-dessus une fois la
+    // désinstallation faite).
     const images = [...fs.readFileSync(composeFile, "utf8").matchAll(/^\s*image:\s*(\S+)\s*$/gm)].map(m => m[1]);
-    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && rm -rf ${sh(dir)}`, async (ok) => {
+    const cleanupCmd = deleteData
+      ? `rm -rf ${sh(dir)}`
+      : `rm -f ${[composeFile, path.join(dir,".env"), path.join(dir,"credentials.json")].map(f=>sh(f)).join(" ")}`;
+    const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down -v 2>&1 && ${cleanupCmd}`, async (ok) => {
       try {
         if (!ok) return;
         saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== id));
