@@ -215,7 +215,7 @@ wss.on("connection", (ws, req) => {
       // (libre + cache récupérable) est la métrique correcte, celle utilisée
       // par "free -h" (colonne "disponible") et htop.
       const ramUsed = mem.total - mem.available;
-      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), ram:{used:ramUsed,total:mem.total,pct:Math.round(ramUsed/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
+      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), cpuCores:cpu.cpus.map(c=>Math.round(c.load)), ram:{used:ramUsed,total:mem.total,pct:Math.round(ramUsed/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
     } catch {}
   }
   iv = setInterval(push, 2000); push();
