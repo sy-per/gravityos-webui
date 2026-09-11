@@ -2173,6 +2173,13 @@ app.post("/api/terminal/ssh", auth, async(req,res)=>{
     let conf = fs.readFileSync(SSHD_CONFIG,"utf8");
     conf = /^\s*#?\s*Port\s+\d+/m.test(conf) ? conf.replace(/^\s*#?\s*Port\s+\d+/m, `Port ${safePort}`) : `Port ${safePort}\n${conf}`;
     fs.writeFileSync(SSHD_CONFIG, conf);
+    // "sshd -t" échoue avec "Missing privilege separation directory: /run/sshd"
+    // si SSH n'a encore jamais été démarré via systemd depuis le dernier
+    // redémarrage — /run est un tmpfs recréé vide à chaque boot, et ce
+    // répertoire n'est normalement créé que par l'ExecStartPre du service
+    // ssh.service (signalé par un utilisateur réel qui activait SSH pour la
+    // première fois après un boot).
+    await execAsync("mkdir -p -m0755 /run/sshd").catch(()=>{});
     await execAsync("sshd -t"); // valide la config avant de l'appliquer
     await execAsync(`ufw allow ${safePort}/tcp`).catch(()=>{});
     if (req.body.active) {
