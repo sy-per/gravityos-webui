@@ -4052,7 +4052,14 @@ function streamUpdate(cmd, res) {
   runUpdateProcess(cmd);
   res.json({ok:true, message:"Mise à jour lancée"});
 }
-function systemUpdateCmd() { return "apt-get update -qq && apt-get upgrade -y 2>&1"; }
+// dist-upgrade (pas upgrade) : "apt-get upgrade" refuse silencieusement tout
+// paquet qui nécessiterait d'installer une nouvelle dépendance ou d'en
+// retirer une ("kept back", sans erreur) — cas très fréquent avec un noyau
+// (linux-image-amd64/linux-headers-amd64 tirent une nouvelle version en
+// dépendance), donc "Installer la mise à jour" semblait ne rien faire alors
+// que la commande réussissait juste sans rien installer (signalé par un
+// utilisateur réel bloqué sur les mêmes 2 paquets noyau à chaque vérification).
+function systemUpdateCmd() { return "apt-get update -qq && apt-get dist-upgrade -y 2>&1"; }
 
 // Cœur de la vérification des mises à jour système, réutilisé par l'endpoint
 // HTTP et par la tâche planifiée système "Vérification des mises à jour (OS)".
