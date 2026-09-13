@@ -196,12 +196,26 @@ wssTerminal.on("connection", (ws, req) => {
   }
 });
 
+// Puissance CPU réelle via RAPL (Intel) — /sys/class/powercap n'existe que sur
+// ce type de matériel, jamais garanti (VirtualBox/ARM/AMD sans RAPL exposé) :
+// lu en best-effort, le widget affiche juste la température si indisponible
+// plutôt que d'inventer une valeur.
+const RAPL_ENERGY_PATH = "/sys/class/powercap/intel-rapl:0/energy_uj";
+const RAPL_MAX_PATH = "/sys/class/powercap/intel-rapl:0/max_energy_range_uj";
+function readRaplEnergyUj() {
+  try { return parseInt(fs.readFileSync(RAPL_ENERGY_PATH,"utf8"),10); }
+  catch { return null; }
+}
+let raplMaxRange = null;
+try { raplMaxRange = parseInt(fs.readFileSync(RAPL_MAX_PATH,"utf8"),10); } catch {}
+
 // ── WebSocket Métriques ───────────────────────────────────────────────────────
 wss.on("connection", (ws, req) => {
   if (!validSid((req.headers.cookie||"").match(/gravity_sid=([a-f0-9]+)/)?.[1])) {
     ws.close(4401); return;
   }
   let iv;
+  let lastRapl = { energy: readRaplEnergyUj(), time: Date.now() };
   async function push() {
     try {
       const [cpu,mem,net,temp,disk] = await Promise.all([si.currentLoad(),si.mem(),si.networkStats(),si.cpuTemperature(),si.fsSize()]);
@@ -215,7 +229,18 @@ wss.on("connection", (ws, req) => {
       // (libre + cache récupérable) est la métrique correcte, celle utilisée
       // par "free -h" (colonne "disponible") et htop.
       const ramUsed = mem.total - mem.available;
-      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), cpuCores:cpu.cpus.map(c=>Math.round(c.load)), ram:{used:ramUsed,total:mem.total,pct:Math.round(ramUsed/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
+
+      let cpuWatts = null;
+      const energyNow = readRaplEnergyUj();
+      if (energyNow != null && lastRapl.energy != null) {
+        const dt = (Date.now() - lastRapl.time) / 1000;
+        let dEnergy = energyNow - lastRapl.energy;
+        if (dEnergy < 0 && raplMaxRange) dEnergy += raplMaxRange; // wrap du compteur
+        if (dEnergy >= 0 && dt > 0) cpuWatts = Math.round((dEnergy / 1e6 / dt) * 10) / 10;
+      }
+      lastRapl = { energy: energyNow, time: Date.now() };
+
+      ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), cpuCores:cpu.cpus.map(c=>Math.round(c.load)), cpuWatts, ram:{used:ramUsed,total:mem.total,pct:Math.round(ramUsed/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
     } catch {}
   }
   iv = setInterval(push, 2000); push();
