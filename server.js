@@ -3038,6 +3038,33 @@ const APP_SHORTCUTS_FILE = `${CFG}/app-shortcuts.json`;
 function loadAppShortcuts(){ try{ return JSON.parse(fs.readFileSync(APP_SHORTCUTS_FILE,"utf8")); } catch { return []; } }
 function saveAppShortcuts(list){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(APP_SHORTCUTS_FILE, JSON.stringify(list,null,2)); }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  PRÉFÉRENCES UI — persistées sur le NAS (pas dans le localStorage du
+//  navigateur) pour que la disposition du bureau (widgets, icônes,
+//  raccourcis) et les autres réglages d'interface suivent l'utilisateur
+//  quel que soit le PC/navigateur utilisé pour se connecter (signalé par
+//  un utilisateur réel : disposition perdue en changeant de machine).
+//  Un seul fichier, plusieurs clés (desktopItems, theme, wallpaper, ...) —
+//  chaque contexte React continue d'utiliser localStorage comme cache
+//  instantané au premier rendu, mais lit/écrit aussi ici.
+// ══════════════════════════════════════════════════════════════════════════════
+const UI_PREFS_FILE = `${CFG}/ui-preferences.json`;
+function loadUiPrefs(){ try{ return JSON.parse(fs.readFileSync(UI_PREFS_FILE,"utf8")); } catch { return {}; } }
+function saveUiPrefs(obj){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(UI_PREFS_FILE, JSON.stringify(obj,null,2)); }
+app.get("/api/preferences/:key", auth, (req,res) => {
+  const prefs = loadUiPrefs();
+  const has = Object.prototype.hasOwnProperty.call(prefs, req.params.key);
+  res.json({ value: has ? prefs[req.params.key] : null });
+});
+app.put("/api/preferences/:key", auth, (req,res) => {
+  try {
+    const prefs = loadUiPrefs();
+    prefs[req.params.key] = req.body?.value ?? null;
+    saveUiPrefs(prefs);
+    res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
 async function nasIp() {
   try {
     const list = await si.networkInterfaces();
