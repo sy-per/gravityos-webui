@@ -813,7 +813,7 @@ app.get("/api/storage/disks", auth, async(req,res)=>{
         media: diskMediaType(d.rota),
         external: d.tran === "usb",
         isSystem,
-        volumeName: matchedVolume ? matchedVolume.name : null,
+        volumeName: matchedVolume ? matchedVolume.label : null,
         partitions: parts,
         smart: smartByPath[devPath] || { available:false, healthy:null, reason:"Lecture SMART impossible" },
       };
@@ -833,6 +833,35 @@ app.get("/api/storage/disks/:name/smart", auth, async(req,res)=>{
 });
 
 // ── Volumes ───────────────────────────────────────────────────────────────────
+// Le nom de dossier/point de montage d'un volume doit rester "sûr" pour le
+// shell et fstab (pas d'espaces ni de caractères spéciaux), mais l'utilisateur
+// doit pouvoir donner un nom d'affichage libre avec espaces/accents/ponctuation
+// (demande explicite — jusqu'ici le nom technique ÉTAIT le nom affiché, donc
+// aucun espace toléré). On sépare les deux : `name` reste l'identifiant
+// technique (slug, utilisé pour le point de montage et les routes API), un
+// fichier séparé stocke le libellé d'affichage par slug.
+const VOLUME_LABELS_FILE = `${CFG}/volume-labels.json`;
+function loadVolumeLabels(){ try{ return JSON.parse(fs.readFileSync(VOLUME_LABELS_FILE,"utf8")); } catch { return {}; } }
+function saveVolumeLabel(slug, label){
+  const all = loadVolumeLabels();
+  all[slug] = label;
+  fs.mkdirSync(CFG,{recursive:true});
+  fs.writeFileSync(VOLUME_LABELS_FILE, JSON.stringify(all,null,2));
+}
+function deleteVolumeLabel(slug){
+  const all = loadVolumeLabels();
+  if (Object.prototype.hasOwnProperty.call(all, slug)) {
+    delete all[slug];
+    fs.mkdirSync(CFG,{recursive:true});
+    fs.writeFileSync(VOLUME_LABELS_FILE, JSON.stringify(all,null,2));
+  }
+}
+function slugifyVolumeName(raw){
+  let s = String(raw).normalize("NFD").replace(/[̀-ͯ]/g,""); // accents
+  s = s.toLowerCase().trim().replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"");
+  return s || "volume";
+}
+
 async function getVolumesList(){
   fs.mkdirSync(VOL_ROOT,{recursive:true});
   const {stdout:rootSrc} = await execAsync("findmnt -n -o SOURCE /").catch(()=>({stdout:"—"}));
@@ -844,14 +873,15 @@ async function getVolumesList(){
   // est lui-même sur la partition racine tant qu'aucun disque dédié n'y est
   // monté séparément)
   fs.mkdirSync(volume1Path(),{recursive:true, mode:0o2775});
-  const volumes = [{ name:"Volume 1 (système)", path:volume1Path(), device:rootSrc.trim()||"—", size:Number(rsz)||0, used:Number(rus)||0, system:true }];
+  const labels = loadVolumeLabels();
+  const volumes = [{ name:"Volume 1 (système)", label:"Volume 1 (système)", path:volume1Path(), device:rootSrc.trim()||"—", size:Number(rsz)||0, used:Number(rus)||0, system:true }];
   for (const name of fs.readdirSync(VOL_ROOT)) {
     if (name === SYSTEM_VOLUME_DIR) continue; // déjà listé ci-dessus comme "Volume 1 (système)"
     const p = path.join(VOL_ROOT, name);
     if (!fs.statSync(p).isDirectory()) continue;
     const {stdout:info} = await execAsync(`df -B1 --output=source,size,used ${sh(p)} 2>/dev/null | tail -n1`).catch(()=>({stdout:""}));
     const [device,sz,us] = info.trim().split(/\s+/);
-    volumes.push({ name, path:p, device:device||"—", size:Number(sz)||0, used:Number(us)||0, system:false });
+    volumes.push({ name, label: labels[name] || name, path:p, device:device||"—", size:Number(sz)||0, used:Number(us)||0, system:false });
   }
   return volumes;
 }
@@ -860,20 +890,42 @@ app.get("/api/storage/volumes", auth, async(req,res)=>{
 });
 app.post("/api/storage/volumes", auth, (req,res)=>{
   const { name, device } = req.body;
-  if(!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de volume invalide (lettres/chiffres/-/_ uniquement)"});
+  const label = String(name||"").trim();
+  if(!label || label.length>64 || /[\/\\]/.test(label)) return res.status(400).json({error:"Nom de volume invalide"});
   if(!device || !/^\/dev\/[a-zA-Z0-9]+$/.test(device)) return res.status(400).json({error:"Périphérique invalide"});
-  const mnt = path.join(VOL_ROOT, name);
+  // Le nom affiché (label) peut contenir espaces/accents/ponctuation, mais le
+  // dossier/point de montage réel doit rester un identifiant "sûr" pour le
+  // shell et fstab — slugifié à partir du label, avec suffixe numérique en
+  // cas de collision avec un volume existant.
+  fs.mkdirSync(VOL_ROOT,{recursive:true});
+  const baseSlug = slugifyVolumeName(label);
+  let slug = baseSlug, n = 2;
+  while (fs.existsSync(path.join(VOL_ROOT, slug))) slug = `${baseSlug}-${n++}`;
+  const mnt = path.join(VOL_ROOT, slug);
   const cmd = `
-    mkfs.ext4 -F -L ${sh(name.slice(0,16))} ${sh(device)}
+    mkfs.ext4 -F -L ${sh(slug.slice(0,16))} ${sh(device)}
     UUID=$(blkid -s UUID -o value ${sh(device)})
     mkdir -p ${sh(mnt)}
     grep -q "$UUID" /etc/fstab || echo "UUID=$UUID  ${mnt}  ext4  defaults,nofail  0  2" >> /etc/fstab
     mount ${sh(mnt)}
     chown gravity:gravity ${sh(mnt)}
-    echo "Volume '${name}' prêt sur ${mnt}"
+    echo "Volume '${slug}' prêt sur ${mnt}"
   `;
   const jobId = runJob(cmd);
-  res.json({ok:true, jobId});
+  saveVolumeLabel(slug, label);
+  res.json({ok:true, jobId, name:slug});
+});
+// Renomme uniquement le nom affiché (le dossier/point de montage technique
+// ne change pas — le renommer impliquerait de démonter/déplacer/re-fstab
+// un volume potentiellement en cours d'utilisation, risqué pour peu de gain).
+app.put("/api/storage/volumes/:name/label", auth, (req,res)=>{
+  const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
+  const label = String(req.body?.label||"").trim();
+  if (!name || name === SYSTEM_VOLUME_DIR) return res.status(400).json({error:"Volume invalide"});
+  if (!fs.existsSync(path.join(VOL_ROOT, name))) return res.status(404).json({error:"Volume introuvable"});
+  if (!label || label.length>64 || /[\/\\]/.test(label)) return res.status(400).json({error:"Nom de volume invalide"});
+  saveVolumeLabel(name, label);
+  res.json({ok:true});
 });
 app.delete("/api/storage/volumes/:name", auth, async(req,res)=>{
   const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
@@ -883,6 +935,7 @@ app.delete("/api/storage/volumes/:name", auth, async(req,res)=>{
     await execAsync(`umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
     const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(mnt)).join("\n");
     fs.writeFileSync("/etc/fstab", fstab);
+    deleteVolumeLabel(name);
     res.json({ok:true, message:"Volume détaché — les données restent sur le disque (non effacées)"});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -935,7 +988,7 @@ app.get("/api/storage/raid", auth, async(req,res)=>{
         degraded: healthMatch ? healthMatch[1].includes("_") : false,
         resyncPercent: resyncMatch ? Number(resyncMatch[1]) : null,
         size: lsblkEntry ? Number(lsblkEntry.size)||0 : 0,
-        volumeName: volume ? volume.name : null,
+        volumeName: volume ? volume.label : null,
       });
     }
     res.json(arrays);
