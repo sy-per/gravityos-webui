@@ -723,8 +723,20 @@ if (multer) {
 }
 
 async function lsblkTree(){
-  const {stdout} = await execAsync("lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,TRAN,PATH,SERIAL 2>/dev/null").catch(()=>({stdout:'{"blockdevices":[]}'}));
+  const {stdout} = await execAsync("lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,TRAN,PATH,SERIAL,ROTA 2>/dev/null").catch(()=>({stdout:'{"blockdevices":[]}'}));
   return JSON.parse(stdout).blockdevices || [];
+}
+// SSD vs HDD ne se déduit PAS du protocole (TRAN peut être "sata" pour un
+// SSD SATA comme pour un HDD SATA) mais du drapeau "rotationnel" du noyau
+// (/sys/block/<dev>/queue/rotational, exposé par lsblk en colonne ROTA) —
+// 0 = SSD/NVMe (pas de pièces mobiles), 1 = HDD. lsblk -J le rend en
+// booléen JSON, d'où la comparaison sur true/false en plus de "0"/"1" par
+// robustesse. Corrige un bug réel : tout disque était affiché "HDD" par
+// défaut (y compris un SSD SATA et un SSD NVMe sur du matériel réel).
+function diskMediaType(rota){
+  if (rota===true || rota==="1" || rota===1) return "HDD";
+  if (rota===false || rota==="0" || rota===0) return "SSD";
+  return null;
 }
 function lsblkFlat(tree){ const flat=[]; (function walk(nodes){for(const n of nodes){flat.push(n);if(n.children)walk(n.children);}})(tree); return flat; }
 
@@ -798,6 +810,7 @@ app.get("/api/storage/disks", auth, async(req,res)=>{
         model: (d.model||"").trim() || "—",
         serial: d.serial || "—",
         tran: (d.tran||"").toUpperCase() || "—",
+        media: diskMediaType(d.rota),
         external: d.tran === "usb",
         isSystem,
         volumeName: matchedVolume ? matchedVolume.name : null,
