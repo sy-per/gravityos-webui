@@ -797,10 +797,20 @@ app.get("/api/storage/disks", auth, async(req,res)=>{
       smartByPath[p] = await getSmartStatus(p);
     }));
     const disks = physicalDisks.map(d=>{
-      const parts = (d.children||[]).filter(c=>c.type==="part").map(c=>({
+      let parts = (d.children||[]).filter(c=>c.type==="part").map(c=>({
         name: c.name, path: c.path || ("/dev/"+c.name), size: Number(c.size)||0,
         fstype: c.fstype || null, mountpoint: c.mountpoint || null,
       }));
+      // Un disque créé comme volume GravityOS (mkfs directement sur le
+      // périphérique entier, voir POST /api/storage/volumes) n'a aucune
+      // table de partitions — sans ça, "Disque" n'affichait aucun détail de
+      // système de fichiers pour ces disques, contrairement au disque
+      // système qui, lui, est partitionné (signalé par un utilisateur réel).
+      // On synthétise une entrée "partition" représentant le disque entier
+      // dans ce cas, réutilisant le même affichage.
+      if (parts.length === 0 && d.fstype) {
+        parts = [{ name: d.name, path: d.path || ("/dev/"+d.name), size: Number(d.size)||0, fstype: d.fstype||null, mountpoint: d.mountpoint||null }];
+      }
       const devPath = d.path || ("/dev/"+d.name);
       const allMounts = [d.mountpoint, ...parts.map(p=>p.mountpoint)].filter(Boolean);
       const isSystem = allMounts.includes("/") || rootSrc.startsWith(devPath);
