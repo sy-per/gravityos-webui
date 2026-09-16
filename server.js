@@ -875,10 +875,18 @@ async function getVolumesList(){
   fs.mkdirSync(volume1Path(),{recursive:true, mode:0o2775});
   const labels = loadVolumeLabels();
   const volumes = [{ name:"Volume 1 (système)", label:"Volume 1 (système)", path:volume1Path(), device:rootSrc.trim()||"—", size:Number(rsz)||0, used:Number(rus)||0, system:true }];
+  const volRootDev = fs.statSync(VOL_ROOT).dev;
   for (const name of fs.readdirSync(VOL_ROOT)) {
     if (name === SYSTEM_VOLUME_DIR) continue; // déjà listé ci-dessus comme "Volume 1 (système)"
     const p = path.join(VOL_ROOT, name);
     if (!fs.statSync(p).isDirectory()) continue;
+    // Un dossier resté sur place sans être un vrai point de montage séparé
+    // (création avortée, ou suppression qui n'a pas nettoyé le dossier) vit
+    // sur le même périphérique que VOL_ROOT (le disque système) — "df" y
+    // renvoie alors les stats du disque système, le faisant apparaître comme
+    // un doublon fantôme de "Volume 1" (signalé par un utilisateur réel).
+    // On l'ignore : ce n'est pas un vrai volume.
+    if (fs.statSync(p).dev === volRootDev) continue;
     const {stdout:info} = await execAsync(`df -B1 --output=source,size,used ${sh(p)} 2>/dev/null | tail -n1`).catch(()=>({stdout:""}));
     const [device,sz,us] = info.trim().split(/\s+/);
     volumes.push({ name, label: labels[name] || name, path:p, device:device||"—", size:Number(sz)||0, used:Number(us)||0, system:false });
@@ -936,6 +944,12 @@ app.delete("/api/storage/volumes/:name", auth, async(req,res)=>{
     const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(mnt)).join("\n");
     fs.writeFileSync("/etc/fstab", fstab);
     deleteVolumeLabel(name);
+    // Le dossier qui servait de point de montage doit disparaître, sinon il
+    // reste listé indéfiniment comme un volume fantôme aux stats du disque
+    // système (même bug que celui qui affichait un ancien volume dupliqué).
+    // rmdir échoue silencieusement si non vide (contenu du disque démonté
+    // resté visible) ou déjà supprimé — jamais de perte de données.
+    try { fs.rmdirSync(mnt); } catch {}
     res.json({ok:true, message:"Volume détaché — les données restent sur le disque (non effacées)"});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
