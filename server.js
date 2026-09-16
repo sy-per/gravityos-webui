@@ -925,6 +925,7 @@ app.post("/api/storage/volumes", auth, (req,res)=>{
     UUID=$(blkid -s UUID -o value ${sh(device)})
     mkdir -p ${sh(mnt)}
     grep -q "$UUID" /etc/fstab || echo "UUID=$UUID  ${mnt}  ext4  defaults,nofail  0  2" >> /etc/fstab
+    systemctl daemon-reload
     mount ${sh(mnt)}
     chown gravity:gravity ${sh(mnt)}
     echo "Volume '${slug}' prêt sur ${mnt}"
@@ -953,6 +954,7 @@ app.delete("/api/storage/volumes/:name", auth, async(req,res)=>{
     await execAsync(`umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
     const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(mnt)).join("\n");
     fs.writeFileSync("/etc/fstab", fstab);
+    await execAsync("systemctl daemon-reload").catch(()=>{});
     deleteVolumeLabel(name);
     // Le dossier qui servait de point de montage doit disparaître, sinon il
     // reste listé indéfiniment comme un volume fantôme aux stats du disque
@@ -1139,6 +1141,7 @@ ${confLines}
 EOF
     mkdir -p ${sh(mnt)}
     grep -q " ${mnt} " /etc/fstab || echo "${mergerfsBranches}  ${mnt}  fuse.mergerfs  defaults,allow_other,use_ino,cache.files=partial,dropcacheonclose=true,category.create=mfs,minfreespace=1G,nofail  0  0" >> /etc/fstab
+    systemctl daemon-reload
     mount ${sh(mnt)}
     chown gravity:${SHARED_GROUP} ${sh(mnt)}
     chmod 2775 ${sh(mnt)}
@@ -1174,6 +1177,7 @@ app.delete("/api/storage/snapraid/:name", auth, async(req,res)=>{
     }
     const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(` ${mnt} `) && !l.includes(poolDir)).join("\n");
     fs.writeFileSync("/etc/fstab", fstab);
+    await execAsync("systemctl daemon-reload").catch(()=>{});
     fs.rmSync(snapraidConfPath(name), {force:true});
     fs.rmSync(snapraidSyncMarker(name), {force:true});
     res.json({ok:true, message:"Pool arrêté — les données restent sur chaque disque (non effacées), consultables individuellement"});
