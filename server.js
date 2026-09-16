@@ -663,37 +663,134 @@ app.delete("/api/files/item", auth, async (req,res)=>{
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
+// ── Transferts de fichiers suivis (déplacement/copie internes) ──────────────
+// fs.renameSync/fs.cpSync sont tout-ou-rien (bloquants, aucune progression
+// possible) — remplacés ici par une copie en flux qui accumule les octets
+// transférés dans un registre partagé, interrogeable en direct par l'icône
+// de suivi de la barre du haut (demande explicite de l'utilisateur, façon
+// Synology). Un déplacement sur le même volume reste un simple renommage
+// (quasi instantané, pas de vraie progression possible) mais est quand même
+// enregistré ici pour apparaître dans le panneau, comme demandé.
+const transfers = new Map();
+const TRANSFER_TTL_MS = 5 * 60 * 1000; // reste visible ("Terminé récemment") 5 min après la fin
+function newTransfer(name, kind, fromLabel, toLabel) {
+  const id = crypto.randomBytes(8).toString("hex");
+  const t = { id, name, kind, fromLabel, toLabel, totalBytes: 0, bytesDone: 0, state: "active", error: null, startedAt: Date.now(), _cancelled: false, _streams: null };
+  transfers.set(id, t);
+  return t;
+}
+function finishTransfer(t, state, error) {
+  t.state = state;
+  t.error = error || null;
+  t._streams = null;
+  setTimeout(() => transfers.delete(t.id), TRANSFER_TTL_MS).unref();
+}
+async function dirSize(p) {
+  const st = await fs.promises.stat(p);
+  if (!st.isDirectory()) return st.size;
+  let total = 0;
+  for (const entry of await fs.promises.readdir(p, { withFileTypes: true })) {
+    total += await dirSize(path.join(p, entry.name));
+  }
+  return total;
+}
+// Copie récursive en flux (fichier par fichier) avec suivi d'octets cumulés
+// dans `t.bytesDone` — permet une vraie barre de progression, contrairement
+// à fs.cpSync qui ne rend la main qu'une fois tout copié.
+async function streamCopyTree(src, dest, t) {
+  if (t._cancelled) throw Object.assign(new Error("Transfert annulé"), { cancelled: true });
+  const st = await fs.promises.stat(src);
+  if (st.isDirectory()) {
+    await fs.promises.mkdir(dest, { recursive: true });
+    for (const entry of await fs.promises.readdir(src, { withFileTypes: true })) {
+      await streamCopyTree(path.join(src, entry.name), path.join(dest, entry.name), t);
+    }
+    return;
+  }
+  await new Promise((resolve, reject) => {
+    if (t._cancelled) return reject(Object.assign(new Error("Transfert annulé"), { cancelled: true }));
+    const rs = fs.createReadStream(src);
+    const ws = fs.createWriteStream(dest);
+    t._streams = { rs, ws };
+    rs.on("data", (chunk) => { t.bytesDone += chunk.length; });
+    rs.on("error", reject);
+    ws.on("error", reject);
+    ws.on("finish", resolve);
+    rs.pipe(ws);
+  });
+}
+app.get("/api/files/transfers", auth, (req, res) => {
+  res.json([...transfers.values()].map(t => ({
+    id: t.id, name: t.name, kind: t.kind, fromLabel: t.fromLabel, toLabel: t.toLabel,
+    totalBytes: t.totalBytes, bytesDone: t.bytesDone, state: t.state, error: t.error, startedAt: t.startedAt,
+  })).sort((a, b) => b.startedAt - a.startedAt));
+});
+app.post("/api/files/transfers/:id/cancel", auth, (req, res) => {
+  const t = transfers.get(req.params.id);
+  if (!t) return res.status(404).json({ error: "Transfert introuvable" });
+  if (t.state !== "active") return res.json({ ok: true });
+  t._cancelled = true;
+  t._streams?.rs.destroy();
+  t._streams?.ws.destroy();
+  res.json({ ok: true });
+});
 app.post("/api/files/move", auth, async (req,res)=>{
   const { from, toDir } = req.body;
   if (!(await filesPathAllowed(from)) || !(await filesPathAllowed(toDir))) return res.status(400).json({error:"Chemin non autorisé"});
-  try {
-    if (!fs.existsSync(from)) return res.status(404).json({error:"Élément introuvable"});
-    const dest = path.join(toDir, path.basename(from));
-    if (!(await filesPathAllowed(dest))) return res.status(400).json({error:"Chemin non autorisé"});
-    if (path.resolve(dest)===path.resolve(from)) return res.status(400).json({error:"Destination identique à la source"});
-    if (fs.existsSync(dest)) return res.status(400).json({error:"Un élément du même nom existe déjà dans le dossier de destination"});
-    // "from" et "toDir" peuvent être sur des volumes/disques différents —
-    // renameSync échoue alors avec EXDEV, il faut copier puis effacer la source
-    try { fs.renameSync(from, dest); }
-    catch(e){ if(e.code==="EXDEV"){ fs.cpSync(from, dest, {recursive:true}); fs.rmSync(from, {recursive:true, force:true}); } else throw e; }
-    res.json({ok:true, path:dest});
-  } catch(e){ res.status(500).json({error:e.message}); }
+  if (!fs.existsSync(from)) return res.status(404).json({error:"Élément introuvable"});
+  const dest = path.join(toDir, path.basename(from));
+  if (!(await filesPathAllowed(dest))) return res.status(400).json({error:"Chemin non autorisé"});
+  if (path.resolve(dest)===path.resolve(from)) return res.status(400).json({error:"Destination identique à la source"});
+  if (fs.existsSync(dest)) return res.status(400).json({error:"Un élément du même nom existe déjà dans le dossier de destination"});
+
+  const t = newTransfer(path.basename(from), "move", from, toDir);
+  res.json({ ok:true, path:dest, transferId:t.id });
+  (async () => {
+    try {
+      const st = await fs.promises.stat(from);
+      t.totalBytes = st.isDirectory() ? await dirSize(from) : st.size;
+      // "from" et "toDir" peuvent être sur des volumes/disques différents —
+      // renameSync échoue alors avec EXDEV, il faut copier puis effacer la source
+      try {
+        fs.renameSync(from, dest);
+        t.bytesDone = t.totalBytes;
+      } catch (e) {
+        if (e.code !== "EXDEV") throw e;
+        await streamCopyTree(from, dest, t);
+        await fs.promises.rm(from, { recursive:true, force:true });
+      }
+      finishTransfer(t, "done");
+    } catch (e) {
+      fs.promises.rm(dest, { recursive:true, force:true }).catch(()=>{});
+      finishTransfer(t, t._cancelled ? "cancelled" : "error", e.message);
+    }
+  })();
 });
 app.post("/api/files/copy", auth, async (req,res)=>{
   const { from, toDir } = req.body;
   if (!(await filesPathAllowed(from)) || !(await filesPathAllowed(toDir))) return res.status(400).json({error:"Chemin non autorisé"});
-  try {
-    if (!fs.existsSync(from)) return res.status(404).json({error:"Élément introuvable"});
-    const base = path.basename(from);
-    const ext = path.extname(base);
-    const stem = ext ? base.slice(0, -ext.length) : base;
-    let dest = path.join(toDir, base);
-    let n = 1;
-    while (fs.existsSync(dest)) { dest = path.join(toDir, `${stem} (copie${n>1?" "+n:""})${ext}`); n++; }
-    if (!(await filesPathAllowed(dest))) return res.status(400).json({error:"Chemin non autorisé"});
-    fs.cpSync(from, dest, { recursive:true });
-    res.json({ok:true, path:dest});
-  } catch(e){ res.status(500).json({error:e.message}); }
+  if (!fs.existsSync(from)) return res.status(404).json({error:"Élément introuvable"});
+  const base = path.basename(from);
+  const ext = path.extname(base);
+  const stem = ext ? base.slice(0, -ext.length) : base;
+  let dest = path.join(toDir, base);
+  let n = 1;
+  while (fs.existsSync(dest)) { dest = path.join(toDir, `${stem} (copie${n>1?" "+n:""})${ext}`); n++; }
+  if (!(await filesPathAllowed(dest))) return res.status(400).json({error:"Chemin non autorisé"});
+
+  const t = newTransfer(base, "copy", from, toDir);
+  res.json({ ok:true, path:dest, transferId:t.id });
+  (async () => {
+    try {
+      const st = await fs.promises.stat(from);
+      t.totalBytes = st.isDirectory() ? await dirSize(from) : st.size;
+      await streamCopyTree(from, dest, t);
+      finishTransfer(t, "done");
+    } catch (e) {
+      fs.promises.rm(dest, { recursive:true, force:true }).catch(()=>{});
+      finishTransfer(t, t._cancelled ? "cancelled" : "error", e.message);
+    }
+  })();
 });
 // Upload dans l'app Fichiers : destination = n'importe quel dossier autorisé
 // (contrairement à /api/vms/upload dont la destination est fixe). On upload
