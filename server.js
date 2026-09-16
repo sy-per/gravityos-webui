@@ -805,9 +805,19 @@ if (multer) {
     const dir = req.body.dir;
     if (!dir || !(await filesPathAllowed(dir))) { fs.unlink(req.file.path, ()=>{}); return res.status(400).json({error:"Dossier non autorisé"}); }
     try {
-      fs.mkdirSync(dir, {recursive:true});
-      const safeName = req.file.originalname.replace(/[^a-zA-Z0-9._ -]/g,"_");
-      const dest = path.join(dir, safeName);
+      // relPath (optionnel) : chemin relatif à "dir" pour un fichier issu
+      // d'un dossier glissé-déposé (webkitGetAsEntry côté navigateur) —
+      // recrée la même arborescence de sous-dossiers sur le NAS plutôt que
+      // de tout déposer à plat dans "dir". Chaque segment est assaini
+      // indépendamment (mêmes caractères autorisés qu'un nom de fichier) et
+      // "."/".." filtrés, pour empêcher toute évasion du dossier cible.
+      const rawRel = String(req.body.relPath || "").replace(/\\/g,"/");
+      const segments = rawRel.split("/").filter(Boolean).map(s=>s.replace(/[^a-zA-Z0-9._ -]/g,"_")).filter(s=>s!=="."&&s!=="..");
+      const safeName = segments.length ? segments.pop() : req.file.originalname.replace(/[^a-zA-Z0-9._ -]/g,"_");
+      const destDir = segments.length ? path.join(dir, ...segments) : dir;
+      if (!(await filesPathAllowed(destDir))) { fs.unlink(req.file.path, ()=>{}); return res.status(400).json({error:"Chemin non autorisé"}); }
+      fs.mkdirSync(destDir, {recursive:true});
+      const dest = path.join(destDir, safeName);
       // /tmp peut être un montage différent (tmpfs) de la destination (volume
       // NAS) — renameSync échoue alors avec EXDEV, il faut copier puis effacer
       try { fs.renameSync(req.file.path, dest); }
