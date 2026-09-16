@@ -4590,6 +4590,32 @@ TERMCFG
     fi
     ufw allow 6900:6999/tcp 2>/dev/null || true
 
+    # Filet de sécurité pour les volumes/pools définis dans /etc/fstab qui
+    # ne se remontent pas tout seuls au démarrage — race de timing connue
+    # avec un disque NVMe/SATA non encore prêt au moment où le générateur
+    # systemd tente le montage initial (nofail l'ignore alors sans réessayer
+    # ensuite). "mount -a" manuel réussit toujours dans ce cas (confirmé par
+    # un utilisateur réel : volume disparu après plusieurs mises à jour/
+    # redémarrages malgré un fstab et un systemd à jour) — ce service le
+    # relance automatiquement une fois les systèmes de fichiers locaux prêts.
+    cat > /etc/systemd/system/gravity-mount-retry.service <<'MOUNTRETRY'
+[Unit]
+Description=GravityOS - remonte les volumes non montés au démarrage (repli de sécurité)
+After=local-fs.target
+Before=gravity-webui.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/mount -a
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+MOUNTRETRY
+    systemctl daemon-reload
+    systemctl enable gravity-mount-retry.service 2>&1 | tail -2
+    systemctl start gravity-mount-retry.service 2>&1 | tail -2
+
     echo "Correctifs système appliqués ✓"
 
     echo ""
