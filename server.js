@@ -1762,6 +1762,7 @@ app.get("/api/vms", auth, async (req,res) => {
       try{const i=await virsh(`dominfo ${vm.name}`);d={...vm,vcpus:(i.match(/CPU\(s\):\s+(\d+)/)||[])[1]||"?",memMB:Math.round(parseInt((i.match(/Max memory:\s+(\d+)/)||[])[1]||0)/1024)};}catch{}
       const diskGB = await vmDiskGB(vm.name);
       if (diskGB!=null) d = { ...d, diskGB };
+      if (loadExternalDisks()[vm.name]) d = { ...d, diskExternal: true };
       const devices = await vmDevicesFromXml(vm.name);
       d = { ...d, ...devices };
       if (vm.state?.includes("running")) {
@@ -1773,33 +1774,67 @@ app.get("/api/vms", auth, async (req,res) => {
     res.json({isLive:false,vms:detailed});
   } catch(e) { res.json({isLive:false,vms:[],error:e.message}); }
 });
+// Registre des disques de VM "en place" — un disque importé sans copie
+// (voir POST /api/vms, importInPlace) reste le fichier original de
+// l'utilisateur, jamais une copie possédée par la VM. DELETE /api/vms/:n
+// consulte ce registre pour ne JAMAIS effacer ce fichier, contrairement au
+// comportement normal (le disque d'une VM est toujours supprimé avec elle) —
+// décision explicite de l'utilisateur après qu'on l'ait prévenu du risque.
+const VM_EXTERNAL_DISKS_FILE = `${CFG}/vm-external-disks.json`;
+function loadExternalDisks(){ try{ return JSON.parse(fs.readFileSync(VM_EXTERNAL_DISKS_FILE,"utf8")); } catch { return {}; } }
+function setExternalDisk(vmName, diskPath){
+  const all = loadExternalDisks();
+  all[vmName] = diskPath;
+  fs.mkdirSync(CFG,{recursive:true});
+  fs.writeFileSync(VM_EXTERNAL_DISKS_FILE, JSON.stringify(all,null,2));
+}
+function clearExternalDisk(vmName){
+  const all = loadExternalDisks();
+  if (Object.prototype.hasOwnProperty.call(all, vmName)) {
+    delete all[vmName];
+    fs.mkdirSync(CFG,{recursive:true});
+    fs.writeFileSync(VM_EXTERNAL_DISKS_FILE, JSON.stringify(all,null,2));
+  }
+}
+
 app.post("/api/vms", auth, async (req,res) => {
   if(isLive()) return res.status(400).json({error:"Impossible en Live CD"});
-  const{name,vcpus,memMB,diskGB,diskDir,iso,network,bios,usbDevices,importDisk}=req.body;
+  const{name,vcpus,memMB,diskGB,diskDir,iso,network,bios,usbDevices,importDisk,importInPlace}=req.body;
   if(!name||!vcpus||!memMB) return res.status(400).json({error:"name, vcpus, memMB requis"});
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g,"");
   // Emplacement du disque : /var/lib/libvirt/images par défaut, ou un volume
   // NAS autorisé (mêmes racines que le parcoureur de dossiers du wizard Docker)
   const targetDir = diskDir && diskDir.trim() ? diskDir.trim() : "/var/lib/libvirt/images";
   if (!isPathAllowed(targetDir)) return res.status(400).json({error:"Emplacement de disque non autorisé"});
-  const dp = path.join(targetDir, `${safeName}.qcow2`);
   try {
-    await execAsync(`mkdir -p ${sh(targetDir)}`);
     // Disque : soit un nouveau qcow2 vide, soit importé/converti depuis un
     // disque existant (qcow2 réutilisé tel quel, vdi/vmdk/raw convertis via
-    // qemu-img — potentiellement long sur un gros disque, donc en job async)
-    let diskCmd;
+    // qemu-img — potentiellement long sur un gros disque, donc en job async),
+    // soit — si l'utilisateur l'a explicitement demandé ET que le fichier est
+    // déjà au format qcow2 — utilisé directement à son emplacement actuel,
+    // sans copie ni conversion (aucune raison de dupliquer un fichier déjà au
+    // bon format).
+    let diskCmd, dp, externalDisk = null;
     if (importDisk) {
       if (!isPathAllowed(importDisk) || !fs.existsSync(importDisk)) return res.status(400).json({error:"Disque à importer introuvable ou hors des volumes autorisés"});
       const ext = path.extname(importDisk).toLowerCase().replace(".","");
       const fmtMap = { qcow2:"qcow2", vdi:"vdi", vmdk:"vmdk", img:"raw", raw:"raw" };
       const srcFmt = fmtMap[ext];
-      diskCmd = srcFmt === "qcow2"
-        ? `cp ${sh(importDisk)} ${sh(dp)}`
-        : `qemu-img convert -p ${srcFmt ? "-f "+srcFmt : ""} -O qcow2 ${sh(importDisk)} ${sh(dp)}`;
+      if (importInPlace && srcFmt === "qcow2") {
+        dp = importDisk;
+        diskCmd = "true"; // rien à faire, le fichier est déjà prêt à son emplacement
+        externalDisk = importDisk;
+      } else {
+        dp = path.join(targetDir, `${safeName}.qcow2`);
+        diskCmd = srcFmt === "qcow2"
+          ? `cp ${sh(importDisk)} ${sh(dp)}`
+          : `qemu-img convert -p ${srcFmt ? "-f "+srcFmt : ""} -O qcow2 ${sh(importDisk)} ${sh(dp)}`;
+      }
     } else {
+      dp = path.join(targetDir, `${safeName}.qcow2`);
       diskCmd = `qemu-img create -f qcow2 ${sh(dp)} ${diskGB||20}G`;
     }
+    await execAsync(`mkdir -p ${sh(targetDir)}`);
     const memKB = parseInt(memMB)*1024;
     const cdrom = iso ? `<disk type='file' device='cdrom'><driver name='qemu' type='raw'/><source file='${iso}'/><target dev='sdb' bus='sata'/><readonly/></disk>` : "";
     const bootDev = iso ? "<boot dev='cdrom'/><boot dev='hd'/>" : "<boot dev='hd'/>";
@@ -1844,7 +1879,10 @@ app.post("/api/vms", auth, async (req,res) => {
     // Le disque (création ou import/conversion) tourne en job asynchrone —
     // une conversion vdi/vmdk→qcow2 peut prendre plusieurs minutes sur un
     // gros disque, pas question de bloquer la requête HTTP dessus
-    const jobId = runJob(`${diskCmd} 2>&1 && echo "Disque prêt : ${dp}" && virsh --connect qemu:///system define ${sh(xmlPath)} 2>&1 && rm -f ${sh(xmlPath)} && echo "VM '${safeName}' définie — démarrez-la depuis la liste"`);
+    const jobId = runJob(
+      `${diskCmd} 2>&1 && echo "Disque prêt : ${dp}" && virsh --connect qemu:///system define ${sh(xmlPath)} 2>&1 && rm -f ${sh(xmlPath)} && echo "VM '${safeName}' définie — démarrez-la depuis la liste"`,
+      (success) => { if (success && externalDisk) setExternalDisk(safeName, externalDisk); },
+    );
     res.json({ok:true, jobId, disk:dp});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -1856,6 +1894,12 @@ app.post("/api/vms/:n/suspend",    auth, async (req,res)=>{try{await virsh(`susp
 app.post("/api/vms/:n/resume",     auth, async (req,res)=>{try{await virsh(`resume ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.delete("/api/vms/:n", auth, async (req,res)=>{
   const name = req.params.n;
+  // Choix explicite (case dans la boîte de confirmation, demande de
+  // l'utilisateur) plutôt qu'une suppression systématique du disque —
+  // cochée par défaut sauf pour un disque importé "en place" (voir
+  // POST /api/vms, importInPlace), où on ne veut surtout pas effacer le
+  // fichier original de l'utilisateur par défaut.
+  const deleteDisk = req.query.deleteDisk !== "false";
   try {
     await virsh(`destroy ${sh(name)}`).catch(()=>{});
     // "--remove-all-storage" ne fait RIEN sur les disques de GravityOS : ils
@@ -1875,7 +1919,16 @@ app.delete("/api/vms/:n", auth, async (req,res)=>{
     const xml = await virsh(`dumpxml ${sh(name)}`).catch(()=>"");
     const diskPaths = [...xml.matchAll(/<disk type='file' device='disk'>[\s\S]*?<source file='([^']*)'/g)].map(m=>m[1]);
     await virsh(`undefine ${sh(name)} --nvram`);
-    for (const p of diskPaths) { if (isPathAllowed(p)) fs.rmSync(p, {force:true}); }
+    if (deleteDisk) {
+      for (const p of diskPaths) { if (isPathAllowed(p)) fs.rmSync(p, {force:true}); }
+    }
+    clearExternalDisk(name);
+    // Le raccourci du menu Applications/bureau créé pour cette VM (voir
+    // maybeCreateShortcut côté frontend) ne disparaissait jamais avec elle —
+    // signalé par un utilisateur réel (icône orpheline restée affichée).
+    const shortcuts = loadAppShortcuts();
+    const remaining = shortcuts.filter(s => s.vmName !== name);
+    if (remaining.length !== shortcuts.length) saveAppShortcuts(remaining);
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
