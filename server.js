@@ -2859,7 +2859,14 @@ app.get("/api/docker/images/check-update", auth, async(req,res)=>{
   if(!docker) return res.status(500).json({error:"Docker indisponible"});
   try {
     const before = await docker.getImage(ref).inspect().catch(()=>null);
-    await execAsync(`docker pull ${sh(ref)} 2>&1`);
+    try { await execAsync(`docker pull ${sh(ref)} 2>&1`); }
+    catch (pe) {
+      // Image construite localement (docker build / "build:" dans un compose) :
+      // jamais tirée d'un registre, donc aucun RepoDigest — rien à vérifier
+      // en amont, ce n'est pas une erreur.
+      if (before && !(before.RepoDigests||[]).length) return res.json({ hasUpdate:false, local:true });
+      throw pe;
+    }
     const after = await docker.getImage(ref).inspect().catch(()=>null);
     res.json({ hasUpdate: !!(before?.Id && after?.Id && before.Id !== after.Id) });
   } catch(e){ res.status(500).json({error:e.message}); }
