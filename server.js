@@ -3028,7 +3028,13 @@ app.post("/api/docker/compose/:name/recreate", auth, (req,res)=>{
   try {
     const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
-    const jobId = runJob(composeUpCmd(dir, "up -d --force-recreate", retagPinnedImagesForDir(dir)));
+    // "Recréer" doit aussi récupérer la dernière image du registre (sinon la
+      // recréation réutilise l'image locale déjà présente). Les images
+      // construites localement (build:) sont ignorées, un échec de pull réseau
+      // ne bloque pas la recréation avec l'image déjà en place.
+      const c = composeCmd();
+      const pull = `{ ${c} pull --ignore-buildable || ${c} pull --ignore-pull-failures || true ; }`;
+      const jobId = runJob(composeUpCmd(dir, "up -d --force-recreate", retagPinnedImagesForDir(dir)).replace(`cd ${sh(dir)} && `, `cd ${sh(dir)} && ${pull} && `));
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
