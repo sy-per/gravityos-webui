@@ -1498,7 +1498,11 @@ ${proxyPassBlock(l.scheme||"http", l.host, l.port)}
   const advanced = h.advanced ? `\n    ${h.advanced.split("\n").join("\n    ")}\n` : "";
   const hstsHdr = h.hsts ? `        add_header Strict-Transport-Security "max-age=63072000${h.hstsSubdomains?"; includeSubDomains":""}" always;\n` : "";
 
-  if (h.sslMode!=="letsencrypt" && h.sslMode!=="custom") {
+  // Let's Encrypt sans certificat (validation échouée, pas encore obtenu) :
+  // ne référencer aucun fichier inexistant, sinon "nginx -t" échoue et bloque
+  // toute modification / bascule d'hôte — on reste en HTTP simple.
+  const leMissing = h.sslMode==="letsencrypt" && !fs.existsSync(`/etc/letsencrypt/live/${h.domains[0]}/fullchain.pem`);
+  if ((h.sslMode!=="letsencrypt" && h.sslMode!=="custom") || leMissing) {
     return `server {
     listen 80;
     server_name ${names};
