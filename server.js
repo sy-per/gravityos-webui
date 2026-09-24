@@ -3034,7 +3034,7 @@ app.post("/api/docker/compose/:name/recreate", auth, (req,res)=>{
       // ne bloque pas la recréation avec l'image déjà en place.
       const c = composeCmd();
       const pull = `{ ${c} pull --ignore-buildable || ${c} pull --ignore-pull-failures || true ; }`;
-      const jobId = runJob(composeUpCmd(dir, "up -d --force-recreate", retagPinnedImagesForDir(dir)).replace(`cd ${sh(dir)} && `, `cd ${sh(dir)} && ${pull} && `));
+      const jobId = runJob(composeUpCmd(dir, "up -d --build --force-recreate", retagPinnedImagesForDir(dir)).replace(`cd ${sh(dir)} && `, `cd ${sh(dir)} && ${pull} && `));
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
