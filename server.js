@@ -1531,6 +1531,29 @@ ${exploits}${cache}${customLocs}${advanced}
   return httpBlock + "\n" + httpsBlock;
 }
 
+// Le certificat existe réellement sur le disque (état réel, pas le mode configuré)
+function proxyCertExists(h) {
+  try {
+    if (h.sslMode==="letsencrypt") return fs.existsSync(`/etc/letsencrypt/live/${h.domains[0]}/fullchain.pem`);
+    if (h.sslMode==="custom") return !!h.certPath && fs.existsSync(h.certPath);
+  } catch {}
+  return false;
+}
+// Lance certbot puis, si le certificat est obtenu, réécrit le vhost avec le
+// bloc HTTPS (directement, sans rappel HTTP authentifié : un appel curl
+// silencieux qui échouait laissait "Hôte HTTPS actif ✓" affiché à tort).
+function startLetsEncrypt(fn, h) {
+  const emailArg = h.letsencryptEmail ? `-m ${sh(h.letsencryptEmail)}` : "--register-unsafely-without-email";
+  const domainArgs = h.domains.map(d=>`-d ${sh(d)}`).join(" ");
+  return runJob(`certbot certonly --nginx --non-interactive --agree-tos ${emailArg} ${domainArgs} 2>&1`, (ok) => {
+    if (!ok) return;
+    try {
+      fs.writeFileSync(path.join(NAVAIL,fn), buildProxyConf(h));
+      execAsync("nginx -t && systemctl reload nginx").catch(e => console.error("Reload nginx après certificat:", e.message));
+    } catch (e) { console.error("Finalisation SSL échouée:", e.message); }
+  });
+}
+
 function proxyIsActive(fn) {
   try { return fs.lstatSync(path.join(NSITES,fn)).isSymbolicLink(); } catch { return false; }
 }
@@ -1549,7 +1572,10 @@ app.get("/api/proxy/hosts", auth, (req,res) => {
   try {
     const meta = loadProxyMeta();
     const files = fs.readdirSync(NAVAIL).filter(f=>f!=="default"&&f!=="gravity-fallback");
-    res.json(files.map(f => ({ name:f, active: proxyIsActive(f), ...( meta[f] || {domains:[f],forwardHost:"?",forwardPort:"",sslMode:"none"} ) })));
+    res.json(files.map(f => {
+      const m = meta[f] || {domains:[f],forwardHost:"?",forwardPort:"",sslMode:"none"};
+      return { name:f, active: proxyIsActive(f), ...m, sslActive: proxyCertExists(m) };
+    }));
   } catch { res.json([]); }
 });
 
@@ -1566,9 +1592,7 @@ app.post("/api/proxy/hosts", auth, async (req,res) => {
       proxyEnable(fn);
       await execAsync("nginx -t && systemctl reload nginx");
       const meta = loadProxyMeta(); meta[fn]=h; saveProxyMeta(meta);
-      const emailArg = h.letsencryptEmail ? `-m ${sh(h.letsencryptEmail)}` : "--register-unsafely-without-email";
-      const domainArgs = h.domains.map(d=>`-d ${sh(d)}`).join(" ");
-      const jobId = runJob(`certbot certonly --nginx --non-interactive --agree-tos ${emailArg} ${domainArgs} 2>&1 && echo "=== Certificat obtenu — finalisation... ===" && curl -s -X POST -H 'Content-Type: application/json' -b "gravity_sid=${getSid(req)}" http://127.0.0.1:${process.env.GRAVITY_PORT||4000}/api/proxy/hosts/${fn}/finalize-ssl >/dev/null && echo "=== Hôte HTTPS actif ✓ ==="`);
+      const jobId = startLetsEncrypt(fn, h);
       return res.json({ok:true, jobId, name:fn});
     }
     fs.writeFileSync(path.join(NAVAIL,fn), buildProxyConf(h));
@@ -1602,6 +1626,9 @@ app.put("/api/proxy/hosts/:name", auth, async (req,res) => {
     fs.writeFileSync(path.join(NAVAIL,fn), buildProxyConf(h));
     if (proxyIsActive(fn)) await execAsync("nginx -t && systemctl reload nginx");
     const meta = loadProxyMeta(); meta[fn]=h; saveProxyMeta(meta);
+    // Let's Encrypt configuré mais certificat absent (demande précédente
+    // échouée) : on relance la demande à l'enregistrement.
+    if (h.sslMode==="letsencrypt" && !proxyCertExists(h)) return res.json({ok:true, jobId:startLetsEncrypt(fn, h)});
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:"Erreur Nginx : "+e.message}); }
 });
