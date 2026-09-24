@@ -1532,6 +1532,14 @@ ${exploits}${cache}${customLocs}${advanced}
 }
 
 // Le certificat existe réellement sur le disque (état réel, pas le mode configuré)
+// Date d'expiration (ISO) du certificat, ou null s'il est absent/illisible
+function proxyCertExpiry(h) {
+  try {
+    const f = h.sslMode==="letsencrypt" ? `/etc/letsencrypt/live/${h.domains[0]}/fullchain.pem` : h.sslMode==="custom" ? h.certPath : null;
+    if (!f || !fs.existsSync(f)) return null;
+    return new Date(new crypto.X509Certificate(fs.readFileSync(f)).validTo).toISOString();
+  } catch { return null; }
+}
 function proxyCertExists(h) {
   try {
     if (h.sslMode==="letsencrypt") return fs.existsSync(`/etc/letsencrypt/live/${h.domains[0]}/fullchain.pem`);
@@ -1574,7 +1582,7 @@ app.get("/api/proxy/hosts", auth, (req,res) => {
     const files = fs.readdirSync(NAVAIL).filter(f=>f!=="default"&&f!=="gravity-fallback");
     res.json(files.map(f => {
       const m = meta[f] || {domains:[f],forwardHost:"?",forwardPort:"",sslMode:"none"};
-      return { name:f, active: proxyIsActive(f), ...m, sslActive: proxyCertExists(m) };
+      return { name:f, active: proxyIsActive(f), ...m, sslActive: proxyCertExists(m), sslExpires: proxyCertExpiry(m) };
     }));
   } catch { res.json([]); }
 });
