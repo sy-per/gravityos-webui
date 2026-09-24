@@ -2154,7 +2154,7 @@ function runJob(cmd, onDone) {
 app.get("/api/jobs/:id", auth, (req,res)=>{
   const job = jobs.get(req.params.id);
   if(!job) return res.status(404).json({error:"Job introuvable"});
-  res.json({log: job.log.join(""), running: job.running});
+  res.json({log: job.log.join(""), running: job.running, success: job.success});
 });
 function sh(v){ return `'${String(v).replace(/'/g,"'\\''")}'`; }
 
