@@ -279,6 +279,53 @@ app.get("/api/system/network", auth, async (req,res) => {
     res.json({ iface: iface?.iface || "—", ip4: iface?.ip4 || "—" });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
+// Redémarrage nécessaire ? (fichier posé par les paquets, ou noyau installé
+// plus récent que celui qui tourne) + éventuel redémarrage déjà planifié.
+function rebootReasons() {
+  const reasons = [];
+  try {
+    if (fs.existsSync("/var/run/reboot-required")) {
+      let pkgs = "";
+      try { pkgs = fs.readFileSync("/var/run/reboot-required.pkgs", "utf8").trim().split("\n").filter(Boolean).join(", "); } catch {}
+      reasons.push(pkgs ? `Mise à jour de : ${pkgs}` : "Une mise à jour demande un redémarrage");
+    }
+    const running = execSync("uname -r").toString().trim();
+    const kernels = fs.readdirSync("/boot").filter(f => f.startsWith("vmlinuz-")).map(f => f.slice(8));
+    if (kernels.length) {
+      const newest = kernels.slice().sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).pop();
+      if (newest !== running && newest.localeCompare(running, undefined, { numeric: true }) > 0)
+        reasons.push(`Nouveau noyau installé (${newest}), le noyau actuel est ${running}`);
+    }
+  } catch {}
+  return reasons;
+}
+function scheduledReboot() {
+  try {
+    const t = fs.readFileSync("/run/systemd/shutdown/scheduled", "utf8");
+    const usec = parseInt((t.match(/^USEC=(\d+)/m) || [])[1], 10);
+    if (usec && /^MODE=reboot/m.test(t)) return new Date(usec / 1000).toISOString();
+  } catch {}
+  return null;
+}
+app.get("/api/system/reboot-status", auth, (req,res) => {
+  const reasons = rebootReasons();
+  res.json({ required: reasons.length > 0, reasons, scheduled: scheduledReboot() });
+});
+// Planifie un redémarrage dans N minutes (shutdown -r : géré par systemd,
+// pas perdu si l'interface est fermée) ; DELETE l'annule.
+app.post("/api/system/reboot-schedule", auth, async (req,res) => {
+  const minutes = Math.round(Number(req.body?.minutes));
+  if (!Number.isFinite(minutes) || minutes < 1 || minutes > 60*24*30) return res.status(400).json({error:"Délai invalide (1 minute à 30 jours)"});
+  try {
+    await execAsync("shutdown -c 2>/dev/null || true");
+    await execAsync(`shutdown -r +${minutes} "Redémarrage planifié depuis GravityOS"`);
+    res.json({ ok:true, scheduled: scheduledReboot() });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.delete("/api/system/reboot-schedule", auth, async (req,res) => {
+  try { await execAsync("shutdown -c 2>/dev/null || true"); res.json({ok:true}); }
+  catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post("/api/system/reboot",   auth, (req,res) => { res.json({ok:true}); setTimeout(()=>exec("systemctl reboot"),1000); });
 app.post("/api/system/shutdown", auth, (req,res) => { res.json({ok:true}); setTimeout(()=>exec("systemctl poweroff"),1000); });
 app.post("/api/system/change-password", auth, async (req,res) => {
@@ -4656,14 +4703,16 @@ let updateRunning = false;
 // forget, réponse immédiate) que par la tâche planifiée système "Mise à jour
 // automatique" (qui a besoin d'attendre la fin réelle pour enregistrer un
 // historique correct — voir startScheduledTaskRun/runBuiltinTask plus bas).
+let updateOk = null;
 function runUpdateProcess(cmd) {
   return new Promise((resolve) => {
     updateLog = [];
     updateRunning = true;
+    updateOk = null;
     const child = require("child_process").spawn("bash",["-c",cmd],{env:{...process.env,DEBIAN_FRONTEND:"noninteractive",LANG:"C"}});
     child.stdout.on("data",d=>updateLog.push(d.toString()));
     child.stderr.on("data",d=>updateLog.push(d.toString()));
-    child.on("close",(code)=>{ updateRunning=false; updateLog.push("=== DONE ==="); resolve({ok: code===0, log: updateLog.join("")}); });
+    child.on("close",(code)=>{ updateRunning=false; updateOk = code===0; updateLog.push(code===0 ? "=== DONE ===" : `=== ERREUR (code ${code}) ===`); resolve({ok: code===0, log: updateLog.join("")}); });
   });
 }
 function streamUpdate(cmd, res) {
@@ -4677,7 +4726,16 @@ function streamUpdate(cmd, res) {
 // dépendance), donc "Installer la mise à jour" semblait ne rien faire alors
 // que la commande réussissait juste sans rien installer (signalé par un
 // utilisateur réel bloqué sur les mêmes 2 paquets noyau à chaque vérification).
-function systemUpdateCmd() { return "apt-get update -qq && apt-get dist-upgrade -y 2>&1"; }
+// - DPkg::Lock::Timeout : attend qu'un autre apt (mise à jour automatique
+//   Debian...) libère le verrou au lieu d'échouer aussitôt ;
+// - dpkg --configure -a : termine une installation précédente interrompue
+//   (ex. service redémarré en plein milieu), qui bloquait toutes les suivantes ;
+// - --force-confold/confdef : jamais de question sur un fichier de config ;
+// - en cas d'échec, la sortie l'explique (et liste les paquets "hold").
+function systemUpdateCmd() {
+  const opt = "-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold";
+  return `{ dpkg --configure -a; apt-get -o DPkg::Lock::Timeout=300 update && apt-get ${opt} dist-upgrade -y; } 2>&1 || { rc=$?; echo "--- Paquets bloqués (hold) :"; apt-mark showhold; exit $rc; }`;
+}
 
 // Cœur de la vérification des mises à jour système, réutilisé par l'endpoint
 // HTTP et par la tâche planifiée système "Vérification des mises à jour (OS)".
@@ -5062,7 +5120,7 @@ app.post("/api/updates/gravity/start", auth, (req,res) => {
 
 // Lire les logs de mise à jour en cours
 app.get("/api/updates/log", auth, (req,res) => {
-  res.json({log: updateLog.join(""), running: updateRunning});
+  res.json({log: updateLog.join(""), running: updateRunning, success: updateOk});
 });;
 
 // Route de diagnostic terminal
