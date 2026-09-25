@@ -283,6 +283,25 @@ app.get("/api/system/network", auth, async (req,res) => {
 // plus récent que celui qui tourne) + éventuel redémarrage déjà planifié.
 function rebootReasons() {
   const reasons = [];
+  // needrestart -b (batch) : état du noyau/microcode + services qui utilisent
+  // encore d'anciennes bibliothèques (ex. libssl mise à jour). Repli sur les
+  // vérifications manuelles ci-dessous s'il n'est pas installé.
+  let usedNeedrestart = false;
+  try {
+    if (cmdExists("needrestart")) {
+      const out = execSync("needrestart -b 2>/dev/null", { timeout: 30000 }).toString();
+      usedNeedrestart = true;
+      const ksta = parseInt((out.match(/NEEDRESTART-KSTA:\s*(\d)/) || [])[1], 10);
+      const kcur = (out.match(/NEEDRESTART-KCUR:\s*(\S+)/) || [])[1];
+      const kexp = (out.match(/NEEDRESTART-KEXP:\s*(\S+)/) || [])[1];
+      if (ksta >= 2 && kexp) reasons.push(`Nouveau noyau installé (${kexp}), le noyau actuel est ${kcur || "?"}`);
+      const usta = parseInt((out.match(/NEEDRESTART-USTA:\s*(\d)/) || [])[1], 10);
+      if (usta >= 2) reasons.push("Mise à jour du microcode du processeur");
+      const svcs = [...out.matchAll(/NEEDRESTART-SVC:\s*(\S+)/g)].map(m => m[1].replace(/\.service$/, ""));
+      if (svcs.length) reasons.push(`Services utilisant d'anciennes bibliothèques : ${svcs.join(", ")}`);
+    }
+  } catch {}
+  if (usedNeedrestart) return reasons;
   try {
     if (fs.existsSync("/var/run/reboot-required")) {
       let pkgs = "";
@@ -4886,6 +4905,17 @@ function gravityUpdateCmd() {
       systemctl enable --now NetworkManager 2>/dev/null || true
     fi
 
+    # needrestart : détecte les mises à jour qui exigent un redémarrage (noyau,
+    # microcode, bibliothèques) — utilisé par Mises à jour > Redémarrage.
+    # Déjà dans la liste de paquets de l'ISO, ce correctif ne sert qu'aux NAS
+    # déjà installés. Config en mode "liste seulement" : jamais de
+    # redémarrage automatique de services (docker, libvirt...) pendant une mise à jour.
+    if ! command -v needrestart &>/dev/null; then
+      echo "Installation de needrestart (détection des redémarrages nécessaires)..."
+      apt-get install -y --no-install-recommends needrestart 2>&1 | tail -3
+    fi
+    mkdir -p /etc/needrestart/conf.d
+    printf '%s\n' '$nrconf{restart} = "l";' > /etc/needrestart/conf.d/gravity.conf
     # nginx + certbot requis pour le Proxy inversé (onglet Paramètres >
     # Réseau > Proxy inversé) — déjà dans la liste de paquets de l'ISO, ce
     # correctif ne sert qu'aux NAS déjà installés avant son ajout
