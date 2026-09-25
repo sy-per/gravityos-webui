@@ -5,7 +5,7 @@ const express  = require("express");
 const http     = require("http");
 const { WebSocketServer } = require("ws");
 const si       = require("systeminformation");
-const { exec, execSync, spawn } = require("child_process");
+const { exec, execFile, execSync, spawn } = require("child_process");
 const { promisify } = require("util");
 const path     = require("path");
 const fs       = require("fs");
@@ -652,6 +652,26 @@ app.put("/api/files/write", auth, async (req,res)=>{
     if (fs.existsSync(p) && fs.statSync(p).isDirectory()) return res.status(400).json({error:"Ce n'est pas un fichier"});
     fs.writeFileSync(p, content, "utf8");
     res.json({ok:true});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+// Taille totale d'un dossier, calculée à la demande (clic droit > "Calculer
+// la taille") — jamais dans /list, trop coûteux sur de gros dossiers.
+// "du -sb" ne suit pas les liens symboliques (pas de boucle) et compte les
+// octets réels des fichiers ; -x reste sur le même système de fichiers.
+app.get("/api/files/size", auth, async (req,res)=>{
+  const p = req.query.path;
+  if (!(await filesPathAllowed(p))) return res.status(400).json({error:"Chemin non autorisé"});
+  try {
+    if (!fs.existsSync(p)) return res.status(404).json({error:"Élément introuvable"});
+    const out = await new Promise((resolve, reject) => {
+      // du renvoie un code ≠ 0 dès qu'un sous-dossier est illisible tout en
+      // donnant un total exploitable : on garde la sortie dans ce cas
+      execFile("du", ["-sbx", "--", p], { timeout: 10*60*1000, maxBuffer: 1024*1024 }, (err, stdout) => {
+        const n = parseInt(String(stdout||"").split(/\s/)[0], 10);
+        if (Number.isFinite(n)) resolve(n); else reject(err || new Error("Calcul impossible"));
+      });
+    });
+    res.json({ size: out });
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 app.delete("/api/files/item", auth, async (req,res)=>{
