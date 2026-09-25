@@ -1861,12 +1861,35 @@ async function syncHostVmLink() {
     if (!iface) return;
     const { stdout } = await execAsync("virsh --connect qemu:///system list --name 2>/dev/null");
     const ips = [];
+    // Dernière IP connue de chaque VM : après un redémarrage du NAS, la table
+    // ARP est vide et vmIp() ne trouve rien tant que la VM n'a pas émis de
+    // trafic — la route n'était alors jamais recréée (502 sur le proxy).
+    const KNOWN_FILE = `${CFG}/vmlink-ips.json`;
+    let known = {};
+    try { known = JSON.parse(fs.readFileSync(KNOWN_FILE, "utf8")); } catch {}
+    let hasDirectVm = false, knownChanged = false;
     for (const n of stdout.split(String.fromCharCode(10)).map(x => x.trim()).filter(Boolean)) {
       const xml = await virsh(`dumpxml ${sh(n)}`);
       if (!/<interface type='direct'>/.test(xml)) continue;
+      hasDirectVm = true;
       const ip = await vmIp(n);
-      if (ip) ips.push(ip);
+      if (ip && known[n] !== ip) { known[n] = ip; knownChanged = true; }
+      if (ip || known[n]) ips.push(ip || known[n]);
     }
+    if (!hasDirectVm) return;
+    if (knownChanged) { try { fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(KNOWN_FILE, JSON.stringify(known)); } catch {} }
+    // Hôtes cibles du proxy inversé sur le même réseau local : routés aussi
+    // par la liaison (sans risque pour un autre appareil du LAN), pour que le
+    // proxy fonctionne même si l'IP de la VM n'est pas encore connue.
+    try {
+      const nasAddr = (await execAsync(`ip -4 -o addr show dev ${sh(iface)} 2>/dev/null`)).stdout.match(/inet (\d+\.\d+\.\d+)\.(\d+)/);
+      if (nasAddr) {
+        for (const h of Object.values(loadProxyMeta())) {
+          const m = String(h?.forwardHost || "").match(/^(\d+\.\d+\.\d+)\.(\d+)$/);
+          if (m && m[1] === nasAddr[1] && m[2] !== nasAddr[2] && !ips.includes(h.forwardHost)) ips.push(h.forwardHost);
+        }
+      }
+    } catch {}
     if (!ips.length) return;
     const links = (await execAsync("ip -o link show 2>/dev/null")).stdout;
     if (!links.includes(`${VMLINK_IF}:`)) await execAsync(`ip link add ${VMLINK_IF} link ${sh(iface)} type macvlan mode bridge`);
