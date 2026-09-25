@@ -1760,6 +1760,50 @@ async function vmIp(name){
   }
   return null;
 }
+// Une VM en pont direct (macvtap) n'est pas joignable depuis l'hôte lui-même
+// (limite du noyau : "No route to host"), donc ni par le proxy inversé du NAS
+// (502 Bad Gateway) ni par ses tâches. Contournement standard : une interface
+// macvlan en mode bridge sur la même interface physique, avec une route /32
+// vers chaque VM en pont direct qui tourne. Adresse source : la première IP
+// libre du sous-réseau en partant de .250. Resynchronisé toutes les 60 s
+// (VM démarrées/arrêtées, IP changée).
+const VMLINK_IF = "gravity-vmlink";
+let vmLinkSrc = null;
+async function syncHostVmLink() {
+  try {
+    const iface = await primaryIface();
+    if (!iface) return;
+    const { stdout } = await execAsync("virsh --connect qemu:///system list --name 2>/dev/null");
+    const ips = [];
+    for (const n of stdout.split(String.fromCharCode(10)).map(x => x.trim()).filter(Boolean)) {
+      const xml = await virsh(`dumpxml ${sh(n)}`);
+      if (!/<interface type='direct'>/.test(xml)) continue;
+      const ip = await vmIp(n);
+      if (ip) ips.push(ip);
+    }
+    if (!ips.length) return;
+    const links = (await execAsync("ip -o link show 2>/dev/null")).stdout;
+    if (!links.includes(`${VMLINK_IF}:`)) await execAsync(`ip link add ${VMLINK_IF} link ${sh(iface)} type macvlan mode bridge`);
+    let addr = (await execAsync(`ip -4 -o addr show dev ${VMLINK_IF} 2>/dev/null`).catch(() => ({stdout:""}))).stdout.match(/inet (\d+\.\d+\.\d+\.\d+)/);
+    if (!addr) {
+      const main = (await execAsync(`ip -4 -o addr show dev ${sh(iface)} 2>/dev/null`)).stdout.match(/inet (\d+\.\d+\.\d+)\.(\d+)/);
+      if (!main) return;
+      let src = null;
+      for (let last = 250; last > 200 && !src; last--) {
+        const cand = `${main[1]}.${last}`;
+        try { await execAsync(`ping -c1 -W1 ${cand} >/dev/null 2>&1`); } catch { src = cand; }
+      }
+      if (!src) return;
+      await execAsync(`ip addr add ${src}/32 dev ${VMLINK_IF}`);
+      vmLinkSrc = src;
+    } else vmLinkSrc = addr[1];
+    await execAsync(`ip link set ${VMLINK_IF} up`);
+    for (const ip of ips) await execAsync(`ip route replace ${ip}/32 dev ${VMLINK_IF} src ${vmLinkSrc}`);
+  } catch {}
+}
+setTimeout(syncHostVmLink, 10000).unref();
+setInterval(syncHostVmLink, 60000).unref();
+
 // Taille virtuelle du disque principal (Go) — lu via qemu-img sur le fichier
 // qcow2 attaché, indépendant de l'état running/stopped de la VM
 async function vmDiskGB(name){
