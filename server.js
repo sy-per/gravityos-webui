@@ -3663,11 +3663,19 @@ async function nasIp() {
 app.get("/api/app-shortcuts", auth, async(req,res)=>{
   try {
     const list = loadAppShortcuts();
-    const containers = list.some(s=>s.storeAppId) && docker
+    const containers = list.some(s=>s.storeAppId && !NATIVE_APPS.some(a => a.id === s.storeAppId)) && docker
       ? await docker.listContainers({all:true}).catch(()=>[])
       : [];
     const withStatus = await Promise.all(list.map(async(s)=>{
       if (s.vmName) return { ...s, running: await vmIsRunning(s.vmName).catch(()=>false) };
+      // App native (AMP...) : pas de projet Compose à démarrer/arrêter — on
+      // n'expose pas storeAppId (le bureau s'en servait pour "démarrer" un
+      // projet inexistant et grisait l'icône), mais nativeAppId pour le lien
+      // avec la fiche du Magasin.
+      if (s.storeAppId && NATIVE_APPS.some(a => a.id === s.storeAppId)) {
+        const { storeAppId, ...rest } = s;
+        return { ...rest, nativeAppId: storeAppId };
+      }
       if (s.storeAppId) {
         const project = `store-${s.storeAppId}`;
         const running = containers.some(c => c.Labels?.["com.docker.compose.project"] === project && c.State === "running");
