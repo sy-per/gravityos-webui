@@ -3048,6 +3048,93 @@ app.get("/api/docker/search", auth, async(req,res)=>{
   } catch(e){ res.status(500).json({error:"Recherche impossible (pas d'accès internet ?) — "+e.message}); }
 });
 
+// ── Pilote de stockage Docker : migration vfs → overlay2 ─────────────────────
+// Historiquement forcé à "vfs" (installations de test sous VirtualBox, sans
+// overlay). vfs ne partage aucune couche entre images/conteneurs : chaque
+// couche est une copie complète, l'espace disque explose (/var/lib/docker/vfs).
+// overlay2 partage les couches. Docker ne relit pas les images/conteneurs d'un
+// autre pilote : on déplace l'ancien dossier, on conserve /volumes (données
+// des volumes nommés), on redémarre en overlay2 puis on recrée les projets
+// Compose qui tournaient avant. Retour arrière automatique si overlay2 ne
+// démarre pas.
+function overlaySupported() {
+  const has = () => { try { return /\boverlay\b/.test(fs.readFileSync("/proc/filesystems","utf8")); } catch { return false; } };
+  if (has()) return true;
+  try { execSync("modprobe overlay 2>/dev/null"); } catch {}
+  return has();
+}
+app.get("/api/docker/storage", auth, async (req,res)=>{
+  try {
+    const { stdout } = await execAsync("docker info --format '{{.Driver}}' 2>/dev/null");
+    const driver = stdout.trim() || null;
+    const overlayOk = overlaySupported();
+    res.json({ driver, overlayOk, needsMigration: driver==="vfs" && overlayOk });
+  } catch { res.json({ driver:null, overlayOk:false, needsMigration:false }); }
+});
+app.post("/api/docker/storage/migrate", auth, async (req,res)=>{
+  try {
+    const { stdout } = await execAsync("docker info --format '{{.Driver}}|{{.DockerRootDir}}' 2>/dev/null");
+    const [driver, root] = stdout.trim().split("|");
+    if (driver !== "vfs") return res.status(400).json({error:`Le pilote actuel est déjà ${driver || "inconnu"}`});
+    if (!root || !root.startsWith("/")) return res.status(500).json({error:"Dossier racine Docker introuvable"});
+    if (!overlaySupported()) return res.status(400).json({error:"overlay2 n'est pas supporté par le noyau de cette machine — migration impossible"});
+    const dj = "/etc/docker/daemon.json";
+    let cfg = {};
+    try { cfg = JSON.parse(fs.readFileSync(dj,"utf8")); } catch {}
+    delete cfg["storage-driver"];
+    fs.mkdirSync("/etc/docker", {recursive:true});
+    if (fs.existsSync(dj)) fs.copyFileSync(dj, dj+".vfs-bak"); else fs.writeFileSync(dj+".vfs-bak", "{}");
+    fs.writeFileSync(dj+".overlay2", JSON.stringify(cfg,null,2));
+    // Projets Compose qui tournent actuellement (seuls ceux-là seront relancés)
+    fs.mkdirSync(COMPOSE_DIR,{recursive:true});
+    const running = [];
+    for (const d of fs.readdirSync(COMPOSE_DIR)) {
+      if (!fs.existsSync(path.join(COMPOSE_DIR,d,"docker-compose.yml"))) continue;
+      if (await stackHasRunningContainer(d)) running.push(d);
+    }
+    const c = composeCmd();
+    const recreate = running.map(d => `echo "--- Recréation de ${d} ---"; ( cd ${sh(path.join(COMPOSE_DIR,d))} && ${c} up -d --build ) || FAIL=1`).join("\n");
+    const script = `echo "=== Migration du stockage Docker : vfs -> overlay2 ==="
+ROOT=${sh(root)}
+OLD="$ROOT.vfs-old"
+FAIL=0
+echo "Conteneurs hors projets Compose (à recréer manuellement, liste conservée) :"
+docker ps -a --format '{{.Names}}\t{{.Image}}\t{{.Label "com.docker.compose.project"}}' | awk -F'\t' '$3==""{print "  - "$1" ("$2")"}' | tee ${sh(CFG+"/docker-migration-containers.txt")}
+rollback() {
+  echo "!!! overlay2 n'a pas démarré — retour arrière"
+  systemctl stop docker docker.socket
+  if [ -d "$ROOT/volumes" ]; then mv "$ROOT/volumes" "$OLD/volumes" || { echo "Retour arrière impossible (volumes) — rien supprimé"; exit 1; }; fi
+  rm -rf "$ROOT"
+  mv "$OLD" "$ROOT"
+  mv ${sh(dj+".vfs-bak")} ${sh(dj)}
+  systemctl start docker
+  exit 1
+}
+echo "Arrêt de Docker..."
+systemctl stop docker docker.socket || exit 1
+mv "$ROOT" "$OLD" || { systemctl start docker; exit 1; }
+mkdir -p "$ROOT"
+[ -d "$OLD/volumes" ] && mv "$OLD/volumes" "$ROOT/volumes"
+cp ${sh(dj+".overlay2")} ${sh(dj)}
+echo "Démarrage de Docker en overlay2..."
+systemctl start docker
+sleep 4
+[ "$(docker info --format '{{.Driver}}' 2>/dev/null)" = "overlay2" ] || rollback
+echo "overlay2 actif ✓"
+${recreate}
+if [ "$FAIL" = "0" ]; then
+  echo "Suppression de l'ancien stockage vfs (libère l'espace)..."
+  rm -rf "$OLD"
+  echo "=== Migration terminée ✓ ==="
+else
+  echo "!!! Certains projets n'ont pas pu être recréés — l'ancien stockage est conservé dans $OLD (à supprimer à la main une fois réglé)"
+  exit 1
+fi`;
+    const jobId = runJob(script);
+    res.json({ok:true, jobId, projects: running});
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
 // ── Docker Compose (stacks) ──────────────────────────────────────────────────
 app.get("/api/docker/compose", auth, (req,res)=>{
   try {
