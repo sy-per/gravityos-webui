@@ -4750,7 +4750,22 @@ async function checkOsUpdatesCore() {
   const {stdout} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | wc -l");
   const {stdout:pkgs} = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep -v 'Listing' | head -20");
   const count = parseInt(stdout.trim()) || 0;
-  return {count, packages: pkgs.trim().split("\n").filter(Boolean)};
+  // Paquets "conservés" : apt refuse de les mettre à jour (dist-upgrade
+  // simulé) parce que ça obligerait à en supprimer d'autres — ex. une
+  // bibliothèque 64 bits dont la version 32 bits (:i386) n'est pas encore
+  // publiée. Sans ça, "Installer la mise à jour" semblait ne rien faire.
+  let keptBack = [], wouldRemove = [];
+  try {
+    const { stdout: sim } = await execAsync("LC_ALL=C apt-get -s dist-upgrade 2>/dev/null");
+    const m = sim.match(/The following packages have been kept back:\n((?: +.*\n?)+)/);
+    if (m) keptBack = m[1].split(/\s+/).filter(Boolean);
+    if (keptBack.length) {
+      const { stdout: simInstall } = await execAsync(`LC_ALL=C apt-get -s install ${keptBack.map(sh).join(" ")} 2>/dev/null`).catch(() => ({ stdout: "" }));
+      const r = simInstall.match(/The following packages will be REMOVED:\n((?: +.*\n?)+)/);
+      if (r) wouldRemove = r[1].split(/\s+/).filter(Boolean);
+    }
+  } catch {}
+  return {count, packages: pkgs.trim().split("\n").filter(Boolean), keptBack, wouldRemove};
 }
 // Vérifier les mises à jour système disponibles
 app.get("/api/updates/system/check", auth, async(req,res) => {
