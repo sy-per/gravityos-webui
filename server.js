@@ -1842,7 +1842,7 @@ app.get("/api/vms", auth, async (req,res) => {
     const vms = raw.split("\n").slice(2).filter(Boolean).map(l=>{const p=l.trim().split(/\s{2,}/);return{id:p[0],name:p[1],state:p[2]};}).filter(v=>v.name);
     const detailed = await Promise.all(vms.map(async vm=>{
       let d = vm;
-      try{const i=await virsh(`dominfo ${vm.name}`);d={...vm,vcpus:(i.match(/CPU\(s\):\s+(\d+)/)||[])[1]||"?",memMB:Math.round(parseInt((i.match(/Max memory:\s+(\d+)/)||[])[1]||0)/1024)};}catch{}
+      try{const i=await virsh(`dominfo ${vm.name}`);d={...vm,autostart:/Autostart:\s+enable/i.test(i),vcpus:(i.match(/CPU\(s\):\s+(\d+)/)||[])[1]||"?",memMB:Math.round(parseInt((i.match(/Max memory:\s+(\d+)/)||[])[1]||0)/1024)};}catch{}
       const diskGB = await vmDiskGB(vm.name);
       if (diskGB!=null) d = { ...d, diskGB };
       if (loadExternalDisks()[vm.name]) d = { ...d, diskExternal: true };
@@ -1973,6 +1973,8 @@ app.post("/api/vms/:n/start",      auth, async (req,res)=>{try{await virsh(`star
 app.post("/api/vms/:n/stop",       auth, async (req,res)=>{try{await virsh(`shutdown ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/force-stop", auth, async (req,res)=>{try{await virsh(`destroy ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/restart",    auth, async (req,res)=>{try{await virsh(`reboot ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+// Démarrage automatique de la VM avec le NAS (autostart libvirt)
+app.post("/api/vms/:n/autostart", auth, async (req,res)=>{try{await virsh(`autostart ${req.body.enabled?"":"--disable "}${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/suspend",    auth, async (req,res)=>{try{await virsh(`suspend ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.post("/api/vms/:n/resume",     auth, async (req,res)=>{try{await virsh(`resume ${sh(req.params.n)}`);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
 app.delete("/api/vms/:n", auth, async (req,res)=>{
