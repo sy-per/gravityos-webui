@@ -3352,20 +3352,124 @@ function writeEnvFile(dir, values) {
 function catalogAppDataPrefix(id) { return `/srv/volumes/volume1/AppData/${id}`; }
 function appUsesPersistentData(app_) { return app_.composeYaml.includes(catalogAppDataPrefix(app_.id)); }
 
-app.get("/api/store/apps", auth, (req,res)=>{
+// ── Applications "natives" du Magasin (installées sur le système, hors Docker) ──
+// Le catalogue umbrel ne contient que des apps Docker. Certaines apps (ex. AMP
+// de CubeCoders, gestionnaire de serveurs de jeux) s'installent directement
+// sur l'hôte : on les déclare ici, avec leur détection (déjà installée ?),
+// leur installation/désinstallation, et un raccourci vers leur interface web.
+const NATIVE_STATE_FILE = `${CFG}/native-apps.json`;
+const NATIVE_CRED_DIR = `${CFG}/native-credentials`;
+function loadNativeState(){ try{ return JSON.parse(fs.readFileSync(NATIVE_STATE_FILE,"utf8")); } catch { return {}; } }
+function saveNativeState(st){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(NATIVE_STATE_FILE, JSON.stringify(st,null,2)); }
+function cmdExists(c){ try { execSync(`command -v ${c}`, {shell:"/bin/bash", stdio:"ignore"}); return true; } catch { return false; } }
+const AMP_ICON = "data:image/svg+xml;utf8," + encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#f97316"/><path d="M16 40l6-16h4l3 9 3-9h4l6 16h-4l-4-10-3 10h-4l-3-10-4 10z" fill="#fff"/><rect x="14" y="44" width="36" height="4" rx="2" fill="#fff" opacity=".85"/></svg>`
+);
+const NATIVE_APPS = [{
+  id: "amp",
+  name: "AMP",
+  tagline: "Gestionnaire de serveurs de jeux (CubeCoders)",
+  description:
+    "AMP (Application Management Panel) de CubeCoders crée et gère des serveurs de jeux (Minecraft, Valheim, ARK, Palworld...) depuis une interface web.\n\n" +
+    "**Installation directe sur GravityOS** (hors Docker). GravityOS lance l'installateur officiel CubeCoders, qui installe AMP et son instance de gestion sur le port 8080.\n\n" +
+    "**Après l'installation** : ouvrez l'interface AMP, connectez-vous avec l'identifiant `admin` et le mot de passe généré par GravityOS (affiché ici), puis saisissez votre clé de licence AMP dans l'interface. Vous pouvez changer le mot de passe depuis AMP.\n\n" +
+    "**Remarque** : l'installation met aussi à jour les paquets du système et peut prendre plusieurs minutes. AMP est un logiciel commercial (licence CubeCoders requise).",
+  category: "developer",
+  version: "",
+  developer: "CubeCoders",
+  website: "https://cubecoders.com/AMP",
+  repo: "",
+  icon: AMP_ICON,
+  gallery: [],
+  hostPorts: [8080],
+  usesHostNetwork: false,
+  needsReview: [],
+  hasUserFacingPassword: true,
+  hasPersistentData: false,
+  native: true,
+  isInstalled() {
+    return cmdExists("ampinstmgr") || fs.existsSync("/opt/cubecoders/amp/ampinstmgr") ||
+      (() => { try { execSync("getent passwd amp", {stdio:"ignore"}); return true; } catch { return false; } })();
+  },
+  installScript(password) {
+    return `echo "=== Installation d'AMP (CubeCoders) — installateur officiel getamp.sh ==="
+export USE_ANSWERS=1 ANSWER_AMPUSER=admin ANSWER_AMPPASS=${sh(password)} ANSWER_HTTPS=n ANSWER_INSTALLJAVA=y ANSWER_INSTALL32BITLIBS=n ANSWER_INSTALLPODMAN=n ANSWER_INSTALLDOCKER=n ANSWER_REINSTALLDOCKER=n SKIPLOCALECHECK=1 AMP_ADS_PORT=8080
+curl -fsSL https://getamp.sh -o /tmp/getamp.sh || { echo "Téléchargement de l'installateur impossible (connexion Internet ?)"; exit 1; }
+bash /tmp/getamp.sh; rc=$?
+rm -f /tmp/getamp.sh
+exit $rc`;
+  },
+  uninstallScript(deleteData) {
+    return `echo "=== Désinstallation d'AMP ==="
+systemctl stop ampinstmgr 2>/dev/null
+systemctl disable ampinstmgr 2>/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get purge -y ampinstmgr
+rm -f /etc/apt/sources.list.d/cubecoders*.list /etc/apt/sources.list.d/cubecoders*.sources
+${deleteData ? "pkill -u amp 2>/dev/null; userdel -r amp 2>/dev/null; echo 'Données AMP supprimées'" : "echo 'Données conservées dans /home/amp (serveurs de jeux)'"}
+echo "=== AMP désinstallé ✓ ==="`;
+  },
+}];
+function nativeAppPort(def){ return loadNativeState()[def.id]?.port || def.hostPorts[0]; }
+async function ensureNativeShortcut(def) {
+  const st = loadNativeState();
+  const list = loadAppShortcuts();
+  if (!list.some(s => s.storeAppId === def.id)) {
+    const ip = await nasIp();
+    list.push({ id: crypto.randomBytes(6).toString("hex"), name: def.name, url: `http://${ip}:${nativeAppPort(def)}`, icon: def.icon, storeAppId: def.id });
+    saveAppShortcuts(list);
+  }
+  st[def.id] = { ...(st[def.id]||{}), shortcut:true };
+  saveNativeState(st);
+}
+// Apps natives déjà présentes sur le NAS (installées à la main) : raccourci
+// créé une seule fois — pas recréé si l'utilisateur l'a ensuite supprimé.
+async function syncNativeShortcuts() {
+  const st = loadNativeState();
+  for (const def of NATIVE_APPS) {
+    if (def.isInstalled() && !st[def.id]?.shortcut) await ensureNativeShortcut(def).catch(()=>{});
+  }
+}
+function nativeCredFile(id){ return path.join(NATIVE_CRED_DIR, `${id}.json`); }
+
+app.get("/api/store/apps", auth, async (req,res)=>{
   try {
+    await syncNativeShortcuts();
     const catalog = loadStoreCatalog();
-    res.json(catalog.map(app => ({
+    const list = catalog.map(app => ({
       ...app,
       composeYaml: undefined, // pas besoin côté liste, alourdit la réponse
       installed: fs.existsSync(path.join(storeDir(app.id), "docker-compose.yml")),
       hasPersistentData: appUsesPersistentData(app),
-    })));
+    }));
+    const natives = NATIVE_APPS.map(({ isInstalled, installScript, uninstallScript, ...def }) => ({
+      ...def, hostPorts: [nativeAppPort(def)], installed: isInstalled(),
+    }));
+    res.json([...natives, ...list]);
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
 app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
+  const nat = NATIVE_APPS.find(a => a.id === id);
+  if (nat) {
+    if (nat.isInstalled()) return res.status(409).json({error:`${nat.name} est déjà installé sur ce système`});
+    const password = crypto.randomBytes(10).toString("hex");
+    fs.mkdirSync(NATIVE_CRED_DIR, {recursive:true, mode:0o700});
+    fs.writeFileSync(nativeCredFile(id), JSON.stringify({ username:"admin", password }), {mode:0o600});
+    const createShortcut = req.body?.createShortcut !== false;
+    const jobId = runJob(nat.installScript(password), async (ok, log) => {
+      try {
+        if (!ok) { try { fs.unlinkSync(nativeCredFile(id)); } catch {} return; }
+        // Le port réel peut différer de 8080 si celui-ci était pris (l'installateur le signale)
+        const m = String(log).match(/will use port (\d+) instead/);
+        const st = loadNativeState();
+        st[id] = { ...(st[id]||{}), port: m ? Number(m[1]) : nat.hostPorts[0] };
+        saveNativeState(st);
+        if (createShortcut) await ensureNativeShortcut(nat);
+      } catch (e) { console.error(`Finalisation de ${id} échouée:`, e.message); }
+    });
+    return res.json({ok:true, jobId});
+  }
   const app_ = loadStoreCatalog().find(a => a.id === id);
   if (!app_) return res.status(404).json({error:"Application introuvable dans le catalogue"});
   // Case "Créer un raccourci" cochée par défaut (demande explicite de
@@ -3443,6 +3547,10 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
 app.get("/api/store/apps/:id/credentials", auth, (req,res)=>{
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
   try {
+    if (NATIVE_APPS.some(a => a.id === id)) {
+      const f = nativeCredFile(id);
+      return res.json(fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : {});
+    }
     const file = path.join(storeDir(id), "credentials.json");
     res.json(fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {});
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -3450,6 +3558,19 @@ app.get("/api/store/apps/:id/credentials", auth, (req,res)=>{
 
 app.post("/api/store/apps/:id/uninstall", auth, async(req,res)=>{
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
+  const nat = NATIVE_APPS.find(a => a.id === id);
+  if (nat) {
+    if (!nat.isInstalled()) return res.status(404).json({error:"Application non installée"});
+    const jobId = runJob(nat.uninstallScript(req.body?.deleteData === true), (ok) => {
+      try {
+        if (!ok) return;
+        saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== id));
+        const st = loadNativeState(); delete st[id]; saveNativeState(st);
+        try { fs.unlinkSync(nativeCredFile(id)); } catch {}
+      } catch (e) { console.error(`Nettoyage de ${id} échoué:`, e.message); }
+    });
+    return res.json({ok:true, jobId});
+  }
   const dir = storeDir(id);
   const composeFile = path.join(dir, "docker-compose.yml");
   if (!fs.existsSync(composeFile)) return res.status(404).json({error:"Application non installée"});
