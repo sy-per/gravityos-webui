@@ -281,8 +281,10 @@ app.get("/api/system/network", auth, async (req,res) => {
 });
 // Redémarrage nécessaire ? (fichier posé par les paquets, ou noyau installé
 // plus récent que celui qui tourne) + éventuel redémarrage déjà planifié.
+let rebootServices = [];
 function rebootReasons() {
   const reasons = [];
+  rebootServices = [];
   // needrestart -b (batch) : état du noyau/microcode + services qui utilisent
   // encore d'anciennes bibliothèques (ex. libssl mise à jour). Repli sur les
   // vérifications manuelles ci-dessous s'il n'est pas installé.
@@ -298,7 +300,10 @@ function rebootReasons() {
       const usta = parseInt((out.match(/NEEDRESTART-USTA:\s*(\d)/) || [])[1], 10);
       if (usta >= 2) reasons.push("Mise à jour du microcode du processeur");
       const svcs = [...out.matchAll(/NEEDRESTART-SVC:\s*(\S+)/g)].map(m => m[1].replace(/\.service$/, ""));
-      if (svcs.length) reasons.push(`Services utilisant d'anciennes bibliothèques : ${svcs.join(", ")}`);
+      // Les services (wsdd, etc.) ne sont PAS une raison de redémarrer : needrestart
+      // en signale à tort juste après un démarrage (scripts Python/Perl). Seuls le
+      // noyau et le microcode exigent un vrai redémarrage.
+      rebootServices = svcs;
     }
   } catch {}
   if (usedNeedrestart) return reasons;
@@ -328,7 +333,7 @@ function scheduledReboot() {
 }
 app.get("/api/system/reboot-status", auth, (req,res) => {
   const reasons = rebootReasons();
-  res.json({ required: reasons.length > 0, reasons, scheduled: scheduledReboot() });
+  res.json({ required: reasons.length > 0, reasons, services: rebootServices, scheduled: scheduledReboot() });
 });
 // Planifie un redémarrage dans N minutes (shutdown -r : géré par systemd,
 // pas perdu si l'interface est fermée) ; DELETE l'annule.
