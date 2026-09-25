@@ -3688,7 +3688,7 @@ app.get("/api/app-shortcuts", auth, async(req,res)=>{
 });
 
 app.post("/api/app-shortcuts", auth, async(req,res)=>{
-  const { id, name, ip, port, icon, https, vmName, dynamic, url, storeAppId, hidden } = req.body;
+  const { id, name, ip, port, icon, https, vmName, dynamic, url, storeAppId, hidden, stackName } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({error:"Nom requis"});
   try {
     const baseId = id || crypto.randomBytes(6).toString("hex");
@@ -3728,6 +3728,9 @@ app.post("/api/app-shortcuts", auth, async(req,res)=>{
     // continuent de fonctionner sur un raccourci recréé/édité ici plutôt
     // qu'automatiquement à l'installation.
     if (storeAppId) entry.storeAppId = String(storeAppId);
+    // Projet Docker créé à la main auquel ce raccourci est rattaché (simple
+    // étiquette : permet à l'app Docker de retrouver/supprimer "son" raccourci).
+    if (stackName) entry.stackName = String(stackName).replace(/[^a-zA-Z0-9_-]/g, "");
     // Masque l'icône du menu Applications et du bureau sans supprimer le
     // raccourci (nom/URL/icône restent en mémoire) — bouton "Modifier" du
     // détail d'une app du Magasin, demande explicite : pouvoir désactiver
