@@ -3155,8 +3155,9 @@ app.get("/api/docker/port-check", auth, async(req,res)=>{
 });
 
 app.post("/api/docker/containers/create", auth, (req,res)=>{
-  const { image, name, ports, volumes, env, restartPolicy, network, command } = req.body;
+  const { image, name, ports, volumes, env, restartPolicy, network, command, replaceId } = req.body;
   if(!image || !/^[a-zA-Z0-9._\-\/:]+$/.test(image)) return res.status(400).json({error:"Image invalide"});
+  if(replaceId !== undefined && !/^[a-zA-Z0-9_.-]+$/.test(String(replaceId))) return res.status(400).json({error:"Conteneur à remplacer invalide"});
   try {
     const args = ["run","-d"];
     if(name) args.push("--name", sh(name.replace(/[^a-zA-Z0-9_.-]/g,"")));
@@ -3167,9 +3168,41 @@ app.post("/api/docker/containers/create", auth, (req,res)=>{
     for(const e of (env||[])) if(e.key) args.push("-e", sh(`${e.key}=${e.value||""}`));
     args.push(sh(image));
     if(command && command.trim()) args.push(command.trim());
-    const jobId = runJob(`docker ${args.join(" ")} 2>&1`);
+    let cmd = `docker ${args.join(" ")} 2>&1`;
+    if (replaceId !== undefined) {
+      // Édition d'un conteneur : l'ancien est arrêté et renommé (pas supprimé)
+      // avant de créer le nouveau ; s'il échoue, l'ancien est remis en place et
+      // redémarré — l'ancien flux le supprimait d'abord, donc un échec de
+      // création le faisait disparaître pour de bon.
+      const oldRef = sh(String(replaceId));
+      const finalName = name ? name.replace(/[^a-zA-Z0-9_.-]/g,"") : "";
+      const tmp = `gravity-old-${Date.now()}`;
+      cmd = `docker stop ${oldRef} >/dev/null 2>&1; docker rename ${oldRef} ${tmp} || exit 1
+if docker ${args.join(" ")} 2>&1; then
+  docker rm -f ${tmp} >/dev/null 2>&1
+else
+  echo "Échec de la création : restauration de l'ancien conteneur"
+  ${finalName ? `docker rename ${tmp} ${sh(finalName)} && docker start ${sh(finalName)} >/dev/null 2>&1` : `docker start ${tmp} >/dev/null 2>&1`}
+  exit 1
+fi`;
+    }
+    const jobId = runJob(cmd);
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Configuration par défaut d'une image (ports EXPOSE, dossiers VOLUME) —
+// préremplit l'assistant de création. Vide si l'image n'est pas encore locale.
+app.get("/api/docker/images/config", auth, async(req,res)=>{
+  const ref = req.query.ref;
+  if(!ref || !/^[a-zA-Z0-9._\-\/:]+$/.test(ref)) return res.status(400).json({error:"Image invalide"});
+  try {
+    const {stdout} = await execAsync(`docker image inspect ${sh(ref)} --format '{{json .Config}}' 2>/dev/null`);
+    const cfg = JSON.parse(stdout.trim() || "{}") || {};
+    const ports = Object.keys(cfg.ExposedPorts || {}).map(k => { const [port, proto] = k.split("/"); return { port, proto: proto || "tcp" }; });
+    const volumes = Object.keys(cfg.Volumes || {});
+    res.json({ local: true, ports, volumes });
+  } catch { res.json({ local: false, ports: [], volumes: [] }); }
 });
 
 // Ports exposés déclarés par une image (Dockerfile EXPOSE) — pour préremplir
