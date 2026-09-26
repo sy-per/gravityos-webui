@@ -2989,8 +2989,8 @@ function retagPinnedImagesCmd(composeYaml) {
 // (cas après la migration overlay2, qui a re-tiré les images sans ce re-tag).
 async function retagAllComposeImages() {
   try {
-    for (const d of fs.readdirSync(COMPOSE_DIR)) {
-      const cmd = retagPinnedImagesForDir(path.join(COMPOSE_DIR, d));
+    for (const st of allStacks()) {
+      const cmd = retagPinnedImagesForDir(st.dir);
       if (cmd) await execAsync(cmd).catch(() => {});
     }
   } catch {}
@@ -3007,6 +3007,27 @@ function composeUpCmd(dir, composeArgs, retag) {
   const steps = [`cd ${sh(dir)}`, `${composeCmd()} ${composeArgs}`];
   if (retag) steps.push(retag);
   return `{ ${steps.join(" && ")} ; } 2>&1`;
+}
+
+// ── Emplacement des projets Compose ──────────────────────────────────────────
+// Par défaut un projet vit dans <Volume 1>/Docker/<nom>. Il peut être créé
+// ailleurs (<Volume X>/Docker/<sous-dossier>) : son emplacement est alors
+// mémorisé ici, et toutes les actions sur le projet passent par stackDir().
+// Le nom du projet Compose est fixé par COMPOSE_PROJECT_NAME dans son .env
+// (sinon Compose prendrait le nom du dossier, et le suivi par nom casserait).
+const STACK_LOCATIONS_FILE = `${CFG}/stack-locations.json`;
+function loadStackLocations(){ try { return JSON.parse(fs.readFileSync(STACK_LOCATIONS_FILE,"utf8")); } catch { return {}; } }
+function saveStackLocations(m){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(STACK_LOCATIONS_FILE, JSON.stringify(m,null,2)); }
+function stackDir(name) {
+  const clean = String(name).replace(/[^a-zA-Z0-9_-]/g,"");
+  return loadStackLocations()[clean] || path.join(COMPOSE_DIR, clean);
+}
+// Tous les projets connus (dossier par défaut + emplacements mémorisés)
+function allStacks() {
+  const out = new Map();
+  try { for (const d of fs.readdirSync(COMPOSE_DIR)) out.set(d, path.join(COMPOSE_DIR, d)); } catch {}
+  for (const [n, dir] of Object.entries(loadStackLocations())) out.set(n, dir);
+  return [...out.entries()].map(([name, dir]) => ({ name, dir })).filter(x => fs.existsSync(path.join(x.dir, "docker-compose.yml")));
 }
 
 // ── docker compose (v2 "docker compose" si dispo, sinon "docker-compose" v1) ──
@@ -3290,7 +3311,7 @@ app.post("/api/docker/images/update", auth, async(req,res)=>{
       affected.filter(c => c.Labels?.["com.docker.compose.project"]).map(c => c.Labels["com.docker.compose.project"])
     )];
     for (const project of projects) {
-      const dir = path.join(COMPOSE_DIR, project.replace(/[^a-zA-Z0-9_-]/g,""));
+      const dir = stackDir(project);
       if (fs.existsSync(path.join(dir,"docker-compose.yml"))) {
         const retag = retagPinnedImagesForDir(dir);
         steps.push(`echo "=== Recreation du projet ${project} ===" && cd ${sh(dir)} && ${composeCmd()} up -d --force-recreate${retag ? " && " + retag : ""}`);
@@ -3442,12 +3463,11 @@ app.post("/api/docker/storage/migrate", auth, async (req,res)=>{
     // Projets Compose qui tournent actuellement (seuls ceux-là seront relancés)
     fs.mkdirSync(COMPOSE_DIR,{recursive:true});
     const running = [];
-    for (const d of fs.readdirSync(COMPOSE_DIR)) {
-      if (!fs.existsSync(path.join(COMPOSE_DIR,d,"docker-compose.yml"))) continue;
-      if (await stackHasRunningContainer(d)) running.push(d);
+    for (const st of allStacks()) {
+      if (await stackHasRunningContainer(st.name)) running.push(st.name);
     }
     const c = composeCmd();
-    const recreate = running.map(d => `echo "--- Recréation de ${d} ---"; ( cd ${sh(path.join(COMPOSE_DIR,d))} && ${c} up -d --build ${retagPinnedImagesForDir(path.join(COMPOSE_DIR,d)) ? '&& ' + retagPinnedImagesForDir(path.join(COMPOSE_DIR,d)) : ''} ) || FAIL=1`).join("\n");
+    const recreate = running.map(d => `echo "--- Recréation de ${d} ---"; ( cd ${sh(stackDir(d))} && ${c} up -d --build ${retagPinnedImagesForDir(stackDir(d)) ? '&& ' + retagPinnedImagesForDir(stackDir(d)) : ''} ) || FAIL=1`).join("\n");
     const script = `echo "=== Migration du stockage Docker : vfs -> overlay2 ==="
 ROOT=${sh(root)}
 OLD="$ROOT.vfs-old"
@@ -3493,25 +3513,41 @@ fi`;
 app.get("/api/docker/compose", auth, (req,res)=>{
   try {
     fs.mkdirSync(COMPOSE_DIR,{recursive:true});
-    res.json(fs.readdirSync(COMPOSE_DIR).filter(d=>fs.existsSync(path.join(COMPOSE_DIR,d,"docker-compose.yml"))));
+    res.json(allStacks().map(x => x.name));
   } catch(e){ res.json([]); }
 });
 app.get("/api/docker/compose/:name", auth, (req,res)=>{
   try {
-    const f = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""), "docker-compose.yml");
+    const f = path.join(stackDir(req.params.name), "docker-compose.yml");
     res.type("text/plain").send(fs.readFileSync(f,"utf8"));
   } catch(e){ res.status(404).json({error:"Stack introuvable"}); }
 });
-app.post("/api/docker/compose", auth, (req,res)=>{
-  const { name, content, env, start } = req.body;
+app.post("/api/docker/compose", auth, async (req,res)=>{
+  const { name, content, env, start, location } = req.body;
   if(!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de stack invalide (lettres/chiffres/-/_ uniquement)"});
   if(!content || !content.trim()) return res.status(400).json({error:"Contenu docker-compose.yml requis"});
   try {
-    const dir = path.join(COMPOSE_DIR, name);
+    // Emplacement : <Volume X>/Docker/<sous-dossier> (défaut : Volume 1/Docker/<nom>)
+    let dir = path.join(COMPOSE_DIR, name);
+    let custom = false;
+    if (location !== undefined && location !== null && location !== "") {
+      const loc = path.resolve(String(location));
+      const vols = await getVolumesList();
+      const okRoot = vols.some(v => loc.startsWith(path.join(v.path, "Docker") + path.sep) && loc.slice(path.join(v.path, "Docker").length + 1).match(/^[^/\\]+$/));
+      if (!okRoot || !/^[a-zA-Z0-9][a-zA-Z0-9 _.-]*$/.test(path.basename(loc)) || path.basename(loc).includes("..")) return res.status(400).json({error:"Emplacement invalide : <volume>/Docker/<sous-dossier> attendu"});
+      custom = loc !== path.join(COMPOSE_DIR, name);
+      dir = loc;
+    }
+    if (allStacks().some(x => x.name === name)) return res.status(409).json({error:"Un projet porte déjà ce nom"});
     fs.mkdirSync(dir,{recursive:true});
+    if (fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(409).json({error:"Ce dossier contient déjà un docker-compose.yml"});
     fs.writeFileSync(path.join(dir,"docker-compose.yml"), content);
-    // Variables (.env) : Docker Compose le charge tout seul depuis le dossier du projet
-    if (typeof env === "string" && env.trim()) fs.writeFileSync(path.join(dir,".env"), env.endsWith("\n") ? env : env + "\n", {mode:0o600});
+    // Variables (.env) : Docker Compose le charge tout seul depuis le dossier du projet.
+    // Projet hors du dossier par défaut : COMPOSE_PROJECT_NAME garde le nom du projet.
+    let envText = typeof env === "string" && env.trim() ? (env.endsWith("\n") ? env : env + "\n") : "";
+    if (custom && !/^COMPOSE_PROJECT_NAME=/m.test(envText)) envText += `COMPOSE_PROJECT_NAME=${name}\n`;
+    if (envText) fs.writeFileSync(path.join(dir,".env"), envText, {mode:0o600});
+    if (custom) { const m = loadStackLocations(); m[name] = dir; saveStackLocations(m); }
     // start === false : fichiers écrits, projet non démarré
     if (start === false) return res.json({ok:true, jobId:null});
     const jobId = runJob(composeUpCmd(dir, "up -d", retagPinnedImagesCmd(content)));
@@ -3522,7 +3558,7 @@ app.post("/api/docker/compose", auth, (req,res)=>{
 // lui-même lit le fichier (YAML, clés inconnues, références...) puis le rend
 // normalisé — on en tire les services, images, ports publiés et dossiers montés.
 app.post("/api/docker/compose/validate", auth, async(req,res)=>{
-  const { content, env, name } = req.body || {};
+  const { content, env, name, location } = req.body || {};
   if(!content || !String(content).trim()) return res.json({valid:false, error:"Le fichier est vide", services:[]});
   const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "gravity-compose-"));
   try {
@@ -3546,7 +3582,7 @@ app.post("/api/docker/compose/validate", auth, async(req,res)=>{
       ports: (svc.ports || []).map(p => ({ published: p.published ? String(p.published) : "", target: String(p.target), protocol: p.protocol || "tcp" })),
       // Les chemins relatifs (./data) sont résolus dans le dossier temporaire d'analyse :
       // on les ramène au dossier réel du futur projet
-      volumes: (svc.volumes || []).filter(v => v.type === "bind").map(v => v.source.startsWith(tmp) ? path.join(COMPOSE_DIR, String(name || "").replace(/[^a-zA-Z0-9_-]/g,"") || "projet") + v.source.slice(tmp.length) : v.source),
+      volumes: (svc.volumes || []).filter(v => v.type === "bind").map(v => v.source.startsWith(tmp) ? (location ? path.resolve(String(location)) : path.join(COMPOSE_DIR, String(name || "").replace(/[^a-zA-Z0-9_-]/g,"") || "projet")) + v.source.slice(tmp.length) : v.source),
       hasBuild: !!svc.build,
     }));
     // Images déjà présentes sur le NAS (pas à télécharger)
@@ -3560,9 +3596,14 @@ app.post("/api/docker/compose/validate", auth, async(req,res)=>{
   } catch(e){ res.json({valid:false, error:e.message, services:[]}); }
   finally { try { fs.rmSync(tmp, {recursive:true, force:true}); } catch {} }
 });
+app.get("/api/docker/compose/:name/info", auth, (req,res)=>{
+  const dir = stackDir(req.params.name);
+  if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
+  res.json({ dir });
+});
 app.post("/api/docker/compose/:name/up", auth, (req,res)=>{
   try {
-    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    const dir = stackDir(req.params.name);
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
     const jobId = runJob(composeUpCmd(dir, "up -d", retagPinnedImagesForDir(dir)));
     res.json({ok:true, jobId});
@@ -3576,7 +3617,7 @@ app.post("/api/docker/compose/:name/up", auth, (req,res)=>{
 // cassé, alors que "Démarrer" les recréait ensuite silencieusement.
 app.post("/api/docker/compose/:name/stop", auth, (req,res)=>{
   try {
-    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    const dir = stackDir(req.params.name);
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} stop 2>&1`);
     res.json({ok:true, jobId});
@@ -3587,7 +3628,7 @@ app.post("/api/docker/compose/:name/stop", auth, (req,res)=>{
 // depuis le fix ci-dessus.
 app.post("/api/docker/compose/:name/down", auth, (req,res)=>{
   try {
-    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    const dir = stackDir(req.params.name);
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} down 2>&1`);
     res.json({ok:true, jobId});
@@ -3602,7 +3643,7 @@ async function stackHasRunningContainer(name) {
 // (docker compose stop/down envoient un SIGTERM avec délai de grâce).
 app.post("/api/docker/compose/:name/kill", auth, (req,res)=>{
   try {
-    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    const dir = stackDir(req.params.name);
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} kill 2>&1`);
     res.json({ok:true, jobId});
@@ -3610,7 +3651,7 @@ app.post("/api/docker/compose/:name/kill", auth, (req,res)=>{
 });
 app.post("/api/docker/compose/:name/restart", auth, (req,res)=>{
   try {
-    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    const dir = stackDir(req.params.name);
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
     const jobId = runJob(`cd ${sh(dir)} && ${composeCmd()} restart 2>&1`);
     res.json({ok:true, jobId});
@@ -3618,7 +3659,7 @@ app.post("/api/docker/compose/:name/restart", auth, (req,res)=>{
 });
 app.post("/api/docker/compose/:name/recreate", auth, (req,res)=>{
   try {
-    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    const dir = stackDir(req.params.name);
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
     // "Recréer" doit aussi récupérer la dernière image du registre (sinon la
       // recréation réutilise l'image locale déjà présente). Les images
@@ -3642,7 +3683,7 @@ app.post("/api/docker/compose/:name/recreate", auth, (req,res)=>{
 // "Désinstaller" depuis le Magasin (choix explicite proposé là-bas).
 app.delete("/api/docker/compose/:name", auth, async(req,res)=>{
   const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
-  const dir = path.join(COMPOSE_DIR, name);
+  const dir = stackDir(name);
   const composeFile = path.join(dir, "docker-compose.yml");
   if(!fs.existsSync(composeFile)) return res.status(404).json({error:"Stack introuvable"});
   try {
@@ -3657,6 +3698,10 @@ app.delete("/api/docker/compose/:name", auth, async(req,res)=>{
       try {
         if (!ok) return;
         if (storeAppId) saveAppShortcuts(loadAppShortcuts().filter(s => s.storeAppId !== storeAppId));
+        // Projet créé ailleurs : oublie son emplacement ; raccourcis rattachés supprimés
+        const locs = loadStackLocations();
+        if (locs[name]) { delete locs[name]; saveStackLocations(locs); }
+        saveAppShortcuts(loadAppShortcuts().filter(s => s.stackName !== name));
         if (!docker || !images.length) return;
         const remaining = await docker.listContainers({all:true});
         for (const image of images) {
@@ -3677,7 +3722,7 @@ app.put("/api/docker/compose/:name", auth, async(req,res)=>{
   const { content } = req.body;
   if(!content || !content.trim()) return res.status(400).json({error:"Contenu docker-compose.yml requis"});
   try {
-    const dir = path.join(COMPOSE_DIR, name);
+    const dir = stackDir(name);
     const file = path.join(dir, "docker-compose.yml");
     if(!fs.existsSync(file)) return res.status(404).json({error:"Stack introuvable"});
     if(await stackHasRunningContainer(name)) return res.status(409).json({error:"Arrêtez le projet avant de modifier sa configuration"});
@@ -3697,7 +3742,7 @@ app.put("/api/docker/compose/:name", auth, async(req,res)=>{
 // en mémoire ne survivent pas à un restart).
 app.get("/api/docker/compose/:name/logs", auth, async(req,res)=>{
   try {
-    const dir = path.join(COMPOSE_DIR, req.params.name.replace(/[^a-zA-Z0-9_-]/g,""));
+    const dir = stackDir(req.params.name);
     if(!fs.existsSync(path.join(dir,"docker-compose.yml"))) return res.status(404).json({error:"Stack introuvable"});
     const {stdout} = await execAsync(`cd ${sh(dir)} && ${composeCmd()} logs --no-color --tail 300 2>&1`);
     res.type("text/plain").send(stdout);
@@ -4246,6 +4291,7 @@ function buildBackupCmd({ scope, volumes, folders, destType, destPath, remoteId,
   let pre = "";
   if (sc.includes("config")) for (const p of ["/etc/gravity","/etc/samba/smb.conf","/etc/exports"]) if (fs.existsSync(p)) paths.push(p);
   if (sc.includes("docker") && fs.existsSync(COMPOSE_DIR)) paths.push(COMPOSE_DIR);
+  if (sc.includes("docker")) for (const st of allStacks()) if (!st.dir.startsWith(COMPOSE_DIR + path.sep)) paths.push(st.dir);
   if (sc.includes("vms")) {
     pre += `mkdir -p /tmp/gravity-vm-defs && for vm in $(virsh --connect qemu:///system list --all --name 2>/dev/null); do virsh --connect qemu:///system dumpxml "$vm" > "/tmp/gravity-vm-defs/$vm.xml" 2>/dev/null; done\n`;
     paths.push("/tmp/gravity-vm-defs");
