@@ -3646,7 +3646,8 @@ app.post("/api/docker/compose/:name/down", auth, (req,res)=>{
 async function stackHasRunningContainer(name) {
   if (!docker) return false;
   const cs = await docker.listContainers({all:true}).catch(()=>[]);
-  return cs.some(c => c.Labels?.["com.docker.compose.project"] === name && c.State === "running");
+  // Compose met le nom du projet en minuscules dans son étiquette (dossier "Nautilyou" -> "nautilyou")
+  return cs.some(c => String(c.Labels?.["com.docker.compose.project"] || "").toLowerCase() === String(name).toLowerCase() && c.State === "running");
 }
 // "Forcer l'arrêt" d'un projet — SIGKILL immédiat à tous ses conteneurs
 // (docker compose stop/down envoient un SIGTERM avec délai de grâce).
@@ -4146,7 +4147,7 @@ app.get("/api/app-shortcuts", auth, async(req,res)=>{
       }
       // Projet créé à la main : démarrable/arrêtable depuis son icône, comme une app du Magasin
       if (s.stackName) {
-        const running = containers.some(c => c.Labels?.["com.docker.compose.project"] === s.stackName && c.State === "running");
+        const running = containers.some(c => String(c.Labels?.["com.docker.compose.project"] || "").toLowerCase() === s.stackName.toLowerCase() && c.State === "running");
         return { ...s, running, projectName: s.stackName };
       }
       return s;
