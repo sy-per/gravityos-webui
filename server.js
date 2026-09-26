@@ -3128,6 +3128,14 @@ app.post("/api/docker/images/update", auth, async(req,res)=>{
 });
 // Images inutilisées = aucune référence par un conteneur (démarré OU arrêté).
 // Liste (aperçu) puis suppression — "docker image prune -a" côté API.
+// Espace récupérable du cache de construction (docker build) : entrées non
+// utilisées par une construction en cours.
+async function buildCacheReclaimable() {
+  try {
+    const df = await docker.df();
+    return (df.BuildCache || []).filter(b => !b.InUse).reduce((sum, b) => sum + (b.Size || 0), 0);
+  } catch { return 0; }
+}
 app.get("/api/docker/images/unused", auth, async(req,res)=>{
   if(!docker) return res.json({ images: [], size: 0 });
   try {
@@ -3137,6 +3145,7 @@ app.get("/api/docker/images/unused", auth, async(req,res)=>{
     res.json({
       images: unused.map(i => ({ id: i.Id.replace("sha256:","").slice(0,12), name: i.RepoTags?.[0] || "<orpheline>", size: i.Size })),
       size: unused.reduce((sum, i) => sum + (i.Size || 0), 0),
+      buildCacheSize: await buildCacheReclaimable(),
     });
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -3145,7 +3154,14 @@ app.post("/api/docker/images/prune", auth, async(req,res)=>{
   try {
     // dangling=false : toutes les images non utilisées, pas seulement les orphelines
     const r = await docker.pruneImages({ filters: { dangling: { false: true } } });
-    res.json({ ok:true, removed: (r.ImagesDeleted || []).filter(x => x.Untagged || x.Deleted).length, reclaimed: r.SpaceReclaimed || 0 });
+    // Cache de construction : supprimé aussi (sans risque : les images et les
+    // données ne sont pas touchées, seule la prochaine construction est plus longue)
+    const cacheBefore = await buildCacheReclaimable();
+    let cacheFreed = 0;
+    if (cacheBefore > 0) {
+      try { await execAsync("docker builder prune -af 2>&1"); cacheFreed = cacheBefore - await buildCacheReclaimable(); } catch {}
+    }
+    res.json({ ok:true, removed: (r.ImagesDeleted || []).filter(x => x.Untagged || x.Deleted).length, reclaimed: (r.SpaceReclaimed || 0) + Math.max(cacheFreed, 0) });
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 app.delete("/api/docker/images/:id", auth, async(req,res)=>{
