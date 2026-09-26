@@ -3503,16 +3503,62 @@ app.get("/api/docker/compose/:name", auth, (req,res)=>{
   } catch(e){ res.status(404).json({error:"Stack introuvable"}); }
 });
 app.post("/api/docker/compose", auth, (req,res)=>{
-  const { name, content } = req.body;
+  const { name, content, env, start } = req.body;
   if(!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de stack invalide (lettres/chiffres/-/_ uniquement)"});
   if(!content || !content.trim()) return res.status(400).json({error:"Contenu docker-compose.yml requis"});
   try {
     const dir = path.join(COMPOSE_DIR, name);
     fs.mkdirSync(dir,{recursive:true});
     fs.writeFileSync(path.join(dir,"docker-compose.yml"), content);
+    // Variables (.env) : Docker Compose le charge tout seul depuis le dossier du projet
+    if (typeof env === "string" && env.trim()) fs.writeFileSync(path.join(dir,".env"), env.endsWith("\n") ? env : env + "\n", {mode:0o600});
+    // start === false : fichiers écrits, projet non démarré
+    if (start === false) return res.json({ok:true, jobId:null});
     const jobId = runJob(composeUpCmd(dir, "up -d", retagPinnedImagesCmd(content)));
     res.json({ok:true, jobId});
   } catch(e){ res.status(500).json({error:e.message}); }
+});
+// Validation et analyse d'un docker-compose.yml avant création : Docker Compose
+// lui-même lit le fichier (YAML, clés inconnues, références...) puis le rend
+// normalisé — on en tire les services, images, ports publiés et dossiers montés.
+app.post("/api/docker/compose/validate", auth, async(req,res)=>{
+  const { content, env, name } = req.body || {};
+  if(!content || !String(content).trim()) return res.json({valid:false, error:"Le fichier est vide", services:[]});
+  const tmp = fs.mkdtempSync(path.join(require("os").tmpdir(), "gravity-compose-"));
+  try {
+    fs.writeFileSync(path.join(tmp,"docker-compose.yml"), content);
+    if (typeof env === "string" && env.trim()) fs.writeFileSync(path.join(tmp,".env"), env);
+    let json = null, errText = "";
+    try {
+      const {stdout} = await execAsync(`cd ${sh(tmp)} && ${composeCmd()} config --format json 2>&1`);
+      json = JSON.parse(stdout);
+    } catch(e) { errText = String(e.stdout || e.stderr || e.message || ""); }
+    if (!json) {
+      // compose v1 (pas de --format json) : simple validation de syntaxe
+      try { await execAsync(`cd ${sh(tmp)} && ${composeCmd()} config -q 2>&1`); return res.json({valid:true, error:null, services:null}); }
+      catch(e2) { errText = String(e2.stdout || e2.stderr || e2.message || errText); }
+      const msg = errText.trim().split("\n").filter(Boolean)[0] || "Fichier invalide";
+      return res.json({valid:false, error:msg, services:[]});
+    }
+    const services = Object.entries(json.services || {}).map(([name, svc]) => ({
+      name,
+      image: svc.image || (svc.build ? "(construit localement)" : ""),
+      ports: (svc.ports || []).map(p => ({ published: p.published ? String(p.published) : "", target: String(p.target), protocol: p.protocol || "tcp" })),
+      // Les chemins relatifs (./data) sont résolus dans le dossier temporaire d'analyse :
+      // on les ramène au dossier réel du futur projet
+      volumes: (svc.volumes || []).filter(v => v.type === "bind").map(v => v.source.startsWith(tmp) ? path.join(COMPOSE_DIR, String(name || "").replace(/[^a-zA-Z0-9_-]/g,"") || "projet") + v.source.slice(tmp.length) : v.source),
+      hasBuild: !!svc.build,
+    }));
+    // Images déjà présentes sur le NAS (pas à télécharger)
+    let local = new Set();
+    try { local = new Set((await docker.listImages()).flatMap(i => i.RepoTags || [])); } catch {}
+    for (const sv of services) {
+      const ref = sv.image.includes(":") ? sv.image : sv.image + ":latest";
+      sv.local = sv.hasBuild || local.has(ref);
+    }
+    res.json({valid:true, error:null, services});
+  } catch(e){ res.json({valid:false, error:e.message, services:[]}); }
+  finally { try { fs.rmSync(tmp, {recursive:true, force:true}); } catch {} }
 });
 app.post("/api/docker/compose/:name/up", auth, (req,res)=>{
   try {
@@ -4017,7 +4063,7 @@ async function nasIp() {
 app.get("/api/app-shortcuts", auth, async(req,res)=>{
   try {
     const list = loadAppShortcuts();
-    const containers = list.some(s=>s.storeAppId && !NATIVE_APPS.some(a => a.id === s.storeAppId)) && docker
+    const containers = list.some(s=>(s.storeAppId && !NATIVE_APPS.some(a => a.id === s.storeAppId)) || s.stackName) && docker
       ? await docker.listContainers({all:true}).catch(()=>[])
       : [];
     const withStatus = await Promise.all(list.map(async(s)=>{
@@ -4033,7 +4079,12 @@ app.get("/api/app-shortcuts", auth, async(req,res)=>{
       if (s.storeAppId) {
         const project = `store-${s.storeAppId}`;
         const running = containers.some(c => c.Labels?.["com.docker.compose.project"] === project && c.State === "running");
-        return { ...s, running };
+        return { ...s, running, projectName: project };
+      }
+      // Projet créé à la main : démarrable/arrêtable depuis son icône, comme une app du Magasin
+      if (s.stackName) {
+        const running = containers.some(c => c.Labels?.["com.docker.compose.project"] === s.stackName && c.State === "running");
+        return { ...s, running, projectName: s.stackName };
       }
       return s;
     }));
