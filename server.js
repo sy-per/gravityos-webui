@@ -3923,14 +3923,19 @@ app.delete("/api/app-shortcuts/:id", auth, (req,res)=>{
 app.get("/api/docker/networks", auth, async(req,res)=>{
   if(!docker) return res.json([]);
   try {
-    const nets = await docker.listNetworks();
+    // listNetworks() ne renseigne pas "Containers" (seulement inspect) : d'où
+    // "0 conteneur" partout et un bouton Supprimer actif sur un réseau utilisé.
+    // On compte les conteneurs (démarrés ou arrêtés) rattachés à chaque réseau.
+    const [nets, allContainers] = await Promise.all([docker.listNetworks(), docker.listContainers({all:true}).catch(()=>[])]);
+    const perNetwork = {};
+    for (const c of allContainers) for (const id of Object.values(c.NetworkSettings?.Networks || {}).map(x => x.NetworkID)) perNetwork[id] = (perNetwork[id] || 0) + 1;
     res.json(nets.map(n=>({
       id: n.Id.slice(0,12),
       name: n.Name,
       driver: n.Driver,
       scope: n.Scope,
       subnet: n.IPAM?.Config?.[0]?.Subnet || "—",
-      containers: Object.keys(n.Containers||{}).length,
+      containers: perNetwork[n.Id] || 0,
     })));
   } catch(e){ res.status(500).json({error:e.message}); }
 });
