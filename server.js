@@ -3126,6 +3126,66 @@ app.post("/api/docker/images/update", auth, async(req,res)=>{
     res.json({ok:true, jobId, containers: affected.length});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
+// ── Nettoyage Docker à la carte (fenêtre "Nettoyer" de l'onglet Images) ──────
+// Aperçu de ce qui peut être supprimé, puis suppression de ce que l'utilisateur
+// a coché. Volumes : seuls les volumes ANONYMES inutilisés (nom = 64 caractères
+// hexadécimaux, créés automatiquement) — jamais un volume nommé.
+const ANON_VOLUME_RE = /^[0-9a-f]{64}$/;
+app.get("/api/docker/cleanup/preview", auth, async(req,res)=>{
+  if(!docker) return res.status(500).json({error:"Docker indisponible"});
+  try {
+    const [imgs, containers, df] = await Promise.all([docker.listImages(), docker.listContainers({all:true}), docker.df()]);
+    const usedImages = new Set(containers.map(c => c.ImageID));
+    const unusedImages = imgs.filter(i => !usedImages.has(i.Id));
+    const stopped = containers.filter(c => ["exited","created","dead"].includes(c.State));
+    // Une fois les conteneurs arrêtés supprimés, leurs images deviennent inutilisées aussi
+    const stoppedImageIds = new Set(stopped.map(c => c.ImageID));
+    const runningImageIds = new Set(containers.filter(c => !stopped.includes(c)).map(c => c.ImageID));
+    const extraImages = imgs.filter(i => stoppedImageIds.has(i.Id) && !runningImageIds.has(i.Id) && usedImages.has(i.Id));
+    const unusedVolumes = (df.Volumes || []).filter(v => ANON_VOLUME_RE.test(v.Name) && v.UsageData && v.UsageData.RefCount === 0);
+    res.json({
+      images: { count: unusedImages.length, size: unusedImages.reduce((a, i) => a + (i.Size || 0), 0), names: unusedImages.map(i => i.RepoTags?.[0] || "<orpheline>").slice(0, 8),
+                extraIfContainers: extraImages.length },
+      buildCache: { size: await buildCacheReclaimable() },
+      containers: { count: stopped.length, names: stopped.map(c => (c.Names?.[0] || "").replace(/^\//, "")).slice(0, 8) },
+      volumes: { count: unusedVolumes.length, size: unusedVolumes.reduce((a, v) => a + Math.max(v.UsageData.Size || 0, 0), 0) },
+    });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/docker/cleanup", auth, async(req,res)=>{
+  if(!docker) return res.status(500).json({error:"Docker indisponible"});
+  const { images, buildCache, containers, volumes } = req.body || {};
+  const result = { reclaimed: 0, containers: 0, images: 0, volumes: 0, buildCache: 0 };
+  try {
+    // Ordre : conteneurs d'abord (libère leurs images), puis images, volumes, cache
+    if (containers) {
+      const r = await docker.pruneContainers();
+      result.containers = (r.ContainersDeleted || []).length;
+      result.reclaimed += r.SpaceReclaimed || 0;
+    }
+    if (images) {
+      const r = await docker.pruneImages({ filters: { dangling: { false: true } } });
+      result.images = (r.ImagesDeleted || []).filter(x => x.Untagged || x.Deleted).length;
+      result.reclaimed += r.SpaceReclaimed || 0;
+    }
+    if (volumes) {
+      // Volumes anonymes seulement (filtre par défaut de l'API : pas les volumes nommés)
+      const r = await docker.pruneVolumes();
+      result.volumes = (r.VolumesDeleted || []).length;
+      result.reclaimed += r.SpaceReclaimed || 0;
+    }
+    if (buildCache) {
+      const before = await buildCacheReclaimable();
+      if (before > 0) {
+        await execAsync("docker builder prune -af 2>&1").catch(() => {});
+        result.buildCache = Math.max(before - await buildCacheReclaimable(), 0);
+        result.reclaimed += result.buildCache;
+      }
+    }
+    res.json({ ok:true, ...result });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
 // Images inutilisées = aucune référence par un conteneur (démarré OU arrêté).
 // Liste (aperçu) puis suppression — "docker image prune -a" côté API.
 // Espace récupérable du cache de construction (docker build) : entrées non
