@@ -3126,6 +3126,28 @@ app.post("/api/docker/images/update", auth, async(req,res)=>{
     res.json({ok:true, jobId, containers: affected.length});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
+// Images inutilisées = aucune référence par un conteneur (démarré OU arrêté).
+// Liste (aperçu) puis suppression — "docker image prune -a" côté API.
+app.get("/api/docker/images/unused", auth, async(req,res)=>{
+  if(!docker) return res.json({ images: [], size: 0 });
+  try {
+    const [imgs, containers] = await Promise.all([docker.listImages(), docker.listContainers({all:true})]);
+    const used = new Set(containers.map(c => c.ImageID));
+    const unused = imgs.filter(i => !used.has(i.Id));
+    res.json({
+      images: unused.map(i => ({ id: i.Id.replace("sha256:","").slice(0,12), name: i.RepoTags?.[0] || "<orpheline>", size: i.Size })),
+      size: unused.reduce((sum, i) => sum + (i.Size || 0), 0),
+    });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post("/api/docker/images/prune", auth, async(req,res)=>{
+  if(!docker) return res.status(500).json({error:"Docker indisponible"});
+  try {
+    // dangling=false : toutes les images non utilisées, pas seulement les orphelines
+    const r = await docker.pruneImages({ filters: { dangling: { false: true } } });
+    res.json({ ok:true, removed: (r.ImagesDeleted || []).filter(x => x.Untagged || x.Deleted).length, reclaimed: r.SpaceReclaimed || 0 });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 app.delete("/api/docker/images/:id", auth, async(req,res)=>{
   try { await docker.getImage(req.params.id).remove({force:true}); res.json({ok:true}); }
   catch(e){ res.status(500).json({error:e.message}); }
