@@ -3100,7 +3100,8 @@ app.get("/api/containers", auth, async(req,res)=>{
         cpu: st?.cpu || null,
         mem: st?.mem || null,
         memPct: st?.memPct || null,
-        composeProject: c.Labels?.["com.docker.compose.project"] || null
+        composeProject: c.Labels?.["com.docker.compose.project"] || null,
+        composeService: c.Labels?.["com.docker.compose.service"] || null
       };
     }));
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -3522,6 +3523,14 @@ app.get("/api/docker/compose/:name", auth, (req,res)=>{
     res.type("text/plain").send(fs.readFileSync(f,"utf8"));
   } catch(e){ res.status(404).json({error:"Stack introuvable"}); }
 });
+app.get("/api/docker/compose/:name/env", auth, (req,res)=>{
+  try {
+    const f = path.join(stackDir(req.params.name), ".env");
+    // COMPOSE_PROJECT_NAME est géré par GravityOS (projet hors dossier par défaut) : non affiché
+    const text = fs.existsSync(f) ? fs.readFileSync(f,"utf8").split("\n").filter(l => !/^COMPOSE_PROJECT_NAME=/.test(l)).join("\n") : "";
+    res.json({ env: text.trim() ? text.replace(/\n+$/,"") + "\n" : "" });
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
 app.post("/api/docker/compose", auth, async (req,res)=>{
   const { name, content, env, start, location } = req.body;
   if(!name || !/^[a-zA-Z0-9_-]+$/.test(name)) return res.status(400).json({error:"Nom de stack invalide (lettres/chiffres/-/_ uniquement)"});
@@ -3719,7 +3728,7 @@ app.delete("/api/docker/compose/:name", auth, async(req,res)=>{
 // relancé, ce qui prêterait à confusion dans l'UI.
 app.put("/api/docker/compose/:name", auth, async(req,res)=>{
   const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
-  const { content } = req.body;
+  const { content, env } = req.body;
   if(!content || !content.trim()) return res.status(400).json({error:"Contenu docker-compose.yml requis"});
   try {
     const dir = stackDir(name);
@@ -3727,6 +3736,15 @@ app.put("/api/docker/compose/:name", auth, async(req,res)=>{
     if(!fs.existsSync(file)) return res.status(404).json({error:"Stack introuvable"});
     if(await stackHasRunningContainer(name)) return res.status(409).json({error:"Arrêtez le projet avant de modifier sa configuration"});
     fs.writeFileSync(file, content);
+    if (typeof env === "string") {
+      // .env réécrit ; la ligne COMPOSE_PROJECT_NAME (projet hors dossier par défaut) est conservée
+      const envFile = path.join(dir, ".env");
+      let keep = "";
+      try { keep = (fs.readFileSync(envFile,"utf8").match(/^COMPOSE_PROJECT_NAME=.*$/m) || [""])[0]; } catch {}
+      const body = env.split("\n").filter(l => !/^COMPOSE_PROJECT_NAME=/.test(l)).join("\n").replace(/\n+$/,"");
+      const full = [body, keep].filter(Boolean).join("\n");
+      if (full) fs.writeFileSync(envFile, full + "\n", {mode:0o600}); else { try { fs.unlinkSync(envFile); } catch {} }
+    }
     // Redémarre automatiquement avec la nouvelle config — le projet doit
     // être arrêté pour être modifiable (contrôle ci-dessus), donc sans ça
     // l'utilisateur se retrouvait avec des conteneurs recréés à l'ancienne
