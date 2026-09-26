@@ -821,8 +821,9 @@ app.post("/api/files/transfers/:id/cancel", auth, (req, res) => {
   if (!t) return res.status(404).json({ error: "Transfert introuvable" });
   if (t.state !== "active") return res.json({ ok: true });
   t._cancelled = true;
-  t._streams?.rs.destroy();
-  t._streams?.ws.destroy();
+  t._streams?.rs?.destroy();
+  t._streams?.ws?.destroy();
+  t._abort?.abort();
   res.json({ ok: true });
 });
 app.post("/api/files/move", auth, async (req,res)=>{
@@ -1993,6 +1994,157 @@ function clearExternalDisk(vmName){
     fs.writeFileSync(VM_EXTERNAL_DISKS_FILE, JSON.stringify(all,null,2));
   }
 }
+
+// ── Catalogue de systèmes à télécharger (assistant de création de VM) ────────
+// L'URL exacte est résolue au moment du téléchargement (les versions
+// ponctuelles changent : ubuntu-24.04.4, debian-13.7.0...) en lisant les
+// index officiels — rien de figé dans le code hormis les dépôts.
+async function fetchText(url, ms = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(url, { signal: ctrl.signal, redirect: "follow", headers: { "User-Agent": "GravityOS" } });
+    if (!r.ok) throw new Error(`HTTP ${r.status} sur ${new URL(url).host}`);
+    return await r.text();
+  } finally { clearTimeout(timer); }
+}
+const byVersion = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+function lastMatch(text, re) {
+  const found = [...text.matchAll(re)].map(m => m[1]);
+  if (!found.length) throw new Error("Aucune image trouvée dans l'index du dépôt");
+  return found.sort(byVersion).pop();
+}
+const OS_CATALOG = [
+  { id: "ubuntu-server", name: "Ubuntu Server", version: "24.04 LTS", kind: "iso", sizeGB: 2.6, ram: 2048, diskGB: 25, cpus: 2, bios: "uefi",
+    host: "releases.ubuntu.com", description: "Serveur sans interface, idéal pour Docker",
+    async resolve() { const f = lastMatch(await fetchText("https://releases.ubuntu.com/24.04/SHA256SUMS"), /\*(ubuntu-24\.04\.\d+-live-server-amd64\.iso)/g); return { url: `https://releases.ubuntu.com/24.04/${f}` }; } },
+  { id: "ubuntu-desktop", name: "Ubuntu Desktop", version: "24.04 LTS", kind: "iso", sizeGB: 6.0, ram: 4096, diskGB: 40, cpus: 4, bios: "uefi",
+    host: "releases.ubuntu.com", description: "Bureau complet, pour un poste virtuel",
+    async resolve() { const f = lastMatch(await fetchText("https://releases.ubuntu.com/24.04/SHA256SUMS"), /\*(ubuntu-24\.04\.\d+-desktop-amd64\.iso)/g); return { url: `https://releases.ubuntu.com/24.04/${f}` }; } },
+  { id: "debian", name: "Debian", version: "13 « Trixie »", kind: "iso", sizeGB: 0.8, ram: 1024, diskGB: 20, cpus: 2, bios: "uefi",
+    host: "cdimage.debian.org", description: "Stable et léger (installation par le réseau)",
+    async resolve() { const f = lastMatch(await fetchText("https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/SHA256SUMS"), /^\S+\s+(debian-\d+\.\d+\.\d+-amd64-netinst\.iso)$/gm); return { url: `https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/${f}` }; } },
+  { id: "fedora", name: "Fedora Workstation", version: "dernière version", kind: "iso", sizeGB: 2.3, ram: 4096, diskGB: 40, cpus: 4, bios: "uefi",
+    host: "download.fedoraproject.org", description: "Bureau GNOME récent",
+    async resolve() {
+      const base = "https://download.fedoraproject.org/pub/fedora/linux/releases/";
+      const rel = lastMatch(await fetchText(base), /href="(\d+)\/"/g);
+      const dir = `${base}${rel}/Workstation/x86_64/iso/`;
+      const f = lastMatch(await fetchText(dir), /href="(Fedora-Workstation-Live-[^"]*\.x86_64\.iso)"/g);
+      return { url: dir + f };
+    } },
+  { id: "mint", name: "Linux Mint", version: "Cinnamon", kind: "iso", sizeGB: 2.8, ram: 4096, diskGB: 40, cpus: 4, bios: "uefi",
+    host: "mirrors.kernel.org", description: "Simple pour débuter sur Linux",
+    async resolve() {
+      const base = "https://mirrors.edge.kernel.org/linuxmint/stable/";
+      const v = lastMatch(await fetchText(base), /href="(\d+(?:\.\d+)?)\/"/g);
+      return { url: `${base}${v}/linuxmint-${v}-cinnamon-64bit.iso` };
+    } },
+  { id: "haos", name: "Home Assistant OS", version: "dernière version", kind: "qcow2", sizeGB: 0.6, ram: 2048, diskGB: 32, cpus: 2, bios: "uefi",
+    host: "github.com/home-assistant", description: "Domotique : aucune installation à faire", shortcutPort: 8123,
+    async resolve() {
+      const r = await fetch("https://api.github.com/repos/home-assistant/operating-system/releases/latest", { headers: { "User-Agent": "GravityOS", "Accept": "application/vnd.github+json" } });
+      if (!r.ok) throw new Error(`GitHub : HTTP ${r.status}`);
+      const asset = ((await r.json()).assets || []).find(a => /^haos_ova-.*\.qcow2\.xz$/.test(a.name));
+      if (!asset) throw new Error("Image QCOW2 de Home Assistant OS introuvable dans la dernière version");
+      return { url: asset.browser_download_url, decompress: "xz" };
+    } },
+  { id: "windows-11", name: "Windows 11", version: "votre ISO Microsoft", kind: "user", sizeGB: 5.4, ram: 4096, diskGB: 64, cpus: 4, bios: "uefi",
+    host: "microsoft.com", description: "Microsoft ne permet pas le téléchargement automatique",
+    website: "https://www.microsoft.com/software-download/windows11" },
+];
+app.get("/api/vms/os-catalog", auth, (req,res)=>{
+  res.json(OS_CATALOG.map(({ resolve, ...o }) => o));
+});
+
+// Fichiers ISO / images disque déjà présents sur le NAS (dossiers ISO et
+// Images de chaque volume, dossier libvirt) — proposés en tête de l'assistant.
+app.get("/api/vms/local-images", auth, async (req,res)=>{
+  try {
+    const vols = await getVolumesList();
+    const dirs = [];
+    for (const v of vols) for (const sub of ["ISO", "Images"]) dirs.push({ dir: path.join(v.path, sub), label: `${v.label.replace(" (système)", "")} › ${sub}` });
+    dirs.push({ dir: "/var/lib/libvirt/images", label: "Images libvirt" });
+    const seen = new Set(), out = [];
+    for (const d of dirs) {
+      let names = [];
+      try { names = fs.readdirSync(d.dir); } catch { continue; }
+      for (const n of names) {
+        if (!/\.(iso|qcow2|img)$/i.test(n)) continue;
+        const full = path.join(d.dir, n);
+        if (seen.has(full)) continue;
+        seen.add(full);
+        try { const st = fs.statSync(full); if (st.isFile()) out.push({ name: n, path: full, size: st.size, where: d.label, kind: /\.iso$/i.test(n) ? "iso" : "disk" }); } catch {}
+      }
+    }
+    res.json(out);
+  } catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// Téléchargement d'un système du catalogue vers un dossier choisi. Suivi comme
+// un transfert (icône de la barre du haut) ; l'assistant lit l'état via
+// GET /api/vms/os-download/:id puis crée la VM avec le fichier obtenu.
+async function downloadOsImage(t, os) {
+  const { url, decompress } = await os.resolve();
+  const fileName = decodeURIComponent(new URL(url).pathname.split("/").pop());
+  const dest = path.join(t._destDir, fileName);
+  const finalPath = decompress === "xz" ? dest.replace(/\.xz$/, "") : dest;
+  t.name = fileName;
+  t._abort = new AbortController();
+  const r = await fetch(url, { signal: t._abort.signal, redirect: "follow", headers: { "User-Agent": "GravityOS" } });
+  if (!r.ok) throw new Error(`Téléchargement refusé (HTTP ${r.status})`);
+  t.totalBytes = Number(r.headers.get("content-length")) || 0;
+  // Déjà téléchargé en entier : on le réutilise
+  if (fs.existsSync(finalPath) && (decompress || (t.totalBytes && fs.statSync(finalPath).size === t.totalBytes))) {
+    try { await r.body.cancel(); } catch {}
+    t.bytesDone = t.totalBytes;
+    return finalPath;
+  }
+  fs.mkdirSync(t._destDir, { recursive: true });
+  const part = dest + ".part";
+  const out = fs.createWriteStream(part);
+  t._streams = { ws: out };
+  try {
+    const reader = r.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!out.write(value)) await new Promise(res2 => out.once("drain", res2));
+      t.bytesDone += value.length;
+    }
+    await new Promise((res2, rej) => out.end(err => err ? rej(err) : res2()));
+  } catch (e) {
+    out.destroy();
+    try { fs.unlinkSync(part); } catch {}
+    if (t._cancelled) throw Object.assign(new Error("Téléchargement annulé"), { cancelled: true });
+    throw e;
+  }
+  fs.renameSync(part, dest);
+  if (decompress === "xz") {
+    t.fromLabel = "Décompression...";
+    await execAsync(`xz -dkf ${sh(dest)}`);
+    try { fs.unlinkSync(dest); } catch {}
+  }
+  return finalPath;
+}
+app.post("/api/vms/os-download", auth, async (req,res)=>{
+  const os = OS_CATALOG.find(o => o.id === req.body?.osId);
+  if (!os || !os.resolve) return res.status(404).json({error:"Système introuvable dans le catalogue"});
+  const dir = req.body?.dir;
+  if (!dir || typeof dir !== "string" || !(await filesPathAllowed(dir))) return res.status(400).json({error:"Dossier de destination non autorisé"});
+  const t = newTransfer(os.name, "download", os.host, path.basename(dir) || dir);
+  t._destDir = path.resolve(dir);
+  t.resultPath = null;
+  downloadOsImage(t, os)
+    .then(p => { t.resultPath = p; finishTransfer(t, "done"); })
+    .catch(e => finishTransfer(t, t._cancelled ? "cancelled" : "error", e.message));
+  res.json({ ok: true, transferId: t.id });
+});
+app.get("/api/vms/os-download/:id", auth, (req,res)=>{
+  const t = transfers.get(req.params.id);
+  if (!t) return res.status(404).json({error:"Téléchargement introuvable"});
+  res.json({ state: t.state, error: t.error, path: t.resultPath || null, name: t.name, totalBytes: t.totalBytes, bytesDone: t.bytesDone, startedAt: t.startedAt });
+});
 
 app.post("/api/vms", auth, async (req,res) => {
   if(isLive()) return res.status(400).json({error:"Impossible en Live CD"});
