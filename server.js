@@ -2831,6 +2831,19 @@ function retagPinnedImagesCmd(composeYaml) {
   const matches = [...composeYaml.matchAll(/image:\s*(\S+):(\S+)@(sha256:[0-9a-f]{64})/g)];
   return matches.map(([, repo, tag, digest]) => `docker tag ${sh(`${repo}@${digest}`)} ${sh(`${repo}:${tag}`)} 2>/dev/null || true`).join(" ; ");
 }
+// Réapplique le nom lisible (repo:tag) des images épinglées par empreinte de
+// tous les projets Compose — sans ça, une image tirée par "repo:tag@sha256:..."
+// n'a AUCUN nom et s'affiche comme "orpheline" alors qu'un conteneur l'utilise
+// (cas après la migration overlay2, qui a re-tiré les images sans ce re-tag).
+async function retagAllComposeImages() {
+  try {
+    for (const d of fs.readdirSync(COMPOSE_DIR)) {
+      const cmd = retagPinnedImagesForDir(path.join(COMPOSE_DIR, d));
+      if (cmd) await execAsync(cmd).catch(() => {});
+    }
+  } catch {}
+}
+setTimeout(retagAllComposeImages, 20000).unref();
 function retagPinnedImagesForDir(dir) {
   try { return retagPinnedImagesCmd(fs.readFileSync(path.join(dir, "docker-compose.yml"), "utf8")); }
   catch { return ""; }
@@ -3025,12 +3038,14 @@ app.get("/api/docker/images/ports", auth, async(req,res)=>{
 app.get("/api/docker/images", auth, async(req,res)=>{
   if(!docker) return res.json([]);
   try {
-    const imgs = await docker.listImages();
+    const [imgs, allContainers] = await Promise.all([docker.listImages(), docker.listContainers({all:true}).catch(()=>[])]);
+    const usedIds = new Set(allContainers.map(c => c.ImageID));
     res.json(imgs.map(i=>{
+      const inUse = usedIds.has(i.Id);
       const tag = i.RepoTags?.[0];
       if (tag) {
         const sep = tag.lastIndexOf(":");
-        return { id:i.Id.replace("sha256:","").slice(0,12), repo:tag.slice(0,sep), tag:tag.slice(sep+1), size:i.Size, created:i.Created, dangling:false };
+        return { id:i.Id.replace("sha256:","").slice(0,12), repo:tag.slice(0,sep), tag:tag.slice(sep+1), size:i.Size, created:i.Created, dangling:false, inUse };
       }
       // Image "orpheline" — un tag repris par une image plus récente après un
       // pull (mise à jour), ou couche intermédiaire de build ; RepoTags est
@@ -3038,7 +3053,7 @@ app.get("/api/docker/images", auth, async(req,res)=>{
       // RepoDigests garde trace du dépôt d'origine quand elle existe encore.
       const digestRef = i.RepoDigests?.[0];
       const repo = digestRef ? digestRef.slice(0, digestRef.lastIndexOf("@")) : null;
-      return { id:i.Id.replace("sha256:","").slice(0,12), repo, tag:null, size:i.Size, created:i.Created, dangling:true };
+      return { id:i.Id.replace("sha256:","").slice(0,12), repo, tag:null, size:i.Size, created:i.Created, dangling:true, inUse };
     }));
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -3186,44 +3201,6 @@ app.post("/api/docker/cleanup", auth, async(req,res)=>{
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// Images inutilisées = aucune référence par un conteneur (démarré OU arrêté).
-// Liste (aperçu) puis suppression — "docker image prune -a" côté API.
-// Espace récupérable du cache de construction (docker build) : entrées non
-// utilisées par une construction en cours.
-async function buildCacheReclaimable() {
-  try {
-    const df = await docker.df();
-    return (df.BuildCache || []).filter(b => !b.InUse).reduce((sum, b) => sum + (b.Size || 0), 0);
-  } catch { return 0; }
-}
-app.get("/api/docker/images/unused", auth, async(req,res)=>{
-  if(!docker) return res.json({ images: [], size: 0 });
-  try {
-    const [imgs, containers] = await Promise.all([docker.listImages(), docker.listContainers({all:true})]);
-    const used = new Set(containers.map(c => c.ImageID));
-    const unused = imgs.filter(i => !used.has(i.Id));
-    res.json({
-      images: unused.map(i => ({ id: i.Id.replace("sha256:","").slice(0,12), name: i.RepoTags?.[0] || "<orpheline>", size: i.Size })),
-      size: unused.reduce((sum, i) => sum + (i.Size || 0), 0),
-      buildCacheSize: await buildCacheReclaimable(),
-    });
-  } catch(e){ res.status(500).json({error:e.message}); }
-});
-app.post("/api/docker/images/prune", auth, async(req,res)=>{
-  if(!docker) return res.status(500).json({error:"Docker indisponible"});
-  try {
-    // dangling=false : toutes les images non utilisées, pas seulement les orphelines
-    const r = await docker.pruneImages({ filters: { dangling: { false: true } } });
-    // Cache de construction : supprimé aussi (sans risque : les images et les
-    // données ne sont pas touchées, seule la prochaine construction est plus longue)
-    const cacheBefore = await buildCacheReclaimable();
-    let cacheFreed = 0;
-    if (cacheBefore > 0) {
-      try { await execAsync("docker builder prune -af 2>&1"); cacheFreed = cacheBefore - await buildCacheReclaimable(); } catch {}
-    }
-    res.json({ ok:true, removed: (r.ImagesDeleted || []).filter(x => x.Untagged || x.Deleted).length, reclaimed: (r.SpaceReclaimed || 0) + Math.max(cacheFreed, 0) });
-  } catch(e){ res.status(500).json({error:e.message}); }
-});
 app.delete("/api/docker/images/:id", auth, async(req,res)=>{
   try { await docker.getImage(req.params.id).remove({force:true}); res.json({ok:true}); }
   catch(e){ res.status(500).json({error:e.message}); }
@@ -3285,7 +3262,7 @@ app.post("/api/docker/storage/migrate", auth, async (req,res)=>{
       if (await stackHasRunningContainer(d)) running.push(d);
     }
     const c = composeCmd();
-    const recreate = running.map(d => `echo "--- Recréation de ${d} ---"; ( cd ${sh(path.join(COMPOSE_DIR,d))} && ${c} up -d --build ) || FAIL=1`).join("\n");
+    const recreate = running.map(d => `echo "--- Recréation de ${d} ---"; ( cd ${sh(path.join(COMPOSE_DIR,d))} && ${c} up -d --build ${retagPinnedImagesForDir(path.join(COMPOSE_DIR,d)) ? '&& ' + retagPinnedImagesForDir(path.join(COMPOSE_DIR,d)) : ''} ) || FAIL=1`).join("\n");
     const script = `echo "=== Migration du stockage Docker : vfs -> overlay2 ==="
 ROOT=${sh(root)}
 OLD="$ROOT.vfs-old"
