@@ -3,9 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" href="/gravity-icon.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- maximum-scale=1 + user-scalable=no : empêche le pincement de zoom sur
+         mobile (l'app a sa propre interface adaptée, pas un site à zoomer) —
+         sans effet sur le zoom navigateur desktop (Ctrl+molette), qui ne
+         dépend pas de cette balise. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>Gravity</title>
-    <script type="module" crossorigin src="/assets/index-BbTQPLNt.js"></script>
+    <script type="module" crossorigin src="/assets/index-DQmq5Foa.js"></script>
     <link rel="stylesheet" crossorigin href="/assets/index-B4v_Omkr.css">
   </head>
   <body>
