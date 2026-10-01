@@ -1943,7 +1943,7 @@ async function vmDevicesFromXml(name) {
       ? BRIDGE_NETWORK_ID
       : (xml.match(/<interface type='network'>[\s\S]*?<source network='([^']*)'/)||[])[1] || null;
     const iso = (xml.match(/<disk type='file' device='cdrom'>[\s\S]*?<source file='([^']*)'/)||[])[1] || null;
-    const usbDevices = [...xml.matchAll(/<hostdev mode='subsystem' type='usb'>[\s\S]*?<vendor id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<product id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<\/hostdev>/g)]
+    const usbDevices = [...xml.matchAll(/<hostdev mode='subsystem' type='usb'[^>]*>[\s\S]*?<vendor id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<product id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<\/hostdev>/g)]
       .map(m => `${m[1]}:${m[2]}`);
     const bios = /<loader readonly='yes' type='pflash'>/.test(xml) ? "uefi" : "legacy";
     return { network, iso, usbDevices, bios };
@@ -2366,7 +2366,7 @@ app.put("/api/vms/:n", auth, async (req,res) => {
     if (Array.isArray(usbDevices)) {
       const liveFlags = running ? "--live --config" : "--config";
       const xml = await virsh(`dumpxml ${sh(name)}`);
-      const current = [...xml.matchAll(/<hostdev mode='subsystem' type='usb'>[\s\S]*?<vendor id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<product id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<\/hostdev>/g)]
+      const current = [...xml.matchAll(/<hostdev mode='subsystem' type='usb'[^>]*>[\s\S]*?<vendor id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<product id='0x([0-9a-fA-F]{4})'\/>[\s\S]*?<\/hostdev>/g)]
         .map(m => `${m[1]}:${m[2]}`);
       const desired = usbDevices.filter(d => /^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$/.test(d));
       const toAdd = desired.filter(d => !current.includes(d));
