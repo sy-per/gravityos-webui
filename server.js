@@ -1760,7 +1760,28 @@ async function syncDefaultHostConf(){
     catch (e) { if (have===null) fs.rmSync(NGINX_DEFAULT_CONF,{force:true}); else fs.writeFileSync(NGINX_DEFAULT_CONF, have); throw e; }
   } catch (e) { console.error("Hôte nginx par défaut:", e.message); }
 }
-syncDefaultHostConf();
+// Ancien nginx.conf de l'ISO : un bloc default_server proxifiait TOUT vers la
+// WebUI, sans jamais lire gravity-default.d — le réglage "Accès externe" n'y
+// changeait donc rien. Migré ici au démarrage du service (idempotent) plutôt
+// que par le seul script de mise à jour, qui exige deux clics pour appliquer
+// un correctif système. Sauvegarde + "nginx -t", restauration si invalide.
+const NGINX_MAIN_CONF = "/etc/nginx/nginx.conf";
+async function migrateLegacyNginxConf(){
+  try {
+    if (!nginxAvailable()) return;
+    const cur = fs.readFileSync(NGINX_MAIN_CONF,"utf8");
+    const lines = cur.split("\n");
+    const start = lines.findIndex(l => l.includes("proxy TOUT vers Node"));
+    const end = lines.findIndex((l,i) => i>start && l.includes("Vhosts proxy personnalis"));
+    if (start<0 || end<0) return;
+    writeDefaultHostConf(loadExternalAccess());
+    fs.writeFileSync(`${NGINX_MAIN_CONF}.gravity-bak`, cur);
+    fs.writeFileSync(NGINX_MAIN_CONF, [...lines.slice(0,start), "    include /etc/nginx/gravity-default.d/*.conf;", "", ...lines.slice(end)].join("\n"));
+    try { await execAsync("nginx -t && systemctl reload nginx"); console.log("nginx.conf migré : hôte par défaut géré par la WebUI"); }
+    catch (e) { fs.writeFileSync(NGINX_MAIN_CONF, cur); throw e; }
+  } catch (e) { console.error("Migration nginx.conf:", e.message); }
+}
+migrateLegacyNginxConf().then(syncDefaultHostConf);
 
 app.get("/api/proxy/external-access", auth, (req,res) => {
   res.json({ enabled: loadExternalAccess(), available: nginxAvailable() });
