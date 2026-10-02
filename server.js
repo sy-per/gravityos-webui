@@ -1668,6 +1668,85 @@ function proxyDisable(fn) {
 
 function nginxAvailable() { return fs.existsSync(NAVAIL) && fs.existsSync(NSITES); }
 
+// Hôte par défaut (accès par adresse IP, ou par un domaine sans proxy
+// configuré). Sans lui, nginx sert le premier hôte proxy venu — d'où une IP
+// publique qui retombait sur un service interne. nginx.conf inclut ce
+// dossier AVANT sites-enabled ; le fichier est entièrement géré ici.
+// Page de bienvenue : "return 200" inline (aucun fichier statique servi,
+// règle "Nginx = proxy-only"). Désactivé (défaut) : connexion coupée sans
+// réponse (444). HTTPS : handshake refusé, pas de certificat requis.
+const PROXY_DEFAULT_META = `${CFG}/proxy-default.json`;
+const NGINX_DEFAULT_DIR = "/etc/nginx/gravity-default.d";
+const NGINX_DEFAULT_CONF = `${NGINX_DEFAULT_DIR}/default.conf`;
+function loadProxyDefaultEnabled(){ try{ return !!JSON.parse(fs.readFileSync(PROXY_DEFAULT_META,"utf8")).enabled; } catch{ return false; } }
+function buildDefaultHostConf(enabled){
+  const page = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the reverse proxy is installed and working. Further configuration is required.</p>
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+`;
+  const body80 = enabled
+    ? `    default_type text/html;\n    return 200 '${page}';`
+    : `    return 444;`;
+  return `# Géré par GravityOS (Paramètres > Proxy inversé) — ne pas modifier à la main
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+${body80}
+}
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+`;
+}
+function writeDefaultHostConf(enabled){
+  fs.mkdirSync(NGINX_DEFAULT_DIR,{recursive:true});
+  fs.writeFileSync(NGINX_DEFAULT_CONF, buildDefaultHostConf(enabled));
+}
+// Au démarrage : recrée le fichier s'il manque ou s'il a dérivé (écriture
+// seule, sans recharger nginx — l'état d'avant l'arrêt reste en vigueur).
+try {
+  if (nginxAvailable()) {
+    const want = buildDefaultHostConf(loadProxyDefaultEnabled());
+    let have = null; try { have = fs.readFileSync(NGINX_DEFAULT_CONF,"utf8"); } catch {}
+    if (have !== want) { fs.mkdirSync(NGINX_DEFAULT_DIR,{recursive:true}); fs.writeFileSync(NGINX_DEFAULT_CONF, want); }
+  }
+} catch (e) { console.error("Hôte nginx par défaut:", e.message); }
+
+app.get("/api/proxy/default-page", auth, (req,res) => {
+  res.json({ enabled: loadProxyDefaultEnabled(), available: nginxAvailable() });
+});
+app.put("/api/proxy/default-page", auth, async (req,res) => {
+  if (!nginxAvailable()) return res.status(503).json({error:"Nginx n'est pas installé sur cette machine (environnement de test) — cette fonctionnalité s'applique réellement sur un vrai NAS GravityOS."});
+  const enabled = !!req.body.enabled;
+  let previous = null; try { previous = fs.readFileSync(NGINX_DEFAULT_CONF,"utf8"); } catch {}
+  try {
+    writeDefaultHostConf(enabled);
+    await execAsync("nginx -t && systemctl reload nginx");
+    fs.mkdirSync(CFG,{recursive:true});
+    fs.writeFileSync(PROXY_DEFAULT_META, JSON.stringify({enabled},null,2));
+    res.json({ok:true, enabled});
+  } catch(e) {
+    try { if (previous===null) fs.rmSync(NGINX_DEFAULT_CONF,{force:true}); else fs.writeFileSync(NGINX_DEFAULT_CONF, previous); } catch {}
+    res.status(500).json({error:e.message});
+  }
+});
+
 app.get("/api/proxy/hosts", auth, (req,res) => {
   try {
     const meta = loadProxyMeta();
@@ -5338,6 +5417,36 @@ function gravityUpdateCmd() {
       ufw allow 443/tcp 2>/dev/null || true
     fi
 
+    # WebUI : port public 4000 -> 5000 (le 4000 reste en boucle locale, géré
+    # par server.js), et nginx n'expose plus la WebUI sur le port 80 : le
+    # bloc "default_server" qui proxyait tout vers Node est remplacé par
+    # l'inclusion de gravity-default.d (page de bienvenue ou connexion coupée,
+    # réglable dans Paramètres > Proxy inversé). Idempotent.
+    if grep -q 'GRAVITY_PORT=4000' /etc/systemd/system/gravity-webui.service 2>/dev/null; then
+      sed -i 's/^Environment=GRAVITY_PORT=4000/Environment=GRAVITY_PORT=5000/' /etc/systemd/system/gravity-webui.service
+      systemctl daemon-reload
+      echo "WebUI : port 4000 -> 5000 ✓"
+    fi
+    ufw allow 5000/tcp 2>/dev/null || true
+    ufw delete allow 4000/tcp 2>/dev/null || true
+    if command -v nginx &>/dev/null; then
+      mkdir -p /etc/nginx/gravity-default.d
+      if [ ! -f /etc/nginx/gravity-default.d/default.conf ]; then
+        printf '%s\n' 'server {' '    listen 80 default_server;' '    listen [::]:80 default_server;' '    server_name _;' '    return 444;' '}' 'server {' '    listen 443 ssl default_server;' '    listen [::]:443 ssl default_server;' '    server_name _;' '    ssl_reject_handshake on;' '}' > /etc/nginx/gravity-default.d/default.conf
+      fi
+      if grep -q 'proxy TOUT vers Node' /etc/nginx/nginx.conf 2>/dev/null; then
+        cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.gravity-bak
+        awk '/proxy TOUT vers Node/{skip=1; print "    include /etc/nginx/gravity-default.d/*.conf;"; print ""; next} /Vhosts proxy personnalis/{skip=0} !skip{print}' /etc/nginx/nginx.conf.gravity-bak > /etc/nginx/nginx.conf
+        if nginx -t 2>/dev/null; then
+          systemctl reload nginx 2>/dev/null || true
+          echo "Nginx : la WebUI n'est plus exposée sur le port 80 (utiliser le port 5000) ✓"
+        else
+          cp /etc/nginx/nginx.conf.gravity-bak /etc/nginx/nginx.conf
+          echo "Nginx : configuration invalide, ancienne configuration restaurée"
+        fi
+      fi
+    fi
+
     # openssh-server requis par l'onglet Paramètres > Terminal (activation
     # SSH + port) — déjà dans la liste de paquets de l'ISO, ce correctif ne
     # sert qu'aux NAS déjà installés avant son ajout. Volontairement PAS
@@ -5583,5 +5692,15 @@ app.get("/api/terminal/test", auth, (req,res) => {
   res.json({ nodeVersion:process.version, ptyAvailable:!!pty, pid:process.pid });
 });
 
-const PORT = process.env.GRAVITY_PORT || 4000;
+// Port public 5000 (l'ancien 4000 est retiré du pare-feu). 4000 reste
+// ouvert en boucle locale seulement : les hôtes proxy existants qui visent
+// 127.0.0.1:4000 continuent de fonctionner sans être modifiés.
+const PORT = process.env.GRAVITY_PORT || 5000;
 server.listen(PORT, "0.0.0.0", () => console.log(`\n  GravityOS WebUI v2 — http://0.0.0.0:${PORT}\n`));
+const LEGACY_LOOPBACK_PORT = 4000;
+if (Number(PORT) !== LEGACY_LOOPBACK_PORT) {
+  const legacyServer = http.createServer(app);
+  for (const l of server.listeners("upgrade")) legacyServer.on("upgrade", l);
+  legacyServer.on("error", e => console.error("Port local 4000:", e.message));
+  legacyServer.listen(LEGACY_LOOPBACK_PORT, "127.0.0.1");
+}
