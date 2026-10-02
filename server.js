@@ -1702,7 +1702,7 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
             return 200 '${page}';
         }
 `;
-  const uiPort = process.env.GRAVITY_PORT || 5000;
+  const uiPort = process.env.GRAVITY_PORT || 4000;
   return `# Géré par GravityOS (Paramètres > Proxy inversé) — ne pas modifier à la main
 geo $gravity_lan {
     default 0;
@@ -5472,17 +5472,17 @@ function gravityUpdateCmd() {
       ufw allow 443/tcp 2>/dev/null || true
     fi
 
-    # WebUI : port public 4000 -> 5000 (le 4000 reste en boucle locale, géré
-    # par server.js), et nginx n'expose plus la WebUI sur le port 80 : le
-    # bloc "default_server" qui proxyait tout vers Node est remplacé par
-    # l'inclusion de gravity-default.d (page de bienvenue ou connexion coupée,
-    # réglable dans Paramètres > Proxy inversé). Idempotent.
-    if grep -q 'GRAVITY_PORT=4000' /etc/systemd/system/gravity-webui.service 2>/dev/null; then
-      sed -i 's/^Environment=GRAVITY_PORT=4000/Environment=GRAVITY_PORT=5000/' /etc/systemd/system/gravity-webui.service
+    # WebUI : Node écoute en boucle locale (127.0.0.1:4000) et nginx est la
+    # seule porte (port 80) : le bloc "default_server" qui proxyait tout vers
+    # Node est remplacé par l'inclusion de gravity-default.d (WebUI en interne,
+    # accès externe réglable dans Paramètres > Proxy inversé). Idempotent.
+    # Le port reste 4000 : un essai en 5000 est entré en collision avec un
+    # conteneur utilisateur (Frigate) — on remet 4000 si le service y était passé.
+    if grep -q 'GRAVITY_PORT=5000' /etc/systemd/system/gravity-webui.service 2>/dev/null; then
+      sed -i 's/^Environment=GRAVITY_PORT=5000/Environment=GRAVITY_PORT=4000/' /etc/systemd/system/gravity-webui.service
       systemctl daemon-reload
-      echo "WebUI : port 4000 -> 5000 ✓"
+      echo "WebUI : port 5000 -> 4000 ✓"
     fi
-    ufw delete allow 5000/tcp 2>/dev/null || true
     ufw delete allow 4000/tcp 2>/dev/null || true
     if command -v nginx &>/dev/null; then
       mkdir -p /etc/nginx/gravity-default.d
@@ -5506,7 +5506,7 @@ server {
     server_name _;
     location / {
         if ($gravity_lan = 0) { return 444; }
-        proxy_pass http://127.0.0.1:5000;
+        proxy_pass http://127.0.0.1:4000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -5783,15 +5783,8 @@ app.get("/api/terminal/test", auth, (req,res) => {
 
 // La WebUI n'écoute qu'en boucle locale : seule la porte nginx (port 80)
 // est exposée, ce qui garantit que le réglage "Accès externe" ne peut pas
-// être contourné par un port direct. 4000 reste ouvert lui aussi en boucle
-// locale : les hôtes proxy existants qui visent 127.0.0.1:4000 continuent
-// de fonctionner sans être modifiés.
-const PORT = process.env.GRAVITY_PORT || 5000;
+// être contourné par un port direct. Port 4000 (historique) : un autre
+// numéro comme 5000 est vite pris par un conteneur de l'utilisateur
+// (Frigate, par exemple) — nginx aurait alors proxifié ce conteneur.
+const PORT = process.env.GRAVITY_PORT || 4000;
 server.listen(PORT, "127.0.0.1", () => console.log(`\n  GravityOS WebUI v2 — http://127.0.0.1:${PORT} (via nginx, port 80)\n`));
-const LEGACY_LOOPBACK_PORT = 4000;
-if (Number(PORT) !== LEGACY_LOOPBACK_PORT) {
-  const legacyServer = http.createServer(app);
-  for (const l of server.listeners("upgrade")) legacyServer.on("upgrade", l);
-  legacyServer.on("error", e => console.error("Port local 4000:", e.message));
-  legacyServer.listen(LEGACY_LOOPBACK_PORT, "127.0.0.1");
-}
