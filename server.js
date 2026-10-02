@@ -1668,18 +1668,20 @@ function proxyDisable(fn) {
 
 function nginxAvailable() { return fs.existsSync(NAVAIL) && fs.existsSync(NSITES); }
 
-// Hôte par défaut (accès par adresse IP, ou par un domaine sans proxy
-// configuré). Sans lui, nginx sert le premier hôte proxy venu — d'où une IP
-// publique qui retombait sur un service interne. nginx.conf inclut ce
-// dossier AVANT sites-enabled ; le fichier est entièrement géré ici.
-// Page de bienvenue : "return 200" inline (aucun fichier statique servi,
-// règle "Nginx = proxy-only"). Désactivé (défaut) : connexion coupée sans
-// réponse (444). HTTPS : handshake refusé, pas de certificat requis.
-const PROXY_DEFAULT_META = `${CFG}/proxy-default.json`;
+// Accès à la WebUI par nginx sur le port 80 (hôte par défaut : adresse IP,
+// nom d'hôte, domaine sans proxy configuré). nginx.conf inclut ce dossier
+// AVANT sites-enabled ; le fichier est entièrement géré ici.
+//  - Réseau local (RFC 1918, loopback, lien local, CGNAT/Tailscale, IPv6
+//    locale) : la WebUI est toujours servie.
+//  - Extérieur : WebUI servie seulement si "Accès externe" est activé ;
+//    sinon une page "Welcome to nginx!" ("return 200" inline : aucun fichier
+//    statique servi, règle "Nginx = proxy-only").
+// HTTPS : handshake refusé sur l'hôte par défaut (pas de certificat requis).
+const PROXY_EXTERNAL_META = `${CFG}/proxy-external.json`;
 const NGINX_DEFAULT_DIR = "/etc/nginx/gravity-default.d";
 const NGINX_DEFAULT_CONF = `${NGINX_DEFAULT_DIR}/default.conf`;
-function loadProxyDefaultEnabled(){ try{ return !!JSON.parse(fs.readFileSync(PROXY_DEFAULT_META,"utf8")).enabled; } catch{ return false; } }
-function buildDefaultHostConf(enabled){
+function loadExternalAccess(){ try{ return !!JSON.parse(fs.readFileSync(PROXY_EXTERNAL_META,"utf8")).enabled; } catch{ return false; } }
+function buildDefaultHostConf(externalAccess){
   const page = `<!DOCTYPE html>
 <html>
 <head>
@@ -1696,20 +1698,31 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 </body>
 </html>
 `;
-  const body80 = enabled
-    ? `    default_type text/html;\n    return 200 '${page}';`
-    : `    return 444;`;
-  // La WebUI reste joignable par le nom d'hôte (gravity-nas.local) : seule
-  // la requête par adresse IP tombe sur l'hôte par défaut ci-dessous.
-  const host = (require("os").hostname() || "gravity-nas").toLowerCase().replace(/[^a-z0-9-]/g,"") || "gravity-nas";
+  const guard = externalAccess ? "" : `        if ($gravity_lan = 0) {
+            return 200 '${page}';
+        }
+`;
   const uiPort = process.env.GRAVITY_PORT || 5000;
   return `# Géré par GravityOS (Paramètres > Proxy inversé) — ne pas modifier à la main
+geo $gravity_lan {
+    default 0;
+    127.0.0.0/8 1;
+    10.0.0.0/8 1;
+    172.16.0.0/12 1;
+    192.168.0.0/16 1;
+    169.254.0.0/16 1;
+    100.64.0.0/10 1;
+    ::1/128 1;
+    fc00::/7 1;
+    fe80::/10 1;
+}
 server {
-    listen 80;
-    listen [::]:80;
-    server_name ${host}.local ${host};
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
     location / {
-        proxy_pass http://127.0.0.1:${uiPort};
+        default_type text/html;
+${guard}        proxy_pass http://127.0.0.1:${uiPort};
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -1722,12 +1735,6 @@ server {
     }
 }
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
-${body80}
-}
-server {
     listen 443 ssl default_server;
     listen [::]:443 ssl default_server;
     server_name _;
@@ -1735,16 +1742,16 @@ server {
 }
 `;
 }
-function writeDefaultHostConf(enabled){
+function writeDefaultHostConf(externalAccess){
   fs.mkdirSync(NGINX_DEFAULT_DIR,{recursive:true});
-  fs.writeFileSync(NGINX_DEFAULT_CONF, buildDefaultHostConf(enabled));
+  fs.writeFileSync(NGINX_DEFAULT_CONF, buildDefaultHostConf(externalAccess));
 }
-// Recrée le fichier s'il manque ou a dérivé (réglage, nom d'hôte, port) et
-// recharge nginx ; si la config est invalide, l'ancien fichier est restauré.
+// Recrée le fichier s'il manque ou a dérivé (réglage, port) et recharge
+// nginx ; si la config est invalide, l'ancien fichier est restauré.
 async function syncDefaultHostConf(){
   try {
     if (!nginxAvailable()) return;
-    const want = buildDefaultHostConf(loadProxyDefaultEnabled());
+    const want = buildDefaultHostConf(loadExternalAccess());
     let have = null; try { have = fs.readFileSync(NGINX_DEFAULT_CONF,"utf8"); } catch {}
     if (have === want) return;
     fs.mkdirSync(NGINX_DEFAULT_DIR,{recursive:true});
@@ -1755,10 +1762,10 @@ async function syncDefaultHostConf(){
 }
 syncDefaultHostConf();
 
-app.get("/api/proxy/default-page", auth, (req,res) => {
-  res.json({ enabled: loadProxyDefaultEnabled(), available: nginxAvailable() });
+app.get("/api/proxy/external-access", auth, (req,res) => {
+  res.json({ enabled: loadExternalAccess(), available: nginxAvailable() });
 });
-app.put("/api/proxy/default-page", auth, async (req,res) => {
+app.put("/api/proxy/external-access", auth, async (req,res) => {
   if (!nginxAvailable()) return res.status(503).json({error:"Nginx n'est pas installé sur cette machine (environnement de test) — cette fonctionnalité s'applique réellement sur un vrai NAS GravityOS."});
   const enabled = !!req.body.enabled;
   let previous = null; try { previous = fs.readFileSync(NGINX_DEFAULT_CONF,"utf8"); } catch {}
@@ -1766,7 +1773,7 @@ app.put("/api/proxy/default-page", auth, async (req,res) => {
     writeDefaultHostConf(enabled);
     await execAsync("nginx -t && systemctl reload nginx");
     fs.mkdirSync(CFG,{recursive:true});
-    fs.writeFileSync(PROXY_DEFAULT_META, JSON.stringify({enabled},null,2));
+    fs.writeFileSync(PROXY_EXTERNAL_META, JSON.stringify({enabled},null,2));
     res.json({ok:true, enabled});
   } catch(e) {
     try { if (previous===null) fs.rmSync(NGINX_DEFAULT_CONF,{force:true}); else fs.writeFileSync(NGINX_DEFAULT_CONF, previous); } catch {}
@@ -2690,10 +2697,7 @@ app.get("/api/network/general", auth, async(req,res)=>{
 app.post("/api/network/general", auth, async(req,res)=>{
   const { hostname, dnsManual, dnsPreferred, dnsAlternate } = req.body;
   try {
-    if (hostname) {
-      await execAsync(`hostnamectl set-hostname ${sh(hostname.replace(/[^a-zA-Z0-9-]/g,""))}`).catch(()=>{});
-      syncDefaultHostConf();
-    }
+    if (hostname) await execAsync(`hostnamectl set-hostname ${sh(hostname.replace(/[^a-zA-Z0-9-]/g,""))}`).catch(()=>{});
     if (dnsManual !== undefined) {
       if (!(await hasNmcli())) {
         return res.status(503).json({ error: "Configuration DNS manuelle indisponible : NetworkManager (nmcli) n'est pas actif sur cette machine." });
@@ -5462,15 +5466,48 @@ function gravityUpdateCmd() {
     if command -v nginx &>/dev/null; then
       mkdir -p /etc/nginx/gravity-default.d
       if [ ! -f /etc/nginx/gravity-default.d/default.conf ]; then
-        GH=$(hostname | tr 'A-Z' 'a-z')
-        printf '%s\n' 'server {' '    listen 80;' '    listen [::]:80;' "    server_name $GH.local $GH;" '    location / {' '        proxy_pass http://127.0.0.1:5000;' '        proxy_http_version 1.1;' '        proxy_set_header Upgrade $http_upgrade;' '        proxy_set_header Connection $connection_upgrade;' '        proxy_set_header Host $host;' '        proxy_read_timeout 3600;' '    }' '}' 'server {' '    listen 80 default_server;' '    listen [::]:80 default_server;' '    server_name _;' '    return 444;' '}' 'server {' '    listen 443 ssl default_server;' '    listen [::]:443 ssl default_server;' '    server_name _;' '    ssl_reject_handshake on;' '}' > /etc/nginx/gravity-default.d/default.conf
+        cat > /etc/nginx/gravity-default.d/default.conf <<'GRAVDEFAULT'
+geo $gravity_lan {
+    default 0;
+    127.0.0.0/8 1;
+    10.0.0.0/8 1;
+    172.16.0.0/12 1;
+    192.168.0.0/16 1;
+    169.254.0.0/16 1;
+    100.64.0.0/10 1;
+    ::1/128 1;
+    fc00::/7 1;
+    fe80::/10 1;
+}
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    location / {
+        if ($gravity_lan = 0) { return 444; }
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 3600;
+    }
+}
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+GRAVDEFAULT
       fi
       if grep -q 'proxy TOUT vers Node' /etc/nginx/nginx.conf 2>/dev/null; then
         cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.gravity-bak
         awk '/proxy TOUT vers Node/{skip=1; print "    include /etc/nginx/gravity-default.d/*.conf;"; print ""; next} /Vhosts proxy personnalis/{skip=0} !skip{print}' /etc/nginx/nginx.conf.gravity-bak > /etc/nginx/nginx.conf
         if nginx -t 2>/dev/null; then
           systemctl reload nginx 2>/dev/null || true
-          echo "Nginx : WebUI sur le port 80 uniquement via le nom d'hôte (par IP : port 5000) ✓"
+          echo "Nginx : WebUI sur le port 80 en interne, accès externe réglable (Paramètres > Proxy inversé) ✓"
         else
           cp /etc/nginx/nginx.conf.gravity-bak /etc/nginx/nginx.conf
           echo "Nginx : configuration invalide, ancienne configuration restaurée"
