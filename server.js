@@ -5,7 +5,7 @@ const express  = require("express");
 const http     = require("http");
 const { WebSocketServer } = require("ws");
 const si       = require("systeminformation");
-const { exec, execFile, execSync, spawn } = require("child_process");
+const { exec, execFile, execFileSync, execSync, spawn } = require("child_process");
 const { promisify } = require("util");
 const path     = require("path");
 const fs       = require("fs");
@@ -85,8 +85,14 @@ const SESSIONS = `${CFG}/sessions.json`;
 const WIZARD   = `${CFG}/.wizard_done`;
 
 function getCreds() {
-  try { const l = fs.readFileSync(CREDS,"utf8").trim().split("\n"); return { user: l[0]||"gravity", pass: l[1]||"gravity" }; }
-  catch { return { user:"gravity", pass:"gravity" }; }
+  try {
+    const l = fs.readFileSync(CREDS,"utf8").trim().split("\n");
+    if (l[0] && l[1]) return { user: l[0], pass: l[1], valid: true };
+  } catch {}
+  // Identifiants d'usine seulement tant que l'assistant n'est pas terminé (ISO
+  // neuve). Ensuite, un fichier absent ou illisible ne doit JAMAIS rouvrir
+  // gravity/gravity : aucun compte n'est alors accepté.
+  return fs.existsSync(WIZARD) ? { user: "", pass: "", valid: false } : { user: "gravity", pass: "gravity", valid: true };
 }
 
 // ── Sessions ──────────────────────────────────────────────────────────────────
@@ -142,7 +148,7 @@ app.post("/api/auth/login", async (req,res) => {
   if (globalLoginFails.length >= 100) await new Promise(r => setTimeout(r, 2000));
   const c = getCreds();
   const okUser = safeEq(username ?? "", c.user), okPass = safeEq(password ?? "", c.pass);
-  if (okUser && okPass) {
+  if (c.valid && okUser && okPass) {
     loginFails.delete(ip);
     const sid = newSid();
     const secure = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
@@ -179,6 +185,10 @@ app.post("/api/wizard/complete", async (req,res) => {
   // sur le réseau réécrit le mot de passe root et les identifiants WebUI.
   if (fs.existsSync(WIZARD)) return res.status(403).json({ error:"L'assistant de configuration est déjà terminé" });
   const { hostname, username, password, timezone } = req.body;
+  // Le mode "Essayer" du Live CD (session éphémère, rien n'est conservé) utilise
+  // volontairement gravity/gravity ; partout ailleurs ce mot de passe est refusé.
+  if (username && password && isFactoryPassword(password) && !isLive()) return res.status(400).json({ error:"Ce mot de passe est celui d'usine, choisissez-en un autre" });
+  if (typeof password === "string" && /[\r\n\0]/.test(password)) return res.status(400).json({ error:"Mot de passe invalide (retour à la ligne interdit)" });
   if (timezone !== undefined && timezone !== "" && !/^[A-Za-z0-9_+\/-]{1,64}$/.test(String(timezone))) return res.status(400).json({ error:"Fuseau horaire invalide" });
   try {
     if (hostname) await execAsync(`hostnamectl set-hostname ${sh(String(hostname).replace(/[^a-zA-Z0-9-]/g,""))}`).catch(()=>{});
@@ -192,6 +202,9 @@ app.post("/api/wizard/complete", async (req,res) => {
       fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
       await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(u)} -s 2>/dev/null`).catch(()=>{});
     }
+    fs.writeFileSync(WIZARD, new Date().toISOString());
+    await syncWebdavWithWebui(null);
+    await neutralizeDefaultAccounts();
     if (timezone) await execAsync(`timedatectl set-timezone ${sh(String(timezone))}`).catch(()=>{});
     fs.writeFileSync(WIZARD, new Date().toISOString());
     res.json({ ok:true });
@@ -428,13 +441,19 @@ app.delete("/api/system/reboot-schedule", auth, async (req,res) => {
 app.post("/api/system/reboot",   auth, (req,res) => { res.json({ok:true}); setTimeout(()=>exec("systemctl reboot"),1000); });
 app.post("/api/system/shutdown", auth, (req,res) => { res.json({ok:true}); setTimeout(()=>exec("systemctl poweroff"),1000); });
 app.post("/api/system/change-password", auth, async (req,res) => {
-  const { username, password } = req.body;
+  const { username, password } = req.body || {};
+  if (typeof password !== "string" || !password) return res.status(400).json({error:"Mot de passe requis"});
+  if (/[\r\n\0]/.test(password)) return res.status(400).json({error:"Mot de passe invalide (retour à la ligne interdit)"});
+  if (isFactoryPassword(password)) return res.status(400).json({error:"Ce mot de passe est celui d'usine, choisissez-en un autre"});
   try {
+    const prev = getCreds();
     const u = (username||"gravity").replace(/[^a-zA-Z0-9_-]/g,"");
     await ensureSharedGroup();
     await execAsync(`id ${sh(u)} &>/dev/null || useradd -m -s /bin/bash -G sudo,libvirt,kvm,docker,${SHARED_GROUP} ${sh(u)}`);
     await execAsync(`echo ${sh(`${u}:${password}`)} | chpasswd`);
     fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
+    await syncWebdavWithWebui(prev);
+    await neutralizeDefaultAccounts();
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -1602,16 +1621,103 @@ app.post("/api/ftp/account", auth, async (req,res) => {
 });
 
 // ── WebDAV (rclone serve webdav) — désactivé par défaut après installation ──
+// Les identifiants suivent le compte WebUI créé à la 1re configuration (plus de
+// gravity/gravity) tant qu'ils n'ont pas été personnalisés dans Paramètres >
+// Services. Le service ne démarre JAMAIS sans fichier d'identifiants (unité
+// avec ConditionPathExists) : rclone sans --user/--pass sert en accès anonyme.
+// Format systemd EnvironmentFile : valeurs entre guillemets, \ et " échappés,
+// pour supporter n'importe quel mot de passe.
 const WEBDAV_ENV = "/etc/gravity/webdav.env";
+const WEBDAV_UNIT = "/etc/systemd/system/gravity-webdav.service";
+function envQuote(v) { return `"${String(v).replace(/[\\"]/g, "\\$&")}"`; }
+function envUnquote(v) {
+  v = String(v).trim();
+  return v.length >= 2 && v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1).replace(/\\(.)/g, "$1") : v;
+}
 function readWebdavEnv() {
   try {
     const conf = fs.readFileSync(WEBDAV_ENV,"utf8");
-    return {
-      username: conf.match(/^RCLONE_USER=(.*)$/m)?.[1]?.trim() || "gravity",
-      password: conf.match(/^RCLONE_PASS=(.*)$/m)?.[1]?.trim() || "gravity",
-    };
-  } catch { return { username:"gravity", password:"gravity" }; }
+    const username = envUnquote(conf.match(/^RCLONE_USER=(.*)$/m)?.[1] ?? "");
+    const password = envUnquote(conf.match(/^RCLONE_PASS=(.*)$/m)?.[1] ?? "");
+    return username && password ? { username, password } : null;
+  } catch { return null; }
 }
+function writeWebdavEnv(username, password) {
+  fs.mkdirSync(path.dirname(WEBDAV_ENV), {recursive:true});
+  fs.writeFileSync(WEBDAV_ENV, `RCLONE_USER=${envQuote(username)}\nRCLONE_PASS=${envQuote(password)}\n`, {mode:0o600});
+  fs.chmodSync(WEBDAV_ENV, 0o600);
+}
+// WebDAV suit le compte WebUI tant qu'il n'a pas été personnalisé : identifiants
+// d'usine (gravity/gravity), ancien compte WebUI (changement de mot de passe) ou
+// fichier absent. Sans effet avant la fin de l'assistant de configuration.
+async function syncWebdavWithWebui(prev) {
+  try {
+    const c = getCreds();
+    if (!c.valid || !fs.existsSync(WIZARD) || !fs.existsSync(WEBDAV_UNIT)) return false;
+    const cur = readWebdavEnv();
+    const factory = !cur || (cur.username === "gravity" && cur.password === "gravity");
+    const followsPrev = !!(cur && prev && cur.username === prev.user && cur.password === prev.pass);
+    if (!factory && !followsPrev) return false;
+    if (cur && cur.username === c.user && cur.password === c.pass) return false;
+    writeWebdavEnv(c.user, c.pass);
+    await execAsync("systemctl is-active gravity-webdav").then(() => execAsync("systemctl restart gravity-webdav")).catch(() => {});
+    console.log("WebDAV : identifiants alignés sur le compte WebUI");
+    return true;
+  } catch (e) { console.error("Synchronisation WebDAV:", e.message); return false; }
+}
+
+// ── Comptes d'usine gravity/gravity ──────────────────────────────────────────
+// L'ISO livre gravity/gravity (Linux = SSH, FTP, console, sudo ; Samba ; root
+// aussi). Une fois le compte créé à la 1re configuration, ces identifiants ne
+// doivent plus ouvrir aucun service. On ne touche un compte QUE si son mot de
+// passe est encore exactement celui d'usine : un compte volontairement
+// personnalisé n'est jamais verrouillé.
+function linuxPasswordIs(user, pw) {
+  try {
+    const line = fs.readFileSync("/etc/shadow","utf8").split("\n").find(l => l.startsWith(user + ":"));
+    const hash = line && line.split(":")[1];
+    if (!hash || !hash.startsWith("$")) return false; // verrouillé ou sans mot de passe
+    // crypt(3) via libcrypt (gère yescrypt, le défaut de Debian) ; le module
+    // Python "crypt" n'existe plus à partir de Python 3.13, d'où ctypes.
+    const code = [
+      "import ctypes,sys",
+      'l=ctypes.CDLL("libcrypt.so.1")',
+      "l.crypt.restype=ctypes.c_char_p",
+      "l.crypt.argtypes=[ctypes.c_char_p,ctypes.c_char_p]",
+      "r=l.crypt(sys.argv[1].encode(),sys.argv[2].encode())",
+      'print(r.decode() if r else "")',
+    ].join("\n");
+    return execFileSync("python3", ["-c", code, pw, hash], { timeout: 5000 }).toString().trim() === hash;
+  } catch { return false; }
+}
+function smbPasswordIs(user, pw) {
+  try {
+    execFileSync("pdbedit", ["-L", "-u", user], { stdio: "ignore", timeout: 5000 }); // l'utilisateur Samba existe
+    execFileSync("smbclient", ["-L", "//127.0.0.1", "-U", `${user}%${pw}`, "-g"], { stdio: "ignore", timeout: 8000 });
+    return true;
+  } catch { return false; }
+}
+async function neutralizeDefaultAccounts() {
+  try {
+    const c = getCreds();
+    if (!c.valid || !fs.existsSync(WIZARD)) return;
+    if (c.user !== "gravity" && linuxPasswordIs("gravity", "gravity")) {
+      await execAsync("usermod -L gravity");
+      console.log("Compte d'usine gravity/gravity verrouillé (SSH, FTP, console)");
+    }
+    if (c.pass !== "gravity" && linuxPasswordIs("root", "gravity")) {
+      await execAsync(`echo ${sh(`root:${c.pass}`)} | chpasswd`);
+      console.log("Mot de passe root d'usine remplacé par celui du compte WebUI");
+    }
+    if (c.user !== "gravity" && smbPasswordIs("gravity", "gravity")) {
+      await execAsync("smbpasswd -x gravity");
+      console.log("Utilisateur Samba d'usine gravity/gravity supprimé");
+    }
+  } catch (e) { console.error("Comptes d'usine:", e.message); }
+}
+// Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
+function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
+
 app.get("/api/webdav/status", auth, async (req,res) => {
   try {
     const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
@@ -1623,22 +1729,29 @@ app.post("/api/webdav/toggle", auth, async (req,res) => {
   try {
     const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
     const cmd = stdout.trim()==="active" ? "stop" : "start";
+    if (cmd === "start" && !readWebdavEnv()) {
+      // Jamais de démarrage sans identifiants (accès anonyme) : on reprend ceux
+      // du compte WebUI, qui n'existent qu'une fois l'assistant terminé.
+      const c = getCreds();
+      if (!c.valid || !fs.existsSync(WIZARD)) return res.status(400).json({error:"Terminez d'abord la configuration initiale (création du compte)"});
+      writeWebdavEnv(c.user, c.pass);
+    }
     await execAsync(`systemctl ${cmd} gravity-webdav`);
     res.json({ok:true, running: cmd==="start"});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 app.get("/api/webdav/account", auth, (req,res) => {
-  const { username } = readWebdavEnv();
-  res.json({ username });
+  const cur = readWebdavEnv();
+  res.json({ username: cur ? cur.username : getCreds().user });
 });
 app.post("/api/webdav/account", auth, async (req,res) => {
-  const { username, password } = req.body;
+  const { username, password } = req.body || {};
   if (!username || !/^[a-z][a-z0-9_-]{2,31}$/i.test(username)) return res.status(400).json({error:"Nom d'utilisateur invalide (3-32 caractères alphanumériques)"});
-  if (!password || password.length < 4) return res.status(400).json({error:"Mot de passe trop court (minimum 4 caractères)"});
+  if (typeof password !== "string" || password.length < 4) return res.status(400).json({error:"Mot de passe trop court (minimum 4 caractères)"});
+  if (/[\r\n\0]/.test(password)) return res.status(400).json({error:"Mot de passe invalide (retour à la ligne interdit)"});
+  if (isFactoryPassword(password)) return res.status(400).json({error:"Ce mot de passe est celui d'usine, choisissez-en un autre"});
   try {
-    fs.mkdirSync(path.dirname(WEBDAV_ENV), {recursive:true});
-    fs.writeFileSync(WEBDAV_ENV, `RCLONE_USER=${username}\nRCLONE_PASS=${password}\n`);
-    fs.chmodSync(WEBDAV_ENV, 0o600);
+    writeWebdavEnv(username, password);
     await execAsync("systemctl is-active gravity-webdav").then(()=>execAsync("systemctl restart gravity-webdav")).catch(()=>{});
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -5707,14 +5820,11 @@ GRAVDEFAULT
       echo "Installation de rclone (requis pour le WebDAV, désactivé par défaut)..."
       apt-get install -y rclone 2>&1 | tail -3
       mkdir -p /etc/gravity
-      if [ ! -f /etc/gravity/webdav.env ]; then
-        printf 'RCLONE_USER=gravity\nRCLONE_PASS=gravity\n' > /etc/gravity/webdav.env
-        chmod 600 /etc/gravity/webdav.env
-      fi
       cat > /etc/systemd/system/gravity-webdav.service <<'WEBDAVUNIT'
 [Unit]
 Description=GravityOS WebDAV (rclone)
 After=network.target
+ConditionPathExists=/etc/gravity/webdav.env
 
 [Service]
 EnvironmentFile=-/etc/gravity/webdav.env
@@ -5727,6 +5837,14 @@ WEBDAVUNIT
       systemctl daemon-reload
       systemctl disable gravity-webdav 2>/dev/null || true
       ufw allow 8081/tcp 2>/dev/null || true
+    fi
+    # Unité WebDAV déjà installée : ne jamais démarrer sans fichier d'identifiants
+    # (rclone sans --user/--pass = accès anonyme). Idempotent. Les identifiants
+    # d'usine gravity/gravity sont remplacés par ceux du compte WebUI par le
+    # service au démarrage (syncWebdavWithWebui).
+    if [ -f /etc/systemd/system/gravity-webdav.service ] && ! grep -q ConditionPathExists /etc/systemd/system/gravity-webdav.service; then
+      sed -i '1a ConditionPathExists=/etc/gravity/webdav.env' /etc/systemd/system/gravity-webdav.service
+      systemctl daemon-reload
     fi
     if ! command -v minidlnad &>/dev/null; then
       echo "Installation de minidlna (requis pour le DLNA, désactivé par défaut)..."
@@ -5925,3 +6043,5 @@ app.get("/api/terminal/test", auth, (req,res) => {
 // (Frigate, par exemple) — nginx aurait alors proxifié ce conteneur.
 const PORT = process.env.GRAVITY_PORT || 4000;
 server.listen(PORT, "127.0.0.1", () => console.log(`\n  GravityOS WebUI v2 — http://127.0.0.1:${PORT} (via nginx, port 80)\n`));
+// NAS déjà installés : les identifiants d'usine gravity/gravity ne doivent plus ouvrir aucun service
+syncWebdavWithWebui(null).then(neutralizeDefaultAccounts);
