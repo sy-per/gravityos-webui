@@ -98,7 +98,7 @@ function getCreds() {
 // ── Sessions ──────────────────────────────────────────────────────────────────
 let sess = {};
 try { sess = JSON.parse(fs.readFileSync(SESSIONS,"utf8")); } catch {}
-function saveSess() { try { fs.writeFileSync(SESSIONS, JSON.stringify(sess)); } catch {} }
+function saveSess() { try { fs.writeFileSync(SESSIONS, JSON.stringify(sess), { mode: 0o600 }); fs.chmodSync(SESSIONS, 0o600); } catch {} }
 function newSid() { const s = crypto.randomBytes(32).toString("hex"); sess[s] = Date.now(); saveSess(); return s; }
 function validSid(s) { if (!s||!sess[s]) return false; if (Date.now()-sess[s]>8*3600*1000) { delete sess[s]; return false; } sess[s]=Date.now(); return true; }
 function getSid(req) { return (req.headers.cookie||"").match(/gravity_sid=([a-f0-9]+)/)?.[1]; }
@@ -3204,6 +3204,79 @@ async function hardenSshRootLogin() {
     return true;
   } catch (e) { console.error("Durcissement SSH:", e.message); return false; }
 }
+// ── Pare-feu : ports publiés par Docker ─────────────────────────────────────
+// Docker publie un port par DNAT (table nat) puis FORWARD : le trafic ne passe
+// jamais par les règles d'entrée d'ufw (chaîne INPUT). Un conteneur avec
+// "-p 5000:5000" est donc joignable depuis Internet même si ufw "refuse tout",
+// et un port ouvert sur la box par erreur expose le conteneur.
+// Correctif standard : la chaîne DOCKER-USER (évaluée avant les règles de
+// Docker). Règles : connexions déjà établies et trafic venant du réseau local
+// (RFC 1918, loopback, lien local, CGNAT/Tailscale — donc aussi les conteneurs,
+// les VM et nginx) passent ; tout le reste est écarté, sauf ouverture
+// explicite par `ufw route allow proto tcp to any port N`
+// (chaîne ufw-user-forward). Bloc géré dans /etc/ufw/after.rules.
+const UFW_AFTER_RULES = "/etc/ufw/after.rules";
+const DOCKER_FW_BEGIN = "# BEGIN GRAVITYOS DOCKER-USER";
+const DOCKER_FW_END = "# END GRAVITYOS DOCKER-USER";
+function dockerFirewallBlock() {
+  return [
+    DOCKER_FW_BEGIN,
+    "# Géré par GravityOS : ne pas modifier à la main (réécrit au démarrage du service).",
+    "# Ouvrir un port de conteneur à Internet : ufw route allow proto tcp to any port <port>",
+    "*filter",
+    // Seule DOCKER-USER est déclarée : redéclarer ufw-user-forward (déjà créée
+    // par before.rules d'ufw) la VIDERAIT et effacerait les `ufw route allow`.
+    ":DOCKER-USER - [0:0]",
+    "-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN",
+    "-A DOCKER-USER -s 127.0.0.0/8 -j RETURN",
+    "-A DOCKER-USER -s 10.0.0.0/8 -j RETURN",
+    "-A DOCKER-USER -s 172.16.0.0/12 -j RETURN",
+    "-A DOCKER-USER -s 192.168.0.0/16 -j RETURN",
+    "-A DOCKER-USER -s 169.254.0.0/16 -j RETURN",
+    "-A DOCKER-USER -s 100.64.0.0/10 -j RETURN",
+    "-A DOCKER-USER -j ufw-user-forward",
+    "-A DOCKER-USER -j DROP",
+    "COMMIT",
+    DOCKER_FW_END,
+  ].join("\n");
+}
+// Idempotent : (ré)écrit le bloc s'il manque ou a changé, puis recharge ufw ;
+// si le rechargement échoue, l'ancien fichier est restauré. Sans ufw (pas de
+// fichier) ou avec un bloc "ufw-docker" déjà installé à la main : rien.
+async function ensureDockerFirewall() {
+  try {
+    if (!fs.existsSync(UFW_AFTER_RULES)) return false;
+    const text = fs.readFileSync(UFW_AFTER_RULES, "utf8");
+    if (text.includes("BEGIN UFW AND DOCKER")) return false;
+    const block = dockerFirewallBlock();
+    const a = text.indexOf(DOCKER_FW_BEGIN);
+    const b = a >= 0 ? text.indexOf(DOCKER_FW_END, a) : -1;
+    let next;
+    if (a >= 0 && b > a) {
+      if (text.slice(a, b + DOCKER_FW_END.length) === block) return false;
+      next = text.slice(0, a) + block + text.slice(b + DOCKER_FW_END.length);
+    } else {
+      next = text.replace(/\n*$/, "\n") + "\n" + block + "\n";
+    }
+    fs.writeFileSync(UFW_AFTER_RULES, next);
+    let out = "";
+    try { out = String((await execAsync("ufw reload")).stdout || ""); }
+    catch (e) { fs.writeFileSync(UFW_AFTER_RULES, text); throw e; }
+    console.log(/not enabled/i.test(out)
+      ? "Pare-feu Docker : règles écrites, appliquées dès qu'ufw sera activé (ufw est inactif : aucun pare-feu pour l'instant)"
+      : "Pare-feu : ports publiés par Docker limités au réseau local (DOCKER-USER)");
+    return true;
+  } catch (e) { console.error("Pare-feu Docker:", e.message); return false; }
+}
+
+// Fichiers de /etc/gravity qui contiennent des secrets (identifiants de
+// sauvegarde distante, identifiants de session) : lisibles par root seulement.
+function securePrivateFiles() {
+  for (const f of ["sessions.json", "backup-remotes.json", "backup-tasks.json", "token"]) {
+    try { fs.chmodSync(`${CFG}/${f}`, 0o600); } catch {}
+  }
+}
+
 app.get("/api/terminal/ssh", auth, async(req,res)=>{
   try {
     const available = await execAsync("command -v sshd").then(()=>true).catch(()=>false);
@@ -4403,7 +4476,7 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
     }
     writeEnvFile(dir, generated);
     if (app_.hasUserFacingPassword && generated.APP_PASSWORD) {
-      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ password: generated.APP_PASSWORD }));
+      fs.writeFileSync(path.join(dir, "credentials.json"), JSON.stringify({ password: generated.APP_PASSWORD }), { mode: 0o600 });
     }
     const jobId = runJob(composeUpCmd(dir, "up -d", retagPinnedImagesCmd(composeYaml)), async (ok) => {
       // Callback fire-and-forget — une erreur ici (ex: écriture disque du
@@ -4691,7 +4764,7 @@ app.delete("/api/docker/networks/:id", auth, async(req,res)=>{
 // ══════════════════════════════════════════════════════════════════════════════
 const BACKUP_REMOTES = `${CFG}/backup-remotes.json`;
 function loadRemotes(){ try{ return JSON.parse(fs.readFileSync(BACKUP_REMOTES,"utf8")); } catch{ return []; } }
-function saveRemotes(r){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(BACKUP_REMOTES, JSON.stringify(r,null,2)); }
+function saveRemotes(r){ fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(BACKUP_REMOTES, JSON.stringify(r,null,2), { mode: 0o600 }); fs.chmodSync(BACKUP_REMOTES, 0o600); }
 
 // Destinations "remote" enregistrées (FTP/SMB) — le mot de passe n'est jamais renvoyé au client
 app.get("/api/backup/remotes", auth, (req,res)=> res.json(loadRemotes().map(({password,...r})=>r)) );
@@ -6077,3 +6150,5 @@ server.listen(PORT, "127.0.0.1", () => console.log(`\n  GravityOS WebUI v2 — h
 if (!getCreds().valid) console.error("Identifiants WebUI illisibles ou absents (/etc/gravity/credentials) : aucun compte n'est accepté. Le service doit tourner en root.");
 syncWebdavWithWebui(null).then(neutralizeDefaultAccounts);
 hardenSshRootLogin();
+securePrivateFiles();
+ensureDockerFirewall();
