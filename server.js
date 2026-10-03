@@ -84,17 +84,51 @@ const CREDS    = `${CFG}/credentials`;
 const SESSIONS = `${CFG}/sessions.json`;
 const WIZARD   = `${CFG}/.wizard_done`;
 
+// ── Identifiants WebUI ────────────────────────────────────────────────────────
+// /etc/gravity/credentials (600), 2 lignes : l'utilisateur, puis son mot de passe
+// HACHÉ en scrypt ("scrypt$N$r$p$sel$hash"). Un fichier lu ne livre plus le mot
+// de passe (qui servait aussi à root, Samba, WebDAV...). L'ancien format (mot de
+// passe en clair, écrit aussi par l'installeur sur disque) reste lu, puis est
+// converti au démarrage (migrateCredentialsHash).
+const SCRYPT_N = 32768, SCRYPT_R = 8, SCRYPT_P = 1, SCRYPT_KEYLEN = 32;
+const scryptAsync = promisify(crypto.scrypt);
+const scryptMaxmem = (N, r) => 256 * N * r; // 128*N*r requis, marge x2
+async function hashPassword(pw) {
+  const salt = crypto.randomBytes(16);
+  const key = await scryptAsync(String(pw), salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P, maxmem: scryptMaxmem(SCRYPT_N, SCRYPT_R) });
+  return `scrypt$${SCRYPT_N}$${SCRYPT_R}$${SCRYPT_P}$${salt.toString("base64")}$${key.toString("base64")}`;
+}
+function parseHash(stored) {
+  const m = /^scrypt\$(\d{1,7})\$(\d{1,3})\$(\d{1,3})\$([A-Za-z0-9+\/=]+)\$([A-Za-z0-9+\/=]+)$/.exec(String(stored ?? ""));
+  if (!m) return null;
+  const N = +m[1], r = +m[2], p = +m[3];
+  if (N < 2 || (N & (N - 1)) !== 0 || N > (1 << 18) || r < 1 || r > 32 || p < 1 || p > 16) return null;
+  const salt = Buffer.from(m[4], "base64"), key = Buffer.from(m[5], "base64");
+  if (salt.length < 8 || key.length < 16) return null;
+  return { N, r, p, salt, key };
+}
+// Ancien format (clair) accepté, comparaison à temps constant.
+async function verifyPassword(pw, stored) {
+  const h = parseHash(stored);
+  if (!h) return safeEq(pw ?? "", stored ?? "");
+  const key = await scryptAsync(String(pw ?? ""), h.salt, h.key.length, { N: h.N, r: h.r, p: h.p, maxmem: scryptMaxmem(h.N, h.r) });
+  return key.length === h.key.length && crypto.timingSafeEqual(key, h.key);
+}
+
+// { user, stored (haché ou, ancien format, clair), plain (clair SEULEMENT si le
+// fichier est encore à l'ancien format, sinon null), valid }
 function getCreds() {
   try {
     const l = fs.readFileSync(CREDS,"utf8").trim().split("\n");
-    if (l[0] && l[1]) return { user: l[0], pass: l[1], valid: true };
+    if (l[0] && l[1]) return { user: l[0], stored: l[1], plain: parseHash(l[1]) ? null : l[1], valid: true };
   } catch {}
   // Identifiants d'usine seulement tant que l'assistant n'est pas terminé (ISO
   // neuve). Ensuite, un fichier absent ou illisible ne doit JAMAIS rouvrir
   // gravity/gravity : aucun compte n'est alors accepté.
-  return fs.existsSync(WIZARD) ? { user: "", pass: "", valid: false } : { user: "gravity", pass: "gravity", valid: true };
+  return fs.existsSync(WIZARD)
+    ? { user: "", stored: "", plain: null, valid: false }
+    : { user: "gravity", stored: "gravity", plain: null, valid: true };
 }
-
 // ── Sessions ──────────────────────────────────────────────────────────────────
 let sess = {};
 try { sess = JSON.parse(fs.readFileSync(SESSIONS,"utf8")); } catch {}
@@ -147,7 +181,8 @@ app.post("/api/auth/login", async (req,res) => {
   globalLoginFails = globalLoginFails.filter(t => now - t < 10*60*1000);
   if (globalLoginFails.length >= 100) await new Promise(r => setTimeout(r, 2000));
   const c = getCreds();
-  const okUser = safeEq(username ?? "", c.user), okPass = safeEq(password ?? "", c.pass);
+  const okUser = safeEq(username ?? "", c.user);
+  const okPass = c.valid ? await verifyPassword(password ?? "", c.stored) : false;
   if (c.valid && okUser && okPass) {
     loginFails.delete(ip);
     const sid = newSid();
@@ -192,18 +227,21 @@ app.post("/api/wizard/complete", async (req,res) => {
   if (timezone !== undefined && timezone !== "" && !/^[A-Za-z0-9_+\/-]{1,64}$/.test(String(timezone))) return res.status(400).json({ error:"Fuseau horaire invalide" });
   try {
     if (hostname) await execAsync(`hostnamectl set-hostname ${sh(String(hostname).replace(/[^a-zA-Z0-9-]/g,""))}`).catch(()=>{});
+    let newCreds = null; // mot de passe en clair, uniquement le temps de cette requête
     if (username && password) {
       const u = username.replace(/[^a-zA-Z0-9_-]/g,"");
       await ensureSharedGroup();
       await execAsync(`id ${sh(u)} 2>/dev/null || useradd -m -s /bin/bash -G sudo,libvirt,kvm,docker,${SHARED_GROUP} ${sh(u)}`).catch(()=>{});
+      // root est verrouillé (plus de mot de passe partagé) : l'admin doit pouvoir sudo
+      await execAsync(`usermod -aG sudo ${sh(u)}`).catch(()=>{});
       await execAsync(`echo ${sh(`${u}:${password}`)} | chpasswd`);
-      await execAsync(`echo ${sh(`root:${password}`)} | chpasswd`);
       fs.mkdirSync(CFG,{recursive:true});
-      fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
+      fs.writeFileSync(CREDS,`${u}\n${await hashPassword(password)}\n`,{mode:0o600});
       await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(u)} -s 2>/dev/null`).catch(()=>{});
+      newCreds = { user: u, pass: password };
     }
     fs.writeFileSync(WIZARD, new Date().toISOString());
-    await syncWebdavWithWebui(null);
+    await syncWebdavWithWebui(null, newCreds);
     await neutralizeDefaultAccounts();
     if (timezone) await execAsync(`timedatectl set-timezone ${sh(String(timezone))}`).catch(()=>{});
     fs.writeFileSync(WIZARD, new Date().toISOString());
@@ -451,8 +489,10 @@ app.post("/api/system/change-password", auth, async (req,res) => {
     await ensureSharedGroup();
     await execAsync(`id ${sh(u)} &>/dev/null || useradd -m -s /bin/bash -G sudo,libvirt,kvm,docker,${SHARED_GROUP} ${sh(u)}`);
     await execAsync(`echo ${sh(`${u}:${password}`)} | chpasswd`);
-    fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
-    await syncWebdavWithWebui(prev);
+    fs.writeFileSync(CREDS,`${u}\n${await hashPassword(password)}\n`,{mode:0o600});
+    // Samba gardait l'ancien mot de passe après un changement depuis les réglages
+    await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(u)} -s 2>/dev/null`).catch(()=>{});
+    await syncWebdavWithWebui(prev, { user: u, pass: password });
     await neutralizeDefaultAccounts();
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -1650,13 +1690,30 @@ function writeWebdavEnv(username, password) {
 // WebDAV suit le compte WebUI tant qu'il n'a pas été personnalisé : identifiants
 // d'usine (gravity/gravity), ancien compte WebUI (changement de mot de passe) ou
 // fichier absent. Sans effet avant la fin de l'assistant de configuration.
-async function syncWebdavWithWebui(prev) {
+// Le mot de passe WebUI n'est plus stocké en clair : `next` ({user, pass}) le
+// fournit au moment où il est saisi (assistant, changement de mot de passe) ;
+// sinon on ne l'a que si le fichier est encore à l'ancien format (migration au
+// démarrage). `prev` = ancien compte (getCreds()) pour reconnaître un WebDAV
+// qui le suivait (comparaison par hachage, sans clair).
+async function syncWebdavWithWebui(prev, next) {
   try {
-    const c = getCreds();
-    if (!c.valid || !fs.existsSync(WIZARD) || !fs.existsSync(WEBDAV_UNIT)) return false;
+    const g = getCreds();
+    if (!g.valid || !fs.existsSync(WIZARD) || !fs.existsSync(WEBDAV_UNIT)) return false;
+    const c = next || (g.plain != null ? { user: g.user, pass: g.plain } : null);
     const cur = readWebdavEnv();
     const factory = !cur || (cur.username === "gravity" && cur.password === "gravity");
-    const followsPrev = !!(cur && prev && cur.username === prev.user && cur.password === prev.pass);
+    if (!c) {
+      // Mot de passe déjà haché, donc impossible d'aligner WebDAV : surtout ne
+      // pas laisser tourner gravity/gravity — on retire le fichier et on arrête.
+      if (cur && factory) {
+        try { fs.unlinkSync(WEBDAV_ENV); } catch {}
+        await execAsync("systemctl stop gravity-webdav").catch(() => {});
+        console.log("WebDAV : identifiants d'usine gravity/gravity retirés (définir un compte dans Paramètres > Services)");
+        return true;
+      }
+      return false;
+    }
+    const followsPrev = !!(cur && prev && prev.valid && cur.username === prev.user && await verifyPassword(cur.password, prev.stored));
     if (!factory && !followsPrev) return false;
     if (cur && cur.username === c.user && cur.password === c.pass) return false;
     writeWebdavEnv(c.user, c.pass);
@@ -1666,17 +1723,24 @@ async function syncWebdavWithWebui(prev) {
   } catch (e) { console.error("Synchronisation WebDAV:", e.message); return false; }
 }
 
-// ── Comptes d'usine gravity/gravity ──────────────────────────────────────────
+// ── Comptes d'usine gravity/gravity et compte root ───────────────────────────
 // L'ISO livre gravity/gravity (Linux = SSH, FTP, console, sudo ; Samba ; root
 // aussi). Une fois le compte créé à la 1re configuration, ces identifiants ne
 // doivent plus ouvrir aucun service. On ne touche un compte QUE si son mot de
 // passe est encore exactement celui d'usine : un compte volontairement
 // personnalisé n'est jamais verrouillé.
-function linuxPasswordIs(user, pw) {
+function shadowHash(user) {
   try {
     const line = fs.readFileSync("/etc/shadow","utf8").split("\n").find(l => l.startsWith(user + ":"));
-    const hash = line && line.split(":")[1];
-    if (!hash || !hash.startsWith("$")) return false; // verrouillé ou sans mot de passe
+    return (line && line.split(":")[1]) || "";
+  } catch { return ""; }
+}
+// Le compte a un mot de passe utilisable (pas verrouillé "!", ni sans mot de passe "*")
+function linuxHasPassword(user) { return shadowHash(user).startsWith("$"); }
+function linuxPasswordIs(user, pw) {
+  try {
+    const hash = shadowHash(user);
+    if (!hash.startsWith("$")) return false; // verrouillé ou sans mot de passe
     // crypt(3) via libcrypt (gère yescrypt, le défaut de Debian) ; le module
     // Python "crypt" n'existe plus à partir de Python 3.13, d'où ctypes.
     const code = [
@@ -1697,6 +1761,21 @@ function smbPasswordIs(user, pw) {
     return true;
   } catch { return false; }
 }
+// root ne doit plus partager un mot de passe avec la WebUI, Samba ou le compte
+// admin : on verrouille son mot de passe (SSH root par mot de passe est déjà
+// interdit) ; l'administration passe par le compte admin + sudo. Refusé si le
+// compte admin n'est pas dans le groupe sudo (il n'y aurait alors plus aucun
+// moyen d'administrer la machine). Récupération d'urgence : Live CD.
+async function lockRootIfSafe(adminUser) {
+  if (!adminUser) return false;
+  const groups = (await execAsync(`id -nG ${sh(adminUser)}`).catch(() => ({ stdout: "" }))).stdout;
+  if (!/(^|\s)sudo(\s|$)/.test(groups)) {
+    console.error(`root non verrouillé : le compte ${adminUser} n'est pas dans le groupe sudo`);
+    return false;
+  }
+  await execAsync("passwd -l root");
+  return true;
+}
 async function neutralizeDefaultAccounts() {
   try {
     const c = getCreds();
@@ -1705,15 +1784,40 @@ async function neutralizeDefaultAccounts() {
       await execAsync("usermod -L gravity");
       console.log("Compte d'usine gravity/gravity verrouillé (SSH, FTP, console)");
     }
-    if (c.pass !== "gravity" && linuxPasswordIs("root", "gravity")) {
-      await execAsync(`echo ${sh(`root:${c.pass}`)} | chpasswd`);
-      console.log("Mot de passe root d'usine remplacé par celui du compte WebUI");
+    if (linuxHasPassword("root") && linuxPasswordIs("root", "gravity") && await lockRootIfSafe(c.user)) {
+      console.log("Mot de passe root d'usine : compte root verrouillé (administration par sudo)");
     }
     if (c.user !== "gravity" && smbPasswordIs("gravity", "gravity")) {
       await execAsync("smbpasswd -x gravity");
       console.log("Utilisateur Samba d'usine gravity/gravity supprimé");
     }
   } catch (e) { console.error("Comptes d'usine:", e.message); }
+}
+// Ancien format (mot de passe en clair dans /etc/gravity/credentials) : converti en
+// hachage scrypt. Avant d'effacer le clair, root est verrouillé s'il partageait ce
+// mot de passe (ancien assistant). Le hachage est vérifié avant d'écrire : en cas
+// de doute le fichier reste intact (jamais de verrouillage accidentel).
+async function migrateCredentialsHash() {
+  try {
+    const g = getCreds();
+    if (!g.valid || g.plain == null) return false;
+    const stored = await hashPassword(g.plain);
+    if (!(await verifyPassword(g.plain, stored))) throw new Error("vérification du hachage échouée : fichier laissé en clair");
+    if (g.user !== "root" && linuxHasPassword("root") && linuxPasswordIs("root", g.plain) && await lockRootIfSafe(g.user)) {
+      console.log("Mot de passe root identique à celui de la WebUI : compte root verrouillé (administration par sudo)");
+    }
+    fs.writeFileSync(CREDS, `${g.user}\n${stored}\n`, { mode: 0o600 });
+    fs.chmodSync(CREDS, 0o600);
+    console.log("Mot de passe WebUI : stocké haché (scrypt), plus en clair");
+    return true;
+  } catch (e) { console.error("Hachage du mot de passe WebUI:", e.message); return false; }
+}
+// Ordre important : WebDAV et root utilisent le mot de passe en clair, donc
+// avant que le fichier soit converti.
+async function migrateAccountsAtStartup() {
+  await syncWebdavWithWebui(null);
+  await neutralizeDefaultAccounts();
+  await migrateCredentialsHash();
 }
 // Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
 function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
@@ -1729,13 +1833,9 @@ app.post("/api/webdav/toggle", auth, async (req,res) => {
   try {
     const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
     const cmd = stdout.trim()==="active" ? "stop" : "start";
-    if (cmd === "start" && !readWebdavEnv()) {
-      // Jamais de démarrage sans identifiants (accès anonyme) : on reprend ceux
-      // du compte WebUI, qui n'existent qu'une fois l'assistant terminé.
-      const c = getCreds();
-      if (!c.valid || !fs.existsSync(WIZARD)) return res.status(400).json({error:"Terminez d'abord la configuration initiale (création du compte)"});
-      writeWebdavEnv(c.user, c.pass);
-    }
+    // Jamais de démarrage sans identifiants (accès anonyme). Le mot de passe
+    // WebUI n'étant plus stocké en clair, on ne peut plus le recopier ici.
+    if (cmd === "start" && !readWebdavEnv()) return res.status(400).json({error:"Définissez d'abord un compte WebDAV (nom d'utilisateur et mot de passe) avant de l'activer"});
     await execAsync(`systemctl ${cmd} gravity-webdav`);
     res.json({ok:true, running: cmd==="start"});
   } catch(e) { res.status(500).json({error:e.message}); }
@@ -6148,7 +6248,7 @@ const PORT = process.env.GRAVITY_PORT || 4000;
 server.listen(PORT, "127.0.0.1", () => console.log(`\n  GravityOS WebUI v2 — http://127.0.0.1:${PORT} (via nginx, port 80)\n`));
 // NAS déjà installés : les identifiants d'usine gravity/gravity ne doivent plus ouvrir aucun service
 if (!getCreds().valid) console.error("Identifiants WebUI illisibles ou absents (/etc/gravity/credentials) : aucun compte n'est accepté. Le service doit tourner en root.");
-syncWebdavWithWebui(null).then(neutralizeDefaultAccounts);
+migrateAccountsAtStartup();
 hardenSshRootLogin();
 securePrivateFiles();
 ensureDockerFirewall();
