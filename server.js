@@ -1844,31 +1844,72 @@ async function initServiceAccessAfterWizard() {
 // HTTP/FTP/SMB + mot de passe de compte ne doivent pas être joignables depuis
 // Internet si la box redirige le port. Idempotent : une règle « Anywhere » est
 // remplacée par une règle par plage privée.
-const PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"];
+const PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10", "fc00::/7", "fe80::/10"];
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-async function restrictPortsToLan(specs, label) {
+// Règles ajoutées à ufw, avec la syntaxe exacte des commandes (« ufw allow 445/tcp »,
+// « ufw allow from 10.0.0.0/8 to any port 445 proto tcp ») : lisibles pare-feu actif
+// ou non, et sert de base à l'idempotence (une règle est présente si sa ligne l'est).
+async function ufwAddedRules() {
+  return (await execAsync("ufw show added").catch(() => ({ stdout: "" }))).stdout.split("\n").map(l => l.trim()).filter(l => l.startsWith("ufw "));
+}
+// Plages IPv6 locales (fc00::/7, fe80::/10) seulement si ufw gère l'IPv6 : sinon
+// chaque commande échouerait à chaque démarrage. Les postes du réseau local
+// joignent souvent le NAS en IPv6 lien-local (résolution par nom).
+function lanRanges() {
+  let v6 = true;
+  try { v6 = !/^\s*IPV6\s*=\s*no\b/mi.test(fs.readFileSync("/etc/default/ufw", "utf8")); } catch {}
+  return PRIVATE_RANGES.filter(r => v6 || !r.includes(":"));
+}
+// Idempotent : une règle « ouvert à tous » est supprimée, puis une règle par plage
+// locale est ajoutée si elle manque. `always` : même pare-feu inactif (règles
+// écrites pour son activation future).
+async function restrictPortsToLan(specs, label, { always = false } = {}) {
   try {
     const st = (await execAsync("ufw status").catch(() => ({ stdout: "" }))).stdout;
-    if (!/Status: active/i.test(st)) return false;
+    if (!always && !/Status: active/i.test(st)) return false;
+    const added = await ufwAddedRules();
+    const ranges = lanRanges();
     let changed = false;
     for (const { port, proto } of specs) {
-      const p = escapeRe(port);
-      const generic = new RegExp(`^${p}(/${proto})?\\s+ALLOW(\\s+IN)?\\s+Anywhere`, "m").test(st);
-      const lan = new RegExp(`^${p}(/${proto})?\\s+ALLOW(\\s+IN)?\\s+(10\\.0\\.0\\.0/8|192\\.168\\.0\\.0/16)`, "m").test(st);
-      if (!generic && lan) continue;
-      if (generic) await execAsync(`ufw delete allow ${port}/${proto}`).catch(() => {});
-      for (const r of PRIVATE_RANGES) await execAsync(`ufw allow from ${r} to any port ${port} proto ${proto}`).catch(() => {});
-      changed = true;
+      for (const generic of [`ufw allow ${port}/${proto}`, `ufw allow ${port}`]) {
+        if (added.includes(generic)) { await execAsync(generic.replace("ufw allow", "ufw delete allow")).catch(() => {}); changed = true; }
+      }
+      for (const r of ranges) {
+        const rule = `ufw allow from ${r} to any port ${port} proto ${proto}`;
+        if (!added.includes(rule)) { await execAsync(rule).catch(() => {}); changed = true; }
+      }
     }
     if (changed) console.log(`Pare-feu : ${label} limité au réseau local`);
     return changed;
   } catch (e) { console.error(`Pare-feu ${label}:`, e.message); return false; }
 }
+// Supprime toutes les règles ufw d'un port (ancien port SSH après un changement).
+async function removeUfwPortRules(port, proto) {
+  const p = escapeRe(String(port));
+  const re = new RegExp(`^ufw allow (from \\S+ to any port ${p}( proto ${proto})?|${p}(/${proto})?)$`);
+  for (const rule of await ufwAddedRules()) if (re.test(rule)) await execAsync(rule.replace(/^ufw allow/, "ufw delete allow")).catch(() => {});
+}
+// Port(s) SSH réellement configurés (Paramètres > Terminal permet de le changer).
+function sshPorts() {
+  try {
+    const found = [...fs.readFileSync("/etc/ssh/sshd_config", "utf8").matchAll(/^\s*Port\s+(\d+)/gm)].map(m => m[1]);
+    return found.length ? [...new Set(found)] : ["22"];
+  } catch { return ["22"]; }
+}
+// NFS, DLNA et SSH ne sont pas joignables depuis Internet : réseau local seulement.
+// (SSH : les sessions déjà ouvertes continuent ; seules les nouvelles connexions
+// venant d'une adresse non locale sont refusées. Pour s'administrer à distance,
+// passer par un VPN dont les adresses sont locales, ex. Tailscale 100.64.0.0/10.)
+async function restrictOtherServicesFirewall() {
+  await restrictPortsToLan([{ port: "2049", proto: "tcp" }], "NFS");
+  await restrictPortsToLan([{ port: "8200", proto: "tcp" }, { port: "1900", proto: "udp" }], "DLNA");
+  await restrictPortsToLan(sshPorts().map(p => ({ port: p, proto: "tcp" })), "SSH");
+}
 // Au démarrage : listes d'accès, application SMB/FTP, ports limités au réseau local.
 async function ensureSharingServices() {
   await migrateServiceAccessLists();
   if (fs.existsSync(WIZARD)) { await applySmbAccess(); await applyFtpAccess(); await syncSharesGroup(); }
-  await restrictPortsToLan([{ port: "445", proto: "tcp" }, { port: "139", proto: "tcp" }], "SMB");
+  await restrictPortsToLan([{ port: "445", proto: "tcp" }, { port: "139", proto: "tcp" }, { port: "137", proto: "udp" }, { port: "138", proto: "udp" }, { port: "3702", proto: "udp" }, { port: "5357", proto: "tcp" }], "SMB");
   await restrictPortsToLan([{ port: "21", proto: "tcp" }, { port: "49152:49200", proto: "tcp" }], "FTP");
 }
 
@@ -2061,6 +2102,7 @@ async function migrateAccountsAtStartup() {
   await migrateCredentialsHash();
   await ensureWebdavService();
   await ensureSharingServices();
+  await restrictOtherServicesFirewall();
 }
 // Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
 function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
@@ -3620,6 +3662,7 @@ app.post("/api/terminal/ssh", auth, async(req,res)=>{
   const safePort = parseInt(req.body.port,10);
   if (!safePort || safePort<1 || safePort>65535) return res.status(400).json({error:"Port invalide (1-65535)"});
   try {
+    const oldPorts = sshPorts();
     let conf = fs.readFileSync(SSHD_CONFIG,"utf8");
     conf = /^\s*#?\s*Port\s+\d+/m.test(conf) ? conf.replace(/^\s*#?\s*Port\s+\d+/m, `Port ${safePort}`) : `Port ${safePort}\n${conf}`;
     fs.writeFileSync(SSHD_CONFIG, conf);
@@ -3631,7 +3674,10 @@ app.post("/api/terminal/ssh", auth, async(req,res)=>{
     // première fois après un boot).
     await execAsync("mkdir -p -m0755 /run/sshd").catch(()=>{});
     await execAsync("sshd -t"); // valide la config avant de l'appliquer
-    await execAsync(`ufw allow ${safePort}/tcp`).catch(()=>{});
+    // Réseau local seulement (même pare-feu inactif : règles écrites pour son activation) ;
+    // l'ancien port est fermé au lieu de rester ouvert à tous.
+    for (const old of oldPorts) if (Number(old) !== safePort) await removeUfwPortRules(old, "tcp");
+    await restrictPortsToLan([{ port: String(safePort), proto: "tcp" }], "SSH", { always: true });
     if (req.body.active) {
       await execAsync("systemctl enable ssh 2>/dev/null").catch(()=>{});
       await execAsync("systemctl restart ssh");
@@ -6245,7 +6291,7 @@ GRAVDEFAULT
       echo "Installation d'openssh-server (requis pour l'onglet Terminal, désactivé par défaut)..."
       apt-get install -y openssh-server 2>&1 | tail -3
       systemctl disable --now ssh 2>/dev/null || true
-      ufw allow 22/tcp 2>/dev/null || true
+      for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10; do ufw allow from $r to any port 22 proto tcp 2>/dev/null || true; done
     fi
 
     # pam_shells (config PAM par défaut de vsftpd) rejette toute connexion FTP
@@ -6286,8 +6332,10 @@ WEBDAVUNIT
       sed -i "s|^media_dir=.*|media_dir=/srv/shares|" /etc/minidlna.conf 2>/dev/null || echo "media_dir=/srv/shares" >> /etc/minidlna.conf
       sed -i "s|^friendly_name=.*|friendly_name=GravityOS|" /etc/minidlna.conf 2>/dev/null || echo "friendly_name=GravityOS" >> /etc/minidlna.conf
       systemctl disable --now minidlna 2>/dev/null || true
-      ufw allow 8200/tcp 2>/dev/null || true
-      ufw allow 1900/udp 2>/dev/null || true
+      for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10; do
+        ufw allow from $r to any port 8200 proto tcp 2>/dev/null || true
+        ufw allow from $r to any port 1900 proto udp 2>/dev/null || true
+      done
     fi
 
     # systemd-timesyncd requis par l'onglet Options régional > Service NTP
@@ -6353,10 +6401,11 @@ WEBDAVUNIT
     # Ports UDP de découverte réseau (NetBIOS + WS-Discovery) — ufw n'ouvrait
     # que du TCP avant le 2026-08-11, rendant le NAS invisible dans "Réseau"
     # Windows malgré une connexion directe fonctionnelle
-    ufw allow 137/udp  2>/dev/null || true
-    ufw allow 138/udp  2>/dev/null || true
-    ufw allow 3702/udp 2>/dev/null || true
-    ufw allow 5357/tcp 2>/dev/null || true
+    # (réseau local seulement : le service remet ces règles à jour à son démarrage)
+    for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10; do
+      for p in 137 138 3702; do ufw allow from $r to any port $p proto udp 2>/dev/null || true; done
+      ufw allow from $r to any port 5357 proto tcp 2>/dev/null || true
+    done
 
     # Terminal web shellinabox (port 4200) : DÉSACTIVÉ. Configuré en connexion
     # automatique (-s /:UID:GID:HOME:/bin/bash), il donnait un shell admin
