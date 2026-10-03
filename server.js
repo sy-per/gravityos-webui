@@ -240,6 +240,7 @@ app.post("/api/wizard/complete", async (req,res) => {
     }
     fs.writeFileSync(WIZARD, new Date().toISOString());
     await neutralizeDefaultAccounts();
+    await initServiceAccessAfterWizard();
     if (timezone) await execAsync(`timedatectl set-timezone ${sh(String(timezone))}`).catch(()=>{});
     fs.writeFileSync(WIZARD, new Date().toISOString());
     res.json({ ok:true });
@@ -490,6 +491,7 @@ app.post("/api/system/change-password", auth, async (req,res) => {
     await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(u)} -s 2>/dev/null`).catch(()=>{});
     await neutralizeDefaultAccounts();
     await refreshWebdavAuth();
+    await applySmbAccess();
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -1556,7 +1558,7 @@ app.get("/api/smb/status", auth, async (req,res) => {
       execAsync("systemctl is-active nmbd").catch(()=>({stdout:"inactive"}))
     ]);
     const ip = (await execAsync("hostname -I 2>/dev/null").catch(()=>({stdout:"?"}))).stdout.trim().split(" ")[0];
-    res.json({ smbd:smbd.stdout.trim(), nmbd:nmbd.stdout.trim(), ip, path:`\\\\${ip}\\public` });
+    res.json({ ...(await serviceAccessSummary("smb")), smbd:smbd.stdout.trim(), nmbd:nmbd.stdout.trim(), ip, path:`\\\\${ip}\\public` });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 app.post("/api/smb/toggle", auth, async (req,res) => {
@@ -1608,7 +1610,11 @@ app.post("/api/nfs/exports", auth, async (req,res) => {
     res.json({ok:true, clients:list});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
-app.get("/api/ftp/status", auth, async (req,res) => { try{const{stdout}=await execAsync("systemctl is-active vsftpd");res.json({active:stdout.trim()==="active"});}catch{res.json({active:false});} });
+app.get("/api/ftp/status", auth, async (req,res) => {
+  const summary = await serviceAccessSummary("ftp").catch(() => ({ allowedUsers: 0, allowedAdmins: [] }));
+  try { const {stdout}=await execAsync("systemctl is-active vsftpd"); res.json({active:stdout.trim()==="active", ...summary}); }
+  catch { res.json({active:false, ...summary}); }
+});
 // Bug corrigé le 2026-08-23 : "systemctl is-active" renvoie un code de
 // sortie non-nul (donc une promesse rejetée) quand le service est déjà
 // arrêté — sans le .catch() ci-dessous, activer vsftpd depuis l'arrêt
@@ -1623,40 +1629,7 @@ app.post("/api/ftp/toggle", auth, async (req,res) => {
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// ── FTP — identification (utilisateur/mot de passe dédiés) ───────────────────
-// vsftpd.conf embarque userlist_enable=YES + userlist_deny=NO : seul un
-// utilisateur listé dans /etc/vsftpd.userlist peut se connecter, quel que
-// soit son mot de passe système. Le compte est créé sans shell de login
-// (/usr/sbin/nologin) et ajouté au groupe "gravity" pour pouvoir écrire dans
-// /srv/shares (chroot FTP, cf. local_root=/srv/shares dans vsftpd.conf).
-const FTP_USERLIST = "/etc/vsftpd.userlist";
-app.get("/api/ftp/account", auth, (req,res) => {
-  try {
-    const list = fs.readFileSync(FTP_USERLIST,"utf8").split("\n").map(l=>l.trim()).filter(Boolean);
-    res.json({ username: list[0] || null });
-  } catch { res.json({ username: null }); }
-});
-app.post("/api/ftp/account", auth, async (req,res) => {
-  const { username, password } = req.body;
-  if (!username || !/^[a-z][a-z0-9_-]{2,31}$/i.test(username)) return res.status(400).json({error:"Nom d'utilisateur invalide (3-32 caractères alphanumériques)"});
-  if (!password || password.length < 4) return res.status(400).json({error:"Mot de passe trop court (minimum 4 caractères)"});
-  try {
-    await execAsync(`grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells`);
-    // vsftpd exige que le répertoire personnel (passwd) existe réellement sur
-    // le disque (vérification interne avant application de local_root), même
-    // si le contenu servi est ensuite déterminé par local_root=/srv/shares —
-    // useradd -M (sans home) fait donc échouer toute connexion FTP malgré un
-    // compte valide (bug découvert en testant une vraie connexion FTP).
-    const exists = await execAsync(`id ${sh(username)}`).then(()=>true).catch(()=>false);
-    if (!exists) await execAsync(`useradd -m -s /usr/sbin/nologin -G gravity ${sh(username)}`);
-    else await execAsync(`usermod -aG gravity ${sh(username)}`);
-    await execAsync(`echo ${sh(`${username}:${password}`)} | chpasswd`);
-    fs.writeFileSync(FTP_USERLIST, username+"\n");
-    res.json({ok:true});
-  } catch(e) { res.status(500).json({error:e.message}); }
-});
-
-// ── Accès par service (WebDAV d'abord ; SMB et FTP suivront) ────────────────
+// ── Accès par service (WebDAV, SMB, FTP) ────────────────────────────────────
 // Chaque service de partage a une LISTE d'utilisateurs autorisés, choisie dans
 // Paramètres > Services (bouton "Gérer les accès"). Un compte administrateur
 // n'a donc accès à un service que s'il est coché explicitement — la fuite d'un
@@ -1664,7 +1637,7 @@ app.post("/api/ftp/account", auth, async (req,res) => {
 // NAS. Les utilisateurs se connectent avec le MOT DE PASSE DE LEUR COMPTE NAS.
 // Fichier : /etc/gravity/service-access.json  { "webdav": ["alice", ...] }
 const SERVICE_ACCESS_FILE = `${CFG}/service-access.json`;
-const ACCESS_SERVICES = { webdav: "WebDAV" }; // services pris en charge pour l'instant
+const ACCESS_SERVICES = { webdav: "WebDAV", smb: "SMB (Samba)", ftp: "FTP" };
 function loadServiceAccess() { try { const o = JSON.parse(fs.readFileSync(SERVICE_ACCESS_FILE,"utf8")); return o && typeof o === "object" ? o : {}; } catch { return {}; } }
 function saveServiceAccess(o) { fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(SERVICE_ACCESS_FILE, JSON.stringify(o,null,2), { mode: 0o644 }); }
 
@@ -1693,6 +1666,212 @@ async function listNasUsers() {
   }));
 }
 
+// ── Application des listes d'accès : SMB, FTP ────────────────────────────────
+// Résumé affiché dans les onglets : nombre d'autorisés et administrateurs
+// autorisés (à revoir : un administrateur ne devrait pas avoir accès aux services).
+async function serviceAccessSummary(svc) {
+  const allowed = new Set(Array.isArray(loadServiceAccess()[svc]) ? loadServiceAccess()[svc] : []);
+  const users = await listNasUsers().catch(() => []);
+  return { allowedUsers: allowed.size, allowedAdmins: users.filter(u => u.isAdmin && allowed.has(u.username)).map(u => u.username) };
+}
+
+// ── SMB (Samba) : l'accès = compte Samba ACTIVÉ ──────────────────────────────
+// Les partages (smb.conf) ne changent pas : on active (smbpasswd -e) les comptes
+// Samba des utilisateurs cochés et on désactive (-d) les autres, qui reçoivent
+// alors "compte désactivé" (pas de repli invité : le compte existe). Un compte
+// Linux désactivé (passwd -l) est aussi désactivé côté Samba, qui ne lit pas le
+// verrouillage Linux. Un compte Samba n'existe que si un mot de passe a été défini
+// (smbpasswd -a) : on ne peut pas le créer ici sans connaître ce mot de passe.
+async function sambaAccounts() {
+  const out = (await execAsync("pdbedit -L -v").catch(() => ({ stdout: "" }))).stdout;
+  const res = {};
+  for (const blk of out.split(/^-{5,}\s*$/m)) {
+    const name = /^Unix username:\s*(\S+)/m.exec(blk)?.[1];
+    const flags = /^Account Flags:\s*\[([^\]]*)\]/m.exec(blk)?.[1];
+    if (name) res[name] = { disabled: /D/.test(flags || "") };
+  }
+  return res;
+}
+// Coupe les connexions SMB ouvertes d'un utilisateur. Le processus smbd d'une
+// connexion tourne en root (pas sous le compte de l'utilisateur) : `pkill -u` ne
+// le voit pas ; on retrouve le PID de sa session par `smbstatus -b`.
+async function killSmbSessions(user) {
+  const out = (await execAsync("smbstatus -b").catch(() => ({ stdout: "" }))).stdout;
+  for (const line of out.split("\n")) {
+    const m = /^\s*(\d+)\s+(\S+)\s/.exec(line);
+    if (m && m[2] === user) await execAsync(`kill ${m[1]}`).catch(() => {});
+  }
+}
+async function applySmbAccess(removed = []) {
+  try {
+    const allowed = new Set(loadServiceAccess().smb || []);
+    const nas = await listNasUsers();
+    const byName = new Map(nas.map(u => [u.username, u]));
+    const accounts = await sambaAccounts();
+    for (const [name, st] of Object.entries(accounts)) {
+      const u = byName.get(name);
+      if (!u) continue; // comptes hors NAS (nobody, services) : non gérés ici
+      const want = allowed.has(name) && !u.disabled;
+      if (want && st.disabled) await execAsync(`smbpasswd -e ${sh(name)}`).catch(() => {});
+      if (!want && !st.disabled) await execAsync(`smbpasswd -d ${sh(name)}`).catch(() => {});
+    }
+    // Un compte désactivé reste connecté tant que sa session dure : on la coupe.
+    for (const name of removed) await killSmbSessions(name);
+    return true;
+  } catch (e) { console.error("Accès SMB:", e.message); return false; }
+}
+// Partages ouverts aux invités (accès anonyme) : hors de la liste d'accès.
+function smbGuestShares() {
+  try {
+    return fs.readFileSync("/etc/samba/smb.conf", "utf8").split(/^\[/m).slice(1)
+      .map(s => ({ name: /^([^\]]+)\]/.exec(s)?.[1]?.trim() || "", guest: /^\s*guest ok\s*=\s*yes\s*$/mi.test(s) }))
+      .filter(s => s.guest && s.name && !/^(global|homes|printers|print\$)$/i.test(s.name))
+      .map(s => s.name);
+  } catch { return []; }
+}
+
+// ── FTP (vsftpd) : l'accès = /etc/vsftpd.userlist ────────────────────────────
+// vsftpd.conf embarque userlist_enable=YES + userlist_deny=NO : seuls les
+// utilisateurs listés peuvent se connecter (vérifié avant le mot de passe), avec
+// le mot de passe de leur compte (PAM). Liste vide = personne.
+const FTP_USERLIST = "/etc/vsftpd.userlist";
+async function ftpActive() { return execAsync("systemctl is-active vsftpd").then(() => true).catch(() => false); }
+// vsftpd exige que le répertoire personnel existe réellement (même avec
+// local_root), sinon "500 OOPS: cannot change directory" à la connexion.
+async function ensureHomeDir(user) {
+  const home = (await execAsync(`getent passwd ${sh(user)} | cut -d: -f6`).catch(() => ({ stdout: "" }))).stdout.trim();
+  if (!home || fs.existsSync(home)) return;
+  await execAsync(`mkdir -p ${sh(home)} && chown ${sh(user)}: ${sh(home)} && chmod 750 ${sh(home)}`).catch(() => {});
+}
+async function applyFtpAccess(removed = []) {
+  try {
+    const list = (loadServiceAccess().ftp || []).filter(u => /^[a-z_][a-z0-9_-]*$/.test(u));
+    await execAsync("grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells").catch(() => {});
+    for (const u of list) await ensureHomeDir(u);
+    fs.writeFileSync(FTP_USERLIST, list.map(u => u + "\n").join(""));
+    // La liste n'est lue qu'à la connexion : redémarrer coupe les sessions des comptes retirés.
+    if (removed.length && await ftpActive()) await execAsync("systemctl restart vsftpd").catch(() => {});
+    return true;
+  } catch (e) { console.error("Accès FTP:", e.message); return false; }
+}
+
+// Les partages Samba (valid users = @gravity, force group = gravity) et le dossier
+// /srv/shares (chroot FTP) sont écrits avec le groupe "gravity" : un utilisateur
+// autorisé en SMB ou en FTP doit en être membre pour y accéder, et le perd quand
+// il n'est plus autorisé nulle part. Les comptes qui ont "gravity" pour groupe
+// principal (le compte d'usine) ne sont pas concernés.
+async function syncSharesGroup() {
+  try {
+    const acc = loadServiceAccess();
+    const want = new Set([...(acc.smb || []), ...(acc.ftp || [])]);
+    const members = new Set(((await execAsync("getent group gravity").catch(() => ({ stdout: "" }))).stdout.trim().split(":")[3] || "").split(",").filter(Boolean));
+    await execAsync("groupadd -f gravity").catch(() => {});
+    for (const u of (await listNasUsers()).map(x => x.username)) {
+      if (u === "gravity") continue;
+      if (want.has(u) && !members.has(u)) await execAsync(`usermod -aG gravity ${sh(u)}`).catch(() => {});
+      if (!want.has(u) && members.has(u)) await execAsync(`gpasswd -d ${sh(u)} gravity`).catch(() => {});
+    }
+  } catch (e) { console.error("Groupe des partages:", e.message); }
+}
+
+async function applyServiceAccess(svc, removed = []) {
+  if (svc === "webdav") await refreshWebdavAuth();
+  else if (svc === "smb") await applySmbAccess(removed);
+  else if (svc === "ftp") await applyFtpAccess(removed);
+  if (svc === "smb" || svc === "ftp") await syncSharesGroup();
+}
+
+// Remarques affichées en haut de la boîte de dialogue d'un service.
+function serviceNotes(svc) {
+  if (svc === "smb") {
+    const guest = smbGuestShares();
+    return [
+      ...(guest.length ? [`Le${guest.length > 1 ? "s" : ""} partage${guest.length > 1 ? "s" : ""} « ${guest.join(", ")} » ${guest.length > 1 ? "sont ouverts" : "est ouvert"} à tout le monde sans compte (accès invité) : cette liste ne ${guest.length > 1 ? "les" : "le"} concerne pas.`] : []),
+      "Un utilisateur doit avoir un compte Samba pour se connecter : il est créé quand son mot de passe est défini dans l'application « Utilisateurs ».",
+    ];
+  }
+  if (svc === "ftp") return ["Le FTP classique n'est pas chiffré : le mot de passe du compte circule en clair sur le réseau local. N'autorisez que des comptes « Utilisateur » dont le mot de passe n'est pas celui d'un administrateur."];
+  return [];
+}
+
+// Au démarrage, pour les NAS déjà installés : SMB et FTP sont en service, donc
+// la liste de départ reproduit l'accès réel d'avant (comptes Samba actifs, comptes
+// de /etc/vsftpd.userlist) pour ne rien couper ; les administrateurs qui y figurent
+// sont signalés dans l'onglet (« à revoir »). Sur une installation neuve (assistant
+// pas encore terminé) les listes restent vides : voir initServiceAccessAfterWizard.
+// Les noms de comptes disparus sont retirés de toutes les listes.
+async function migrateServiceAccessLists() {
+  try {
+    if (!fs.existsSync(WIZARD)) return false;
+    const access = loadServiceAccess();
+    const nas = new Set((await listNasUsers()).map(u => u.username));
+    let changed = false;
+    if (!Array.isArray(access.smb)) {
+      const acc = await sambaAccounts();
+      access.smb = Object.entries(acc).filter(([u, s]) => nas.has(u) && !s.disabled).map(([u]) => u).sort();
+      changed = true;
+      console.log(`SMB : liste d'accès initialisée avec les ${access.smb.length} compte(s) Samba actif(s) existant(s) — à revoir dans Paramètres > Services`);
+    }
+    if (!Array.isArray(access.ftp)) {
+      let cur = [];
+      try { cur = fs.readFileSync(FTP_USERLIST, "utf8").split("\n").map(l => l.trim()).filter(Boolean); } catch {}
+      access.ftp = [...new Set(cur.filter(u => nas.has(u)))].sort();
+      changed = true;
+    }
+    for (const svc of Object.keys(access)) {
+      if (!Array.isArray(access[svc])) continue;
+      const kept = access[svc].filter(u => nas.has(u));
+      if (kept.length !== access[svc].length) { access[svc] = kept; changed = true; }
+    }
+    if (changed) saveServiceAccess(access);
+    return changed;
+  } catch (e) { console.error("Listes d'accès:", e.message); return false; }
+}
+// Fin de l'assistant (installation neuve) : SMB et FTP démarrent SANS aucun
+// utilisateur autorisé — le compte administrateur qui vient d'être créé n'a donc
+// accès à aucun service tant qu'il n'est pas coché.
+async function initServiceAccessAfterWizard() {
+  try {
+    const acc = loadServiceAccess();
+    let ch = false;
+    for (const s of ["smb", "ftp"]) if (!Array.isArray(acc[s])) { acc[s] = []; ch = true; }
+    if (ch) saveServiceAccess(acc);
+    await applySmbAccess(); await applyFtpAccess(); await syncSharesGroup();
+  } catch (e) { console.error("Listes d'accès (assistant):", e.message); }
+}
+
+// ── Pare-feu : services de partage joignables depuis le réseau local seulement ──
+// HTTP/FTP/SMB + mot de passe de compte ne doivent pas être joignables depuis
+// Internet si la box redirige le port. Idempotent : une règle « Anywhere » est
+// remplacée par une règle par plage privée.
+const PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"];
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+async function restrictPortsToLan(specs, label) {
+  try {
+    const st = (await execAsync("ufw status").catch(() => ({ stdout: "" }))).stdout;
+    if (!/Status: active/i.test(st)) return false;
+    let changed = false;
+    for (const { port, proto } of specs) {
+      const p = escapeRe(port);
+      const generic = new RegExp(`^${p}(/${proto})?\\s+ALLOW(\\s+IN)?\\s+Anywhere`, "m").test(st);
+      const lan = new RegExp(`^${p}(/${proto})?\\s+ALLOW(\\s+IN)?\\s+(10\\.0\\.0\\.0/8|192\\.168\\.0\\.0/16)`, "m").test(st);
+      if (!generic && lan) continue;
+      if (generic) await execAsync(`ufw delete allow ${port}/${proto}`).catch(() => {});
+      for (const r of PRIVATE_RANGES) await execAsync(`ufw allow from ${r} to any port ${port} proto ${proto}`).catch(() => {});
+      changed = true;
+    }
+    if (changed) console.log(`Pare-feu : ${label} limité au réseau local`);
+    return changed;
+  } catch (e) { console.error(`Pare-feu ${label}:`, e.message); return false; }
+}
+// Au démarrage : listes d'accès, application SMB/FTP, ports limités au réseau local.
+async function ensureSharingServices() {
+  await migrateServiceAccessLists();
+  if (fs.existsSync(WIZARD)) { await applySmbAccess(); await applyFtpAccess(); await syncSharesGroup(); }
+  await restrictPortsToLan([{ port: "445", proto: "tcp" }, { port: "139", proto: "tcp" }], "SMB");
+  await restrictPortsToLan([{ port: "21", proto: "tcp" }, { port: "49152:49200", proto: "tcp" }], "FTP");
+}
+
 // ── WebDAV (rclone serve webdav) — désactivé par défaut après installation ──
 // rclone ne connaît aucun compte : il délègue chaque connexion à
 // webdav-auth.js (--auth-proxy), qui vérifie la liste d'accès + le mot de passe
@@ -1718,7 +1897,6 @@ Restart=on-failure
 WantedBy=multi-user.target
 `;
 }
-const PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"];
 async function webdavActive() { return execAsync("systemctl is-active gravity-webdav").then(() => true).catch(() => false); }
 // Redémarre WebDAV s'il tourne : fin des sessions en cache après un changement
 // de liste, de mot de passe, de statut ou de suppression d'un compte.
@@ -1751,28 +1929,22 @@ async function ensureWebdavService() {
     return changed;
   } catch (e) { console.error("Service WebDAV:", e.message); return false; }
 }
-// Le port 8081 n'est ouvert qu'aux adresses locales : WebDAV (HTTP + mot de passe
-// de compte) ne doit pas être joignable depuis Internet si la box redirige le port.
-async function restrictWebdavFirewall() {
-  try {
-    const st = (await execAsync("ufw status").catch(() => ({ stdout: "" }))).stdout;
-    if (!/Status: active/i.test(st)) return;
-    const generic = /^8081(\/tcp)?\s+ALLOW\s+Anywhere/m.test(st);
-    const lan = /^8081(\/tcp)?\s+ALLOW\s+(10\.0\.0\.0\/8|192\.168\.0\.0\/16)/m.test(st);
-    if (!generic && lan) return;
-    if (generic) await execAsync("ufw delete allow 8081/tcp").catch(() => {});
-    for (const r of PRIVATE_RANGES) await execAsync(`ufw allow from ${r} to any port 8081 proto tcp`).catch(() => {});
-    console.log("Pare-feu : WebDAV (port 8081) limité au réseau local");
-  } catch (e) { console.error("Pare-feu WebDAV:", e.message); }
-}
+// Le port 8081 n'est ouvert qu'aux adresses locales : WebDAV (HTTP + mot de passe de
+// compte) ne doit pas être joignable depuis Internet si la box redirige le port.
+async function restrictWebdavFirewall() { return restrictPortsToLan([{ port: "8081", proto: "tcp" }], "WebDAV"); }
 
 app.get("/api/services/:svc/access", auth, async (req,res) => {
   const svc = req.params.svc;
   if (!ACCESS_SERVICES[svc]) return res.status(404).json({ error: "Service inconnu ou pas encore disponible" });
   try {
     const allowed = new Set(Array.isArray(loadServiceAccess()[svc]) ? loadServiceAccess()[svc] : []);
-    const users = (await listNasUsers()).map(u => ({ ...u, allowed: allowed.has(u.username) }));
-    res.json({ service: svc, label: ACCESS_SERVICES[svc], users });
+    const samba = svc === "smb" ? await sambaAccounts() : null;
+    const users = (await listNasUsers()).map(u => ({
+      ...u,
+      allowed: allowed.has(u.username),
+      ...(samba && !samba[u.username] ? { hint: "Pas encore de compte Samba : définissez son mot de passe dans l'application « Utilisateurs » pour qu'il puisse se connecter." } : {}),
+    }));
+    res.json({ service: svc, label: ACCESS_SERVICES[svc], users, notes: serviceNotes(svc) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 app.put("/api/services/:svc/access", auth, async (req,res) => {
@@ -1785,9 +1957,10 @@ app.put("/api/services/:svc/access", auth, async (req,res) => {
     const unknown = wanted.filter(u => !known.has(u));
     if (unknown.length) return res.status(400).json({ error: `Utilisateur inconnu : ${unknown[0]}` });
     const access = loadServiceAccess();
+    const before = new Set(Array.isArray(access[svc]) ? access[svc] : []);
     access[svc] = [...new Set(wanted)].sort();
     saveServiceAccess(access);
-    if (svc === "webdav") await refreshWebdavAuth();
+    await applyServiceAccess(svc, [...before].filter(u => !access[svc].includes(u)));
     res.json({ ok: true, users: access[svc] });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1887,6 +2060,7 @@ async function migrateAccountsAtStartup() {
   await neutralizeDefaultAccounts();
   await migrateCredentialsHash();
   await ensureWebdavService();
+  await ensureSharingServices();
 }
 // Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
 function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
@@ -1895,8 +2069,7 @@ app.get("/api/webdav/status", auth, async (req,res) => {
   try {
     const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
     const ip = (await execAsync("hostname -I 2>/dev/null").catch(()=>({stdout:"?"}))).stdout.trim().split(" ")[0];
-    const allowed = Array.isArray(loadServiceAccess().webdav) ? loadServiceAccess().webdav.length : 0;
-    res.json({ active: stdout.trim()==="active", ip, port: 8081, allowedUsers: allowed });
+    res.json({ active: stdout.trim()==="active", ip, port: 8081, ...(await serviceAccessSummary("webdav")) });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 app.post("/api/webdav/toggle", auth, async (req,res) => {
@@ -5716,6 +5889,7 @@ app.post("/api/users", auth, async(req,res)=>{
     await execAsync(`echo ${sh(`${username}:${password}`)} | chpasswd`);
     await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(username)} -s`).catch(()=>{});
     await applyRole(username, role.id);
+    await applySmbAccess(); // le compte Samba vient d'être créé actif : il n'est autorisé que s'il figure dans la liste
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -5729,7 +5903,7 @@ app.put("/api/users/:username", auth, async(req,res)=>{
       await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(username)} -s`).catch(()=>{});
     }
     if (roleId) await applyRole(username, roleId);
-    if (password) await refreshWebdavAuth();
+    if (password) { await refreshWebdavAuth(); await applySmbAccess(); }
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -5737,6 +5911,7 @@ app.delete("/api/users/:username", auth, async(req,res)=>{
   const { username } = req.params;
   if (!/^[a-z_][a-z0-9_-]*$/.test(username)) return res.status(400).json({error:"Utilisateur invalide"});
   try {
+    await execAsync(`smbpasswd -x ${sh(username)}`).catch(()=>{}); // sinon un futur compte du même nom hériterait du compte Samba
     await execAsync(`userdel -r ${sh(username)}`);
     const map = loadUserRoles();
     delete map[username];
@@ -5748,6 +5923,8 @@ app.delete("/api/users/:username", auth, async(req,res)=>{
     for (const svc of Object.keys(access)) if (Array.isArray(access[svc]) && access[svc].includes(username)) { access[svc] = access[svc].filter(u => u !== username); touched = true; }
     if (touched) saveServiceAccess(access);
     await refreshWebdavAuth();
+    await applyFtpAccess([username]);
+    await syncSharesGroup();
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -5772,6 +5949,7 @@ app.post("/api/users/:username/status", auth, async(req,res)=>{
   try {
     await execAsync(`passwd ${status==="Désactivé"?"-l":"-u"} ${sh(username)}`);
     await refreshWebdavAuth();
+    await applySmbAccess(); // Samba ne lit pas le verrouillage Linux
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
