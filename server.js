@@ -3884,6 +3884,87 @@ app.post("/api/notifications/email/test", auth, async(req,res)=>{
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  NOTIFICATIONS PERSISTANTES (cloche de la barre du haut)
+//  Écrites par le serveur (tâches planifiées, même sans session ouverte) dans
+//  /etc/gravity/notifications.json ; la WebUI les relit à la connexion puis
+//  régulièrement. Une notification avec la même `key` est mise à jour au lieu
+//  d'être dupliquée, et ne redevient « non lue » que si son contenu change.
+// ══════════════════════════════════════════════════════════════════════════════
+const NOTIF_FILE = `${CFG}/notifications.json`;
+function loadNotifs() {
+  try { const a = JSON.parse(fs.readFileSync(NOTIF_FILE, "utf8")); return Array.isArray(a) ? a : []; }
+  catch { return []; }
+}
+function saveNotifs(list) {
+  fs.mkdirSync(CFG, { recursive: true });
+  fs.writeFileSync(NOTIF_FILE, JSON.stringify(list.slice(0, 100), null, 2), { mode: 0o600 });
+}
+// E-mail (si configuré et activé dans Paramètres > Notifications) : envoyé à
+// l'adresse de l'expéditeur. Sujet et corps encodés en base64 (UTF-8, et aucune
+// injection d'en-tête possible via un nom de tâche). Le corps ne reprend jamais
+// le journal d'une tâche (il peut contenir des secrets) : seulement un résumé.
+async function sendNotificationEmail(subject, body) {
+  const c = loadEmailNotifConfig();
+  if (!c.enabled || !c.smtpHost || !c.senderEmail) return false;
+  const b64 = (t) => Buffer.from(t, "utf8").toString("base64");
+  const wrap = (t) => b64(t).replace(/(.{76})/g, "$1\r\n");
+  const from = c.senderName ? `=?UTF-8?B?${b64(c.senderName)}?= <${c.senderEmail}>` : c.senderEmail;
+  const mail = [
+    `From: ${from}`, `To: ${c.senderEmail}`, `Subject: =?UTF-8?B?${b64("GravityOS : " + subject)}?=`,
+    `Date: ${new Date().toUTCString()}`, "MIME-Version: 1.0", "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: base64", "", wrap(body), "",
+  ].join("\r\n");
+  const tmp = path.join("/tmp", `gravity-notif-mail-${crypto.randomBytes(6).toString("hex")}.eml`);
+  try {
+    fs.writeFileSync(tmp, mail, { mode: 0o600 });
+    const tlsFlag = c.tlsRequired ? "--ssl-reqd" : "";
+    const authFlag = c.authRequired && c.username ? `--user ${sh(`${c.username}:${c.password}`)}` : "";
+    await execAsync(`curl -sS --max-time 30 --url ${sh(`smtp://${c.smtpHost}:${c.smtpPort}`)} --mail-from ${sh(c.senderEmail)} --mail-rcpt ${sh(c.senderEmail)} --upload-file ${sh(tmp)} ${authFlag} ${tlsFlag}`);
+    return true;
+  } finally { fs.unlink(tmp, () => {}); }
+}
+// Ne doit jamais faire échouer l'appelant (une tâche planifiée, par exemple).
+function pushNotification({ key, type = "info", title, message = "", emailBody }) {
+  try {
+    const list = loadNotifs();
+    const now = new Date().toISOString();
+    const i = key ? list.findIndex(n => n.key === key) : -1;
+    let changed = true;
+    if (i >= 0) {
+      const old = list[i];
+      changed = old.title !== title || old.message !== message || old.type !== type;
+      if (changed) { list.splice(i, 1); list.unshift({ ...old, type, title, message, time: now, read: false }); }
+    } else {
+      list.unshift({ id: crypto.randomBytes(6).toString("hex"), key: key || null, type, title, message, time: now, read: false });
+    }
+    if (!changed) return;
+    saveNotifs(list);
+    sendNotificationEmail(title, emailBody || message).catch(e => console.error("E-mail de notification :", String(e.stderr || "échec de l'envoi").trim().split(/\r?\n/)[0])); // pas e.message : il contient la commande, donc l'identifiant SMTP
+  } catch (e) { console.error("Notification :", e.message); }
+}
+// Le problème a disparu (mises à jour installées, tâche de nouveau en succès…).
+function resolveNotification(key) {
+  try {
+    const list = loadNotifs();
+    const kept = list.filter(n => n.key !== key);
+    if (kept.length !== list.length) saveNotifs(kept);
+  } catch {}
+}
+app.get("/api/notifications", auth, (req, res) => res.json(loadNotifs()));
+app.post("/api/notifications/read", auth, (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : null;
+  const list = loadNotifs();
+  for (const n of list) if (!ids || ids.includes(n.id)) n.read = true;
+  saveNotifs(list);
+  res.json({ ok: true });
+});
+app.delete("/api/notifications", auth, (req, res) => {
+  const id = req.query.id ? String(req.query.id) : null;
+  saveNotifs(id ? loadNotifs().filter(n => n.id !== id) : []);
+  res.json({ ok: true });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  DOCKER
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -5423,14 +5504,21 @@ function startTaskRun(taskId){
     });
   } catch (e) {
     const tasks2 = loadTasks(); const t2 = tasks2.find(x=>x.id===taskId);
-    if (t2) { t2.status = "warning"; saveTasks(tasks2); }
+    if (t2) {
+      t2.status = "warning"; saveTasks(tasks2);
+      pushNotification({ key: `backup-failed:${taskId}`, type: "error", title: `Échec de la sauvegarde « ${t2.name} »`, message: String(e?.message || e).slice(0, 200), emailBody: `La sauvegarde « ${t2.name} » n'a pas pu démarrer. Consultez Sauvegarde dans GravityOS.` });
+    }
     return;
   }
   runJob(cmd, (ok, log) => {
     const tasks2 = loadTasks();
     const t2 = tasks2.find(x=>x.id===taskId);
     if (!t2) return;
+    const wasFailing = t2.status === "warning";
     t2.status = ok ? "success" : "warning";
+    if (!ok && !wasFailing) {
+      pushNotification({ key: `backup-failed:${taskId}`, type: "error", title: `Échec de la sauvegarde « ${t2.name} »`, message: String(log || "").trim().slice(-200) || "Aucun détail dans le journal.", emailBody: `La sauvegarde « ${t2.name} » a échoué. Consultez son journal dans l'application Sauvegarde.` });
+    } else if (ok) resolveNotification(`backup-failed:${taskId}`);
     t2.lastBackup = new Date().toISOString();
     const sizeMatch = log.match(/SIZE_BYTES:(\d+)/);
     if (sizeMatch) t2.sizeGb = Math.round((parseInt(sizeMatch[1],10)/1e9)*100)/100;
@@ -5661,14 +5749,30 @@ async function runBuiltinTask(t) {
   if (t.builtinType === "auto-update") {
     const sys = await runUpdateProcess(systemUpdateCmd());
     const grav = await runUpdateProcess(gravityUpdateCmd());
+    if (sys.ok) resolveNotification("os-updates");
     return { ok: sys.ok && grav.ok, log: `${sys.log}\n\n${grav.log}` };
   }
   if (t.builtinType === "check-os-updates") {
     const r = await checkOsUpdatesCore();
+    if (r.count > 0) {
+      const names = r.packages.map(l => l.split("/")[0]).slice(0, 8);
+      pushNotification({
+        key: "os-updates", type: "info",
+        title: `${r.count} mise${r.count > 1 ? "s" : ""} à jour système disponible${r.count > 1 ? "s" : ""}`,
+        message: names.join(", ") + (r.count > names.length ? ` et ${r.count - names.length} autre(s)` : "") + ". À installer dans Paramètres > Mises à jour.",
+      });
+    } else resolveNotification("os-updates");
     return { ok: true, log: r.count > 0 ? `${r.count} mise(s) à jour disponible(s) :\n${r.packages.join("\n")}` : "Système à jour." };
   }
   if (t.builtinType === "check-docker-updates") {
     const r = await checkDockerImageUpdates();
+    if (r.count > 0) {
+      pushNotification({
+        type: "info",
+        title: `${r.count} image${r.count > 1 ? "s" : ""} Docker mise${r.count > 1 ? "s" : ""} à jour téléchargée${r.count > 1 ? "s" : ""}`,
+        message: r.images.join(", ") + ". Recréez les conteneurs concernés pour les appliquer.",
+      });
+    }
     return { ok: true, log: (r.count > 0 ? `${r.count} image(s) mise(s) à jour :\n${r.images.join("\n")}\n\n` : "Toutes les images sont à jour.\n\n") + r.log };
   }
   return { ok: false, log: "Type de tâche système inconnu : " + t.builtinType };
@@ -5685,9 +5789,19 @@ function startScheduledTaskRun(taskId){
     const tasks2 = loadScheduledTasks();
     const t2 = tasks2.find(x=>x.id===taskId);
     if (!t2) return;
+    const wasFailing = t2.lastOk === false;
     t2.status = "idle";
     t2.lastRun = new Date().toISOString();
     t2.lastOk = ok;
+    // Une seule notification par série d'échecs (sinon une tâche à la minute en
+    // enverrait une par minute) ; elle disparaît dès que la tâche réussit.
+    if (!ok && !wasFailing) {
+      pushNotification({
+        key: `task-failed:${taskId}`, type: "error", title: `Échec de la tâche « ${t2.name} »`,
+        message: String(log || "").trim().slice(-200) || "Aucun détail dans le journal.",
+        emailBody: `La tâche planifiée « ${t2.name} » a échoué. Consultez son journal dans Paramètres > Planification.`,
+      });
+    } else if (ok) resolveNotification(`task-failed:${taskId}`);
     t2.history = [...(t2.history||[]), { date:t2.lastRun, ok, durationMs: Date.now()-startedAt, log: log.slice(-8000) }].slice(-20);
     saveScheduledTasks(tasks2);
   };
