@@ -11,6 +11,7 @@ const path     = require("path");
 const fs       = require("fs");
 const crypto   = require("crypto");
 const os       = require("os");
+const net      = require("net");
 let Dockerode; try { Dockerode = require("dockerode"); } catch {}
 let multer; try { multer = require("multer"); } catch {}
 
@@ -37,6 +38,19 @@ process.on("uncaughtException", (err) => {
 const wss = new WebSocketServer({ noServer: true });
 // WebSocket server pour le terminal (/terminal)
 const wssTerminal = new WebSocketServer({ noServer: true });
+// WebSocket server pour la console VM (/vnc/<vm>) : pont RFB authentifié,
+// protocole "binary" attendu par noVNC. Remplace websockify, qui écoutait
+// sur toutes les interfaces (ports 6900-6999) sans aucune authentification.
+const wssVnc = new WebSocketServer({ noServer: true, handleProtocols: (protocols) => (protocols.has("binary") ? "binary" : false) });
+wssVnc.on("connection", (ws, req, port) => {
+  const sock = net.connect(port, "127.0.0.1");
+  sock.on("data", d => { if (ws.readyState === 1) ws.send(d, { binary: true }); });
+  sock.on("close", () => { try { ws.close(); } catch {} });
+  sock.on("error", () => { try { ws.close(); } catch {} });
+  ws.on("message", d => { if (!sock.destroyed) sock.write(d); });
+  ws.on("close", () => sock.destroy());
+  ws.on("error", () => sock.destroy());
+});
 
 // Routing des connexions WebSocket selon le path
 server.on("upgrade", (req, socket, head) => {
@@ -44,6 +58,16 @@ server.on("upgrade", (req, socket, head) => {
     wssTerminal.handleUpgrade(req, socket, head, ws => {
       wssTerminal.emit("connection", ws, req);
     });
+  } else if (req.url.startsWith("/vnc/")) {
+    const name = decodeURIComponent(req.url.slice(5).split("?")[0]);
+    if (!validSid(getSid(req)) || !/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    vncPortFor(name)
+      .then(port => wssVnc.handleUpgrade(req, socket, head, ws => wssVnc.emit("connection", ws, req, port)))
+      .catch(() => { socket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"); socket.destroy(); });
   } else {
     wss.handleUpgrade(req, socket, head, ws => {
       wss.emit("connection", ws, req);
@@ -103,9 +127,14 @@ app.get("/api/auth/me", auth, async(req,res) => {
 
 // ── Wizard (pas besoin d'auth — c'est la 1ère config) ─────────────────────────
 app.post("/api/wizard/complete", async (req,res) => {
+  // Route sans authentification par nature (1re configuration) : elle ne doit
+  // JAMAIS pouvoir rejouer une fois l'assistant terminé, sinon n'importe qui
+  // sur le réseau réécrit le mot de passe root et les identifiants WebUI.
+  if (fs.existsSync(WIZARD)) return res.status(403).json({ error:"L'assistant de configuration est déjà terminé" });
   const { hostname, username, password, timezone } = req.body;
+  if (timezone !== undefined && timezone !== "" && !/^[A-Za-z0-9_+\/-]{1,64}$/.test(String(timezone))) return res.status(400).json({ error:"Fuseau horaire invalide" });
   try {
-    if (hostname) await execAsync(`hostnamectl set-hostname "${hostname.replace(/[^a-zA-Z0-9-]/g,"")}"` ).catch(()=>{});
+    if (hostname) await execAsync(`hostnamectl set-hostname ${sh(String(hostname).replace(/[^a-zA-Z0-9-]/g,""))}`).catch(()=>{});
     if (username && password) {
       const u = username.replace(/[^a-zA-Z0-9_-]/g,"");
       await ensureSharedGroup();
@@ -115,9 +144,8 @@ app.post("/api/wizard/complete", async (req,res) => {
       fs.mkdirSync(CFG,{recursive:true});
       fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
       await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(u)} -s 2>/dev/null`).catch(()=>{});
-      exec("/usr/local/bin/gravity-configure-terminal", ()=>{}); // terminal connecté auto sur ce compte admin
     }
-    if (timezone) await execAsync(`timedatectl set-timezone "${timezone}"`).catch(()=>{});
+    if (timezone) await execAsync(`timedatectl set-timezone ${sh(String(timezone))}`).catch(()=>{});
     fs.writeFileSync(WIZARD, new Date().toISOString());
     res.json({ ok:true });
   } catch(e) { res.status(500).json({ error:e.message }); }
@@ -357,11 +385,9 @@ app.post("/api/system/change-password", auth, async (req,res) => {
   try {
     const u = (username||"gravity").replace(/[^a-zA-Z0-9_-]/g,"");
     await ensureSharedGroup();
-    await execAsync(`id "${u}" &>/dev/null || useradd -m -s /bin/bash -G sudo,libvirt,kvm,docker,${SHARED_GROUP} "${u}"`);
-    await execAsync(`echo "${u}:${password}" | chpasswd`);
+    await execAsync(`id ${sh(u)} &>/dev/null || useradd -m -s /bin/bash -G sudo,libvirt,kvm,docker,${SHARED_GROUP} ${sh(u)}`);
+    await execAsync(`echo ${sh(`${u}:${password}`)} | chpasswd`);
     fs.writeFileSync(CREDS,`${u}\n${password}`,{mode:0o600});
-    // Reconnecte le terminal web sur ce compte (admin, sans re-login)
-    exec("/usr/local/bin/gravity-configure-terminal", ()=>{});
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -369,7 +395,10 @@ app.post("/api/system/change-password", auth, async (req,res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 //  INSTALLATION SUR DISQUE
 // ══════════════════════════════════════════════════════════════════════════════
-app.get("/api/install/disks", async (req,res) => {
+// L'installeur écrase un disque entier : il n'existe que sur le Live CD,
+// jamais sur un NAS installé (routes sans authentification par nature).
+function liveOnly(req, res, next) { if (isLive()) return next(); res.status(403).json({ error:"Disponible uniquement depuis le Live CD" }); }
+app.get("/api/install/disks", liveOnly, async (req,res) => {
   try {
     const { stdout } = await execAsync("lsblk -J -o NAME,SIZE,MODEL,TYPE,MOUNTPOINT 2>/dev/null");
     const disks = (JSON.parse(stdout).blockdevices||[]).filter(d=>d.type==="disk");
@@ -380,9 +409,9 @@ app.get("/api/install/disks", async (req,res) => {
 // Status d'installation (step, progress, done, error)
 let installStatus = { running:false, step:0, stepName:"", progress:0, done:false, error:null };
 
-app.get("/api/install/status", (req,res) => res.json(installStatus));
+app.get("/api/install/status", liveOnly, (req,res) => res.json(installStatus));
 
-app.post("/api/install/start", (req,res) => {
+app.post("/api/install/start", liveOnly, (req,res) => {
   const { disk, hostname, username, password, timezone } = req.body;
   if (!disk||!password) return res.status(400).json({error:"disk et password requis"});
   const safeDisk     = disk.replace(/[^a-zA-Z0-9]/g,"");
@@ -415,12 +444,12 @@ app.post("/api/install/start", (req,res) => {
   child.unref();
 });
 
-app.get("/api/install/logs", (req,res) => {
+app.get("/api/install/logs", liveOnly, (req,res) => {
   try { res.json({log:fs.readFileSync("/var/log/gravity-install.log","utf8")}); }
   catch { res.json({log:""}); }
 });
 
-app.post("/api/install/reboot", (req,res) => {
+app.post("/api/install/reboot", liveOnly, (req,res) => {
   res.json({ok:true});
   setTimeout(() => exec("systemctl reboot"), 2000);
 });
@@ -2528,31 +2557,25 @@ app.get("/api/vms/:n/ip", auth, async (req,res) => {
   catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// ── Console VM temps réel (noVNC dans le navigateur, via un pont websockify) ─
+// ── Console VM temps réel (noVNC dans le navigateur) ─────────────────────────
 // Chaque VM utilise déjà <graphics type='vnc' port='-1'/> (port assigné par
-// libvirt) ; websockify fait le pont TCP brut ↔ WebSocket pour que le canvas
-// noVNC (servi en statique depuis le paquet Debian, pas de CDN) puisse s'y
-// connecter. Un seul pont par VM, réutilisé s'il tourne déjà.
-const vncBridges = new Map(); // nom de VM -> { wsPort, proc }
+// libvirt, écoute en 127.0.0.1) ; la WebUI fait elle-même le pont TCP brut ↔
+// WebSocket (/vnc/<vm>, session obligatoire) pour que le canvas noVNC (servi
+// en statique depuis le paquet Debian, pas de CDN) puisse s'y connecter.
+// Port VNC local (127.0.0.1 seulement, géré par libvirt) d'une VM démarrée.
+async function vncPortFor(name) {
+  const state = (await virsh(`domstate ${sh(name)}`)).trim();
+  if (state !== "running") throw new Error("La VM doit être démarrée pour ouvrir la console");
+  const display = (await virsh(`vncdisplay ${sh(name)}`)).trim(); // ex: "127.0.0.1:0" ou ":0"
+  const dispNum = parseInt(display.split(":").pop(), 10);
+  if (isNaN(dispNum)) throw new Error("Port VNC introuvable pour cette VM");
+  return 5900 + dispNum;
+}
+// Vérifie que la console est disponible ; la connexion elle-même passe par
+// le WebSocket authentifié /vnc/<vm> (voir le routage "upgrade" en haut).
 app.get("/api/vms/:n/console", auth, async (req,res) => {
-  const name = req.params.n;
-  try {
-    const state = (await virsh(`domstate ${sh(name)}`)).trim();
-    if (state !== "running") return res.status(400).json({error:"La VM doit être démarrée pour ouvrir la console"});
-    const existing = vncBridges.get(name);
-    if (existing) return res.json({ok:true, wsPort:existing.wsPort});
-
-    const display = (await virsh(`vncdisplay ${sh(name)}`)).trim(); // ex: "127.0.0.1:0" ou ":0"
-    const dispNum = parseInt(display.split(":").pop(), 10);
-    if (isNaN(dispNum)) return res.status(500).json({error:"Port VNC introuvable pour cette VM"});
-    const vncPort = 5900 + dispNum;
-    const wsPort = 6900 + (vncBridges.size % 100); // pool 6900-6999, réutilisé si une VM est arrêtée entre-temps
-
-    const proc = spawn("websockify", [String(wsPort), `127.0.0.1:${vncPort}`], { stdio: "ignore" });
-    proc.on("exit", () => vncBridges.delete(name));
-    vncBridges.set(name, { wsPort, proc });
-    res.json({ok:true, wsPort});
-  } catch(e){ res.status(500).json({error:e.message}); }
+  try { await vncPortFor(req.params.n); res.json({ok:true}); }
+  catch(e){ res.status(400).json({error:e.message}); }
 });
 // Les ISOs vivent désormais dans le dossier personnel (~/ISO), pas
 // /var/lib/libvirt/images — cohérent avec l'app Fichiers et son raccourci ISO
@@ -5660,45 +5683,36 @@ WEBDAVUNIT
     ufw allow 3702/udp 2>/dev/null || true
     ufw allow 5357/tcp 2>/dev/null || true
 
-    # Thème terminal shellinabox (blanc sur noir + couleurs, sinon texte
-    # illisible sur certaines installs faites avant le fix)
-    if [ -d /etc/shellinabox/options-available ]; then
-      rm -f /etc/shellinabox/options-enabled/*.css
-      ln -sf "../options-available/00_White On Black.css" "/etc/shellinabox/options-enabled/00_White On Black.css"
-      ln -sf "../options-available/01+Color Terminal.css" "/etc/shellinabox/options-enabled/01+Color Terminal.css"
+    # Terminal web shellinabox (port 4200) : DÉSACTIVÉ. Configuré en connexion
+    # automatique (-s /:UID:GID:HOME:/bin/bash), il donnait un shell admin
+    # (groupes sudo + docker) sans aucun mot de passe à tout appareil du
+    # réseau. La WebUI a son propre terminal, authentifié (WebSocket /terminal).
+    # Idempotent : retire aussi l'ancien script qui le reconfigurait.
+    if [ -f /etc/default/shellinabox ]; then
+      sed -i 's|^SHELLINABOX_ARGS=.*|SHELLINABOX_ARGS="--no-beep --disable-ssl"|' /etc/default/shellinabox
     fi
-
-    # /usr/local/bin/gravity-configure-terminal n'existe pas sur les NAS
-    # installés avant le 2026-08-11 (script livré uniquement par l'ISO, pas
-    # par le dépôt git de la WebUI) — on le (ré)écrit ici pour que le
-    # mécanisme "Mettre à jour" le livre aussi
+    systemctl disable --now shellinabox 2>/dev/null || true
+    ufw delete allow 4200/tcp 2>/dev/null || true
     cat > /usr/local/bin/gravity-configure-terminal <<'TERMCFG'
 #!/usr/bin/env bash
-set -uo pipefail
-CREDS="/etc/gravity/credentials"
-USER_NAME=$(head -1 "$CREDS" 2>/dev/null)
-[[ -z "$USER_NAME" ]] && USER_NAME="gravity"
-if ! id "$USER_NAME" &>/dev/null; then
-  useradd -m -s /bin/bash "$USER_NAME" 2>/dev/null || true
-fi
-usermod -aG sudo "$USER_NAME" 2>/dev/null || true
-USER_UID=$(id -u "$USER_NAME" 2>/dev/null || echo 0)
-USER_GID=$(id -g "$USER_NAME" 2>/dev/null || echo 0)
-USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
-[[ -z "$USER_HOME" ]] && USER_HOME="/root"
-sed -i "s#^SHELLINABOX_ARGS=.*#SHELLINABOX_ARGS=\"--no-beep --disable-ssl -s /:$USER_UID:$USER_GID:$USER_HOME:/bin/bash\"#" /etc/default/shellinabox 2>/dev/null || true
-systemctl restart shellinabox 2>/dev/null || true
+# Terminal web shellinabox désactivé (voir Paramètres > Terminal pour SSH) :
+# ce script ne réactive plus jamais de shell sans mot de passe.
+systemctl disable --now shellinabox 2>/dev/null || true
+exit 0
 TERMCFG
     chmod +x /usr/local/bin/gravity-configure-terminal
-    /usr/local/bin/gravity-configure-terminal && echo "Terminal connecté auto sur le compte admin ✓"
+    echo "Terminal web sans identification (port 4200) désactivé ✓"
 
-    # noVNC + websockify requis pour la console VM temps réel (absents avant le 2026-08-13)
-    if ! command -v websockify &>/dev/null || [ ! -d /usr/share/novnc ]; then
-      echo "Installation de noVNC + websockify (console VM temps réel)..."
+    # noVNC requis pour la console VM (fichiers statiques du paquet Debian). Le
+    # pont VNC est intégré à la WebUI (WebSocket authentifié) : plus de
+    # websockify ni de ports 6900-6999 ouverts à tout le réseau.
+    if [ ! -d /usr/share/novnc ]; then
+      echo "Installation de noVNC (console VM temps réel)..."
       apt-get update -qq 2>&1 | tail -2
-      apt-get install -y novnc websockify 2>&1 | tail -3
+      apt-get install -y novnc 2>&1 | tail -3
     fi
-    ufw allow 6900:6999/tcp 2>/dev/null || true
+    pkill -x websockify 2>/dev/null || true
+    ufw delete allow 6900:6999/tcp 2>/dev/null || true
 
     # Filet de sécurité pour les volumes/pools définis dans /etc/fstab qui
     # ne se remontent pas tout seuls au démarrage — race de timing connue
