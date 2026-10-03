@@ -3174,6 +3174,36 @@ app.delete("/api/network/vpn-profiles/:name", auth, async(req,res)=>{
 //  TERMINAL — Paramètres > Terminal (activation SSH + port)
 // ══════════════════════════════════════════════════════════════════════════════
 const SSHD_CONFIG = "/etc/ssh/sshd_config";
+// La connexion SSH de root par mot de passe est interdite (PermitRootLogin
+// prohibit-password : clé seulement). Root partageait le mot de passe de la
+// WebUI et sshd n'a pas de blocage après des essais ratés : un port 22 ouvert
+// sur Internet = attaque directe en root. On passe par le compte admin + sudo.
+// Idempotent : corrige aussi les NAS déjà installés (ISO avec "PermitRootLogin
+// yes") et les fichiers de /etc/ssh/sshd_config.d ; config validée par
+// "sshd -t" avant rechargement, restaurée si invalide.
+async function hardenSshRootLogin() {
+  try {
+    const files = [SSHD_CONFIG];
+    try { for (const f of fs.readdirSync("/etc/ssh/sshd_config.d")) if (f.endsWith(".conf")) files.push(`/etc/ssh/sshd_config.d/${f}`); } catch {}
+    const original = new Map();
+    for (const f of files) {
+      let text; try { text = fs.readFileSync(f, "utf8"); } catch { continue; }
+      const fixed = text.replace(/^(\s*)PermitRootLogin\s+yes\b.*$/gim, "$1PermitRootLogin prohibit-password");
+      if (fixed !== text) { original.set(f, text); fs.writeFileSync(f, fixed); }
+    }
+    if (!original.size) return false;
+    try {
+      await execAsync("mkdir -p -m0755 /run/sshd").catch(() => {});
+      await execAsync("sshd -t");
+    } catch (e) {
+      for (const [f, text] of original) fs.writeFileSync(f, text);
+      throw e;
+    }
+    await execAsync("systemctl is-active ssh").then(() => execAsync("systemctl reload ssh")).catch(() => {});
+    console.log("SSH : connexion de root par mot de passe interdite (PermitRootLogin prohibit-password)");
+    return true;
+  } catch (e) { console.error("Durcissement SSH:", e.message); return false; }
+}
 app.get("/api/terminal/ssh", auth, async(req,res)=>{
   try {
     const available = await execAsync("command -v sshd").then(()=>true).catch(()=>false);
@@ -6044,4 +6074,6 @@ app.get("/api/terminal/test", auth, (req,res) => {
 const PORT = process.env.GRAVITY_PORT || 4000;
 server.listen(PORT, "127.0.0.1", () => console.log(`\n  GravityOS WebUI v2 — http://127.0.0.1:${PORT} (via nginx, port 80)\n`));
 // NAS déjà installés : les identifiants d'usine gravity/gravity ne doivent plus ouvrir aucun service
+if (!getCreds().valid) console.error("Identifiants WebUI illisibles ou absents (/etc/gravity/credentials) : aucun compte n'est accepté. Le service doit tourner en root.");
 syncWebdavWithWebui(null).then(neutralizeDefaultAccounts);
+hardenSshRootLogin();
