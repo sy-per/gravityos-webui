@@ -100,14 +100,61 @@ function auth(req, res, next) { if (validSid(getSid(req))) return next(); res.st
 function isLive() { return fs.existsSync("/run/live")||fs.existsSync("/lib/live/mount/medium"); }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-app.post("/api/auth/login", (req,res) => {
-  const { username, password } = req.body;
+// Limitation des essais : sans elle, un mot de passe se devine par force brute
+// (illimité, surtout si l'accès externe est activé). Par adresse IP : 5 échecs
+// en 15 min => blocage 15 min (réseau local : 10 échecs => 2 min, pour ne pas
+// verrouiller le propriétaire sur une faute de frappe). Ralentissement global
+// si des centaines d'échecs arrivent de partout (attaque distribuée).
+// IP cliente : X-Real-IP posé par nginx, crédible seulement s'il vient de la
+// boucle locale (Node n'écoute que là) ; sinon l'adresse de la socket.
+const loginFails = new Map(); // ip -> { count, first, lockedUntil }
+let globalLoginFails = [];
+function clientIp(req) {
+  const sock = req.socket.remoteAddress || "";
+  const loopback = sock === "127.0.0.1" || sock === "::1" || sock === "::ffff:127.0.0.1";
+  const real = req.headers["x-real-ip"];
+  return (loopback && typeof real === "string" && real.trim()) ? real.trim() : sock.replace(/^::ffff:/, "");
+}
+function isPrivateIp(ip) {
+  return /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(ip) || ip === "::1" || /^(fc|fd|fe80)/i.test(ip);
+}
+function safeEq(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a)).digest();
+  const hb = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, r] of loginFails) if (r.lockedUntil < now && now - r.first > 15*60*1000) loginFails.delete(ip);
+}, 10*60*1000).unref();
+app.post("/api/auth/login", async (req,res) => {
+  const { username, password } = req.body || {};
+  const ip = clientIp(req);
+  const lan = isPrivateIp(ip);
+  const now = Date.now();
+  const rec = loginFails.get(ip);
+  if (rec && rec.lockedUntil > now) {
+    const secs = Math.ceil((rec.lockedUntil - now) / 1000);
+    res.setHeader("Retry-After", String(secs));
+    return res.status(429).json({ error: `Trop de tentatives. Réessayez dans ${secs > 90 ? Math.ceil(secs/60) + " min" : secs + " s"}.` });
+  }
+  globalLoginFails = globalLoginFails.filter(t => now - t < 10*60*1000);
+  if (globalLoginFails.length >= 100) await new Promise(r => setTimeout(r, 2000));
   const c = getCreds();
-  if (username===c.user && password===c.pass) {
+  const okUser = safeEq(username ?? "", c.user), okPass = safeEq(password ?? "", c.pass);
+  if (okUser && okPass) {
+    loginFails.delete(ip);
     const sid = newSid();
-    res.setHeader("Set-Cookie",`gravity_sid=${sid}; Path=/; HttpOnly; SameSite=Strict`);
-    res.json({ ok:true, wizardDone: fs.existsSync(WIZARD) });
-  } else res.status(401).json({ error:"Identifiants incorrects" });
+    const secure = req.headers["x-forwarded-proto"] === "https" ? "; Secure" : "";
+    res.setHeader("Set-Cookie", `gravity_sid=${sid}; Path=/; HttpOnly; SameSite=Strict${secure}`);
+    return res.json({ ok:true, wizardDone: fs.existsSync(WIZARD) });
+  }
+  globalLoginFails.push(now);
+  const r = rec && now - rec.first < 15*60*1000 ? rec : { count: 0, first: now, lockedUntil: 0 };
+  r.count++;
+  if (r.count >= (lan ? 10 : 5)) { r.lockedUntil = now + (lan ? 2*60*1000 : 15*60*1000); r.count = 0; r.first = now; console.error(`Connexion WebUI : trop d'échecs depuis ${ip}, accès bloqué`); }
+  loginFails.set(ip, r);
+  res.status(401).json({ error:"Identifiants incorrects" });
 });
 app.post("/api/auth/logout", (req,res) => { const s=getSid(req); if(s) delete sess[s]; res.setHeader("Set-Cookie","gravity_sid=; Path=/; Max-Age=0"); res.json({ok:true}); });
 app.get("/api/auth/status",  (req,res) => res.json({ authenticated: validSid(getSid(req)), wizardDone: fs.existsSync(WIZARD), isLive: isLive() }));
@@ -1470,7 +1517,42 @@ app.post("/api/smb/toggle", auth, async (req,res) => {
 //  NFS / FTP / PROXY (inchangé)
 // ══════════════════════════════════════════════════════════════════════════════
 app.get("/api/nfs/exports", auth, (req,res) => { try{const r=fs.readFileSync("/etc/exports","utf8");res.json(r.split("\n").filter(l=>l.trim()&&!l.startsWith("#")).map(l=>{const[p,...o]=l.trim().split(/\s+/);return{path:p,options:o.join(" ")};} ));}catch{res.json([]);} });
-app.post("/api/nfs/exports", auth, async (req,res) => { const{path:p,clients,options}=req.body;try{fs.mkdirSync(p,{recursive:true});fs.appendFileSync("/etc/exports",`\n${p}  ${clients||"*"}(${options||"rw,sync,no_subtree_check"})\n`);await execAsync("exportfs -ra");res.json({ok:true});}catch(e){res.status(500).json({error:e.message});} });
+// Réseaux locaux de la machine (interfaces physiques seulement, pas les ponts
+// Docker/libvirt) : défaut des exports NFS à la place de "*" (tout Internet
+// si le port est redirigé). Exemple : ["192.168.1.0/24"].
+function localSubnets() {
+  const out = new Set();
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (/^(lo|docker|br-|veth|virbr|vnet|macvtap|gravity-vmlink)/.test(name)) continue;
+    for (const a of addrs || []) {
+      if (a.family !== "IPv4" || a.internal || !a.netmask) continue;
+      const ip = a.address.split(".").map(Number), mask = a.netmask.split(".").map(Number);
+      const bits = mask.reduce((n, o) => n + o.toString(2).replace(/0/g, "").length, 0);
+      out.add(`${ip.map((o, i) => o & mask[i]).join(".")}/${bits}`);
+    }
+  }
+  return [...out];
+}
+app.post("/api/nfs/exports", auth, async (req,res) => {
+  const { path: p, clients, options } = req.body || {};
+  // Écrit tel quel dans /etc/exports : toute valeur non validée permettrait
+  // d'injecter d'autres lignes d'export (retour à la ligne, espaces).
+  if (typeof p !== "string" || !/^\/[A-Za-z0-9._\/+@-]*$/.test(p) || p.includes("..")) return res.status(400).json({error:"Chemin invalide (absolu, sans espace ni caractère spécial)"});
+  const opts = (typeof options === "string" && options.trim()) ? options.trim() : "rw,sync,no_subtree_check";
+  if (!/^[a-z_0-9=:,.-]+$/.test(opts)) return res.status(400).json({error:"Options NFS invalides"});
+  let list = (typeof clients === "string" ? clients : "").split(/[\s,]+/).filter(Boolean);
+  if (!list.length) list = localSubnets();
+  if (!list.length) return res.status(400).json({error:"Aucun réseau local détecté : précisez les clients autorisés (ex : 192.168.1.0/24)"});
+  // Accepté : "*", IPv4 ou IPv4/CIDR, IPv6[/CIDR], nom d'hôte (jokers * ? permis).
+  const validClient = c => /^\*$/.test(c) || /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(c) || /^[0-9a-fA-F:]*:[0-9a-fA-F:]*(\/\d{1,3})?$/.test(c) || /^[A-Za-z0-9*?][A-Za-z0-9.*?-]*$/.test(c);
+  if (list.some(c => !validClient(c))) return res.status(400).json({error:"Client NFS invalide (adresse IP, réseau CIDR comme 192.168.1.0/24, ou nom d'hôte)"});
+  try {
+    fs.mkdirSync(p, {recursive:true});
+    fs.appendFileSync("/etc/exports", `\n${p}  ${list.map(c => `${c}(${opts})`).join(" ")}\n`);
+    await execAsync("exportfs -ra");
+    res.json({ok:true, clients:list});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
 app.get("/api/ftp/status", auth, async (req,res) => { try{const{stdout}=await execAsync("systemctl is-active vsftpd");res.json({active:stdout.trim()==="active"});}catch{res.json({active:false});} });
 // Bug corrigé le 2026-08-23 : "systemctl is-active" renvoie un code de
 // sortie non-nul (donc une promesse rejetée) quand le service est déjà
@@ -1710,6 +1792,23 @@ const PROXY_EXTERNAL_META = `${CFG}/proxy-external.json`;
 const NGINX_DEFAULT_DIR = "/etc/nginx/gravity-default.d";
 const NGINX_DEFAULT_CONF = `${NGINX_DEFAULT_DIR}/default.conf`;
 function loadExternalAccess(){ try{ return !!JSON.parse(fs.readFileSync(PROXY_EXTERNAL_META,"utf8")).enabled; } catch{ return false; } }
+// Certificat auto-signé pour l'hôte par défaut en HTTPS (accès externe par IP
+// ou domaine sans proxy). Sans HTTPS, le mot de passe et le cookie de session
+// circulent en clair sur Internet. Pour un certificat de confiance, créer un
+// hôte proxy avec Let's Encrypt (ce hôte prend le pas sur celui-ci).
+const TLS_DIR = `${CFG}/tls`;
+const TLS_CERT = `${TLS_DIR}/selfsigned.crt`;
+const TLS_KEY = `${TLS_DIR}/selfsigned.key`;
+function ensureSelfSignedCert(){
+  if (fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY)) return true;
+  try {
+    fs.mkdirSync(TLS_DIR, { recursive:true, mode:0o700 });
+    const cn = (os.hostname() || "gravity-nas").replace(/[^a-zA-Z0-9-]/g,"") || "gravity-nas";
+    execSync(`openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 -keyout ${sh(TLS_KEY)} -out ${sh(TLS_CERT)} -subj ${sh("/CN="+cn)} -addext ${sh(`subjectAltName=DNS:${cn},DNS:${cn}.local`)} 2>&1`);
+    fs.chmodSync(TLS_KEY, 0o600);
+    return true;
+  } catch (e) { console.error("Certificat HTTPS auto-signé:", e.message); return false; }
+}
 function buildDefaultHostConf(externalAccess){
   const page = `<!DOCTYPE html>
 <html>
@@ -1727,11 +1826,49 @@ body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-se
 </body>
 </html>
 `;
-  const guard = externalAccess ? "" : `        if ($gravity_lan = 0) {
+  // Accès externe actif => HTTPS obligatoire : sans certificat on retombe sur
+  // le mode "désactivé" (jamais d'identifiants en clair sur Internet).
+  const https = !!externalAccess && ensureSelfSignedCert();
+  const uiPort = process.env.GRAVITY_PORT || 4000;
+  const proxy = `        proxy_pass http://127.0.0.1:${uiPort};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600;
+        proxy_connect_timeout 10;
+        proxy_send_timeout 3600;`;
+  const guard80 = https
+    ? `        if ($gravity_lan = 0) {
+            return 301 https://$host$request_uri;
+        }
+`
+    : `        if ($gravity_lan = 0) {
             return 200 '${page}';
         }
 `;
-  const uiPort = process.env.GRAVITY_PORT || 4000;
+  const server443 = https
+    ? `server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_certificate ${TLS_CERT};
+    ssl_certificate_key ${TLS_KEY};
+    location / {
+${proxy}
+    }
+}
+`
+    : `server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+`;
   return `# Géré par GravityOS (Paramètres > Proxy inversé) — ne pas modifier à la main
 geo $gravity_lan {
     default 0;
@@ -1751,25 +1888,10 @@ server {
     server_name _;
     location / {
         default_type text/html;
-${guard}        proxy_pass http://127.0.0.1:${uiPort};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 3600;
-        proxy_connect_timeout 10;
-        proxy_send_timeout 3600;
+${guard80}${proxy}
     }
 }
-server {
-    listen 443 ssl default_server;
-    listen [::]:443 ssl default_server;
-    server_name _;
-    ssl_reject_handshake on;
-}
-`;
+${server443}`;
 }
 function writeDefaultHostConf(externalAccess){
   fs.mkdirSync(NGINX_DEFAULT_DIR,{recursive:true});
@@ -1818,6 +1940,7 @@ app.get("/api/proxy/external-access", auth, (req,res) => {
 app.put("/api/proxy/external-access", auth, async (req,res) => {
   if (!nginxAvailable()) return res.status(503).json({error:"Nginx n'est pas installé sur cette machine (environnement de test) — cette fonctionnalité s'applique réellement sur un vrai NAS GravityOS."});
   const enabled = !!req.body.enabled;
+  if (enabled && !ensureSelfSignedCert()) return res.status(500).json({error:"Impossible de générer le certificat HTTPS (openssl) — l'accès externe exige le HTTPS."});
   let previous = null; try { previous = fs.readFileSync(NGINX_DEFAULT_CONF,"utf8"); } catch {}
   try {
     writeDefaultHostConf(enabled);
