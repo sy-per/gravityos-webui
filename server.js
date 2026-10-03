@@ -1573,7 +1573,7 @@ app.post("/api/smb/toggle", auth, async (req,res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 //  NFS / FTP / PROXY (inchangé)
 // ══════════════════════════════════════════════════════════════════════════════
-app.get("/api/nfs/exports", auth, (req,res) => { try{const r=fs.readFileSync("/etc/exports","utf8");res.json(r.split("\n").filter(l=>l.trim()&&!l.startsWith("#")).map(l=>{const[p,...o]=l.trim().split(/\s+/);return{path:p,options:o.join(" ")};} ));}catch{res.json([]);} });
+app.get("/api/nfs/exports", auth, (req,res) => { try{const r=fs.readFileSync("/etc/exports","utf8");res.json(r.split("\n").filter(l=>l.trim()&&!l.startsWith("#")).map(l=>{const[p,...o]=l.trim().split(/\s+/);return{path:p.split("\\040").join(" "),options:o.join(" ")};} ));}catch{res.json([]);} });
 // Réseaux locaux de la machine (interfaces physiques seulement, pas les ponts
 // Docker/libvirt) : défaut des exports NFS à la place de "*" (tout Internet
 // si le port est redirigé). Exemple : ["192.168.1.0/24"].
@@ -1594,7 +1594,12 @@ app.post("/api/nfs/exports", auth, async (req,res) => {
   const { path: p, clients, options } = req.body || {};
   // Écrit tel quel dans /etc/exports : toute valeur non validée permettrait
   // d'injecter d'autres lignes d'export (retour à la ligne, espaces).
-  if (typeof p !== "string" || !/^\/[A-Za-z0-9._\/+@-]*$/.test(p) || p.includes("..")) return res.status(400).json({error:"Chemin invalide (absolu, sans espace ni caractère spécial)"});
+  if (typeof p !== "string" || !/^\/[A-Za-z0-9._\/+@ -]*$/.test(p) || p.includes("..")) return res.status(400).json({error:"Chemin invalide"});
+  // Seulement un dossier existant d'un volume (ou l'un de ses sous-dossiers) :
+  // pas de dossier système, et le lien symbolique est résolu avant la vérification.
+  let real;
+  try { real = fs.realpathSync(p); if (!fs.statSync(real).isDirectory()) throw new Error("x"); } catch { return res.status(400).json({error:"Dossier introuvable : choisissez un dossier existant d'un volume"}); }
+  if (real === VOL_ROOT || !real.startsWith(VOL_ROOT + path.sep)) return res.status(400).json({error:"Le dossier doit se trouver dans un volume (ou l'un de ses sous-dossiers)"});
   const opts = (typeof options === "string" && options.trim()) ? options.trim() : "rw,sync,no_subtree_check";
   if (!/^[a-z_0-9=:,.-]+$/.test(opts)) return res.status(400).json({error:"Options NFS invalides"});
   let list = (typeof clients === "string" ? clients : "").split(/[\s,]+/).filter(Boolean);
@@ -1604,12 +1609,58 @@ app.post("/api/nfs/exports", auth, async (req,res) => {
   const validClient = c => /^\*$/.test(c) || /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(c) || /^[0-9a-fA-F:]*:[0-9a-fA-F:]*(\/\d{1,3})?$/.test(c) || /^[A-Za-z0-9*?][A-Za-z0-9.*?-]*$/.test(c);
   if (list.some(c => !validClient(c))) return res.status(400).json({error:"Client NFS invalide (adresse IP, réseau CIDR comme 192.168.1.0/24, ou nom d'hôte)"});
   try {
-    fs.mkdirSync(p, {recursive:true});
-    fs.appendFileSync("/etc/exports", `\n${p}  ${list.map(c => `${c}(${opts})`).join(" ")}\n`);
+    fs.appendFileSync("/etc/exports", `\n${real.split(" ").join("\\040")}  ${list.map(c => `${c}(${opts})`).join(" ")}\n`);
     await execAsync("exportfs -ra");
     res.json({ok:true, clients:list});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
+// Service NFS (nfs-server) : activé/désactivé comme les autres services de fichiers.
+// enable/disable --now pour que le choix survive à un redémarrage du NAS.
+app.get("/api/nfs/status", auth, async (req,res) => {
+  const { stdout } = await execAsync("systemctl is-active nfs-server").catch(e => ({ stdout: e.stdout || "inactive" }));
+  res.json({ active: String(stdout).trim() === "active" });
+});
+app.post("/api/nfs/toggle", auth, async (req,res) => {
+  try {
+    const { stdout } = await execAsync("systemctl is-active nfs-server").catch(e => ({ stdout: e.stdout || "inactive" }));
+    const on = String(stdout).trim() !== "active";
+    await execAsync(`systemctl ${on ? "enable" : "disable"} --now nfs-server`);
+    res.json({ ok: true, running: on });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+// Retire un export de /etc/exports (toutes les lignes dont le dossier est `path`).
+// Les commentaires et les autres exports sont conservés tels quels.
+app.delete("/api/nfs/exports", auth, async (req,res) => {
+  const p = String(req.query.path || "");
+  if (!p.startsWith("/") || /[\r\n\t]/.test(p)) return res.status(400).json({error:"Chemin invalide"});
+  try {
+    const lines = fs.readFileSync("/etc/exports", "utf8").split("\n");
+    const kept = lines.filter(l => l.trim().split(/\s+/)[0].split("\\040").join(" ") !== p || l.trim().startsWith("#"));
+    if (kept.length === lines.length) return res.status(404).json({error:"Export introuvable"});
+    fs.writeFileSync("/etc/exports", kept.join("\n"));
+    // exportfs -ra retire aussi du noyau les exports qui ne sont plus dans le fichier
+    await execAsync("exportfs -ra").catch(() => {});
+    res.json({ok:true});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+// Anciens exports d'usine de l'ISO (dossier public ouvert à tout le monde avec
+// no_root_squash, media sur 192.168/16) : un NAS ne doit en avoir aucun par défaut.
+// Seules les lignes EXACTEMENT identiques à celles d'usine sont retirées.
+function removeFactoryNfsExports() {
+  try {
+    const FACTORY = [
+      "/srv/shares/public  *(rw,sync,no_subtree_check,no_root_squash)",
+      "/srv/shares/media   192.168.0.0/16(rw,sync,no_subtree_check)",
+    ];
+    const lines = fs.readFileSync("/etc/exports", "utf8").split("\n");
+    const kept = lines.filter(l => !FACTORY.includes(l.trimEnd()));
+    if (kept.length === lines.length) return false;
+    fs.writeFileSync("/etc/exports", kept.join("\n"));
+    execAsync("exportfs -ra").catch(() => {});
+    console.log("NFS : exports d'usine retirés (aucun export par défaut)");
+    return true;
+  } catch { return false; }
+}
 app.get("/api/ftp/status", auth, async (req,res) => {
   const summary = await serviceAccessSummary("ftp").catch(() => ({ allowedUsers: 0, allowedAdmins: [] }));
   try { const {stdout}=await execAsync("systemctl is-active vsftpd"); res.json({active:stdout.trim()==="active", ...summary}); }
@@ -2103,6 +2154,7 @@ async function migrateAccountsAtStartup() {
   await ensureWebdavService();
   await ensureSharingServices();
   await restrictOtherServicesFirewall();
+  removeFactoryNfsExports();
 }
 // Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
 function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
