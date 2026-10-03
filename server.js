@@ -227,7 +227,6 @@ app.post("/api/wizard/complete", async (req,res) => {
   if (timezone !== undefined && timezone !== "" && !/^[A-Za-z0-9_+\/-]{1,64}$/.test(String(timezone))) return res.status(400).json({ error:"Fuseau horaire invalide" });
   try {
     if (hostname) await execAsync(`hostnamectl set-hostname ${sh(String(hostname).replace(/[^a-zA-Z0-9-]/g,""))}`).catch(()=>{});
-    let newCreds = null; // mot de passe en clair, uniquement le temps de cette requête
     if (username && password) {
       const u = username.replace(/[^a-zA-Z0-9_-]/g,"");
       await ensureSharedGroup();
@@ -238,10 +237,8 @@ app.post("/api/wizard/complete", async (req,res) => {
       fs.mkdirSync(CFG,{recursive:true});
       fs.writeFileSync(CREDS,`${u}\n${await hashPassword(password)}\n`,{mode:0o600});
       await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(u)} -s 2>/dev/null`).catch(()=>{});
-      newCreds = { user: u, pass: password };
     }
     fs.writeFileSync(WIZARD, new Date().toISOString());
-    await syncWebdavWithWebui(null, newCreds);
     await neutralizeDefaultAccounts();
     if (timezone) await execAsync(`timedatectl set-timezone ${sh(String(timezone))}`).catch(()=>{});
     fs.writeFileSync(WIZARD, new Date().toISOString());
@@ -484,7 +481,6 @@ app.post("/api/system/change-password", auth, async (req,res) => {
   if (/[\r\n\0]/.test(password)) return res.status(400).json({error:"Mot de passe invalide (retour à la ligne interdit)"});
   if (isFactoryPassword(password)) return res.status(400).json({error:"Ce mot de passe est celui d'usine, choisissez-en un autre"});
   try {
-    const prev = getCreds();
     const u = (username||"gravity").replace(/[^a-zA-Z0-9_-]/g,"");
     await ensureSharedGroup();
     await execAsync(`id ${sh(u)} &>/dev/null || useradd -m -s /bin/bash -G sudo,libvirt,kvm,docker,${SHARED_GROUP} ${sh(u)}`);
@@ -492,8 +488,8 @@ app.post("/api/system/change-password", auth, async (req,res) => {
     fs.writeFileSync(CREDS,`${u}\n${await hashPassword(password)}\n`,{mode:0o600});
     // Samba gardait l'ancien mot de passe après un changement depuis les réglages
     await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(u)} -s 2>/dev/null`).catch(()=>{});
-    await syncWebdavWithWebui(prev, { user: u, pass: password });
     await neutralizeDefaultAccounts();
+    await refreshWebdavAuth();
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
@@ -1660,68 +1656,141 @@ app.post("/api/ftp/account", auth, async (req,res) => {
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
+// ── Accès par service (WebDAV d'abord ; SMB et FTP suivront) ────────────────
+// Chaque service de partage a une LISTE d'utilisateurs autorisés, choisie dans
+// Paramètres > Services (bouton "Gérer les accès"). Un compte administrateur
+// n'a donc accès à un service que s'il est coché explicitement — la fuite d'un
+// mot de passe de service (ex. FTP en clair) ne donne plus l'administration du
+// NAS. Les utilisateurs se connectent avec le MOT DE PASSE DE LEUR COMPTE NAS.
+// Fichier : /etc/gravity/service-access.json  { "webdav": ["alice", ...] }
+const SERVICE_ACCESS_FILE = `${CFG}/service-access.json`;
+const ACCESS_SERVICES = { webdav: "WebDAV" }; // services pris en charge pour l'instant
+function loadServiceAccess() { try { const o = JSON.parse(fs.readFileSync(SERVICE_ACCESS_FILE,"utf8")); return o && typeof o === "object" ? o : {}; } catch { return {}; } }
+function saveServiceAccess(o) { fs.mkdirSync(CFG,{recursive:true}); fs.writeFileSync(SERVICE_ACCESS_FILE, JSON.stringify(o,null,2), { mode: 0o644 }); }
+
+// Comptes du NAS (uid ≥ 1000) avec leur rôle : "administrateur" = rôle admin ou
+// groupe sudo (accès total à la machine) ; "désactivé" = mot de passe verrouillé.
+async function listNasUsers() {
+  // uid 1000-59999 : comptes ordinaires (60000+ réservé aux comptes de service,
+  // ex. libvirt-qemu 64055)
+  const { stdout } = await execAsync("getent passwd | awk -F: '$3>=1000 && $3<60000{print $1\",\"$5}'").catch(() => ({ stdout: "" }));
+  const roles = loadRoles();
+  return Promise.all(stdout.trim().split("\n").filter(Boolean).map(async (l) => {
+    const [username, fullname] = l.split(",");
+    const [roleId, groups, status] = await Promise.all([
+      userRoleId(username),
+      execAsync(`id -nG ${sh(username)}`).then(r => r.stdout).catch(() => ""),
+      userStatus(username),
+    ]);
+    const role = roles.find(r => r.id === roleId);
+    return {
+      username,
+      fullname: fullname || "",
+      role: role ? role.name : "Utilisateur",
+      isAdmin: !!(role && role.isAdmin) || /(^|\s)sudo(\s|$)/.test(groups),
+      disabled: status === "Désactivé",
+    };
+  }));
+}
+
 // ── WebDAV (rclone serve webdav) — désactivé par défaut après installation ──
-// Les identifiants suivent le compte WebUI créé à la 1re configuration (plus de
-// gravity/gravity) tant qu'ils n'ont pas été personnalisés dans Paramètres >
-// Services. Le service ne démarre JAMAIS sans fichier d'identifiants (unité
-// avec ConditionPathExists) : rclone sans --user/--pass sert en accès anonyme.
-// Format systemd EnvironmentFile : valeurs entre guillemets, \ et " échappés,
-// pour supporter n'importe quel mot de passe.
-const WEBDAV_ENV = "/etc/gravity/webdav.env";
+// rclone ne connaît aucun compte : il délègue chaque connexion à
+// webdav-auth.js (--auth-proxy), qui vérifie la liste d'accès + le mot de passe
+// du compte NAS. Le service ne démarre pas sans ce programme (ConditionPathExists).
+// Limite de rclone : un compte déjà connecté est gardé en cache ~5 min (les
+// mauvais mots de passe sont alors refusés sans rappeler le programme, donc sans
+// délai) ; chaque changement de liste, de mot de passe ou de statut redémarre
+// donc le service (refreshWebdavAuth), et le port n'est ouvert qu'au réseau local.
 const WEBDAV_UNIT = "/etc/systemd/system/gravity-webdav.service";
-function envQuote(v) { return `"${String(v).replace(/[\\"]/g, "\\$&")}"`; }
-function envUnquote(v) {
-  v = String(v).trim();
-  return v.length >= 2 && v.startsWith('"') && v.endsWith('"') ? v.slice(1, -1).replace(/\\(.)/g, "$1") : v;
+const WEBDAV_OLD_ENV = "/etc/gravity/webdav.env"; // ancien compte unique (retiré)
+const WEBDAV_AUTH = path.join(__dirname, "webdav-auth.js");
+function webdavUnitText() {
+  return `[Unit]
+Description=GravityOS WebDAV (rclone)
+After=network.target
+ConditionPathExists=${WEBDAV_AUTH}
+
+[Service]
+ExecStart=/usr/bin/rclone serve webdav --addr :8081 --auth-proxy ${WEBDAV_AUTH} --vfs-cache-mode writes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+`;
 }
-function readWebdavEnv() {
+const PRIVATE_RANGES = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10"];
+async function webdavActive() { return execAsync("systemctl is-active gravity-webdav").then(() => true).catch(() => false); }
+// Redémarre WebDAV s'il tourne : fin des sessions en cache après un changement
+// de liste, de mot de passe, de statut ou de suppression d'un compte.
+async function refreshWebdavAuth() {
+  try { if (fs.existsSync(WEBDAV_UNIT) && await webdavActive()) await execAsync("systemctl restart gravity-webdav"); } catch {}
+}
+// Idempotent, au démarrage du service : unité à jour (auth déléguée), ancien
+// compte unique retiré, liste d'accès créée (vide), port 8081 réservé au réseau
+// local. L'ancien compte (qui suivait le compte administrateur) n'est PAS
+// converti en autorisation : l'accès se redonne explicitement.
+async function ensureWebdavService() {
   try {
-    const conf = fs.readFileSync(WEBDAV_ENV,"utf8");
-    const username = envUnquote(conf.match(/^RCLONE_USER=(.*)$/m)?.[1] ?? "");
-    const password = envUnquote(conf.match(/^RCLONE_PASS=(.*)$/m)?.[1] ?? "");
-    return username && password ? { username, password } : null;
-  } catch { return null; }
-}
-function writeWebdavEnv(username, password) {
-  fs.mkdirSync(path.dirname(WEBDAV_ENV), {recursive:true});
-  fs.writeFileSync(WEBDAV_ENV, `RCLONE_USER=${envQuote(username)}\nRCLONE_PASS=${envQuote(password)}\n`, {mode:0o600});
-  fs.chmodSync(WEBDAV_ENV, 0o600);
-}
-// WebDAV suit le compte WebUI tant qu'il n'a pas été personnalisé : identifiants
-// d'usine (gravity/gravity), ancien compte WebUI (changement de mot de passe) ou
-// fichier absent. Sans effet avant la fin de l'assistant de configuration.
-// Le mot de passe WebUI n'est plus stocké en clair : `next` ({user, pass}) le
-// fournit au moment où il est saisi (assistant, changement de mot de passe) ;
-// sinon on ne l'a que si le fichier est encore à l'ancien format (migration au
-// démarrage). `prev` = ancien compte (getCreds()) pour reconnaître un WebDAV
-// qui le suivait (comparaison par hachage, sans clair).
-async function syncWebdavWithWebui(prev, next) {
-  try {
-    const g = getCreds();
-    if (!g.valid || !fs.existsSync(WIZARD) || !fs.existsSync(WEBDAV_UNIT)) return false;
-    const c = next || (g.plain != null ? { user: g.user, pass: g.plain } : null);
-    const cur = readWebdavEnv();
-    const factory = !cur || (cur.username === "gravity" && cur.password === "gravity");
-    if (!c) {
-      // Mot de passe déjà haché, donc impossible d'aligner WebDAV : surtout ne
-      // pas laisser tourner gravity/gravity — on retire le fichier et on arrête.
-      if (cur && factory) {
-        try { fs.unlinkSync(WEBDAV_ENV); } catch {}
-        await execAsync("systemctl stop gravity-webdav").catch(() => {});
-        console.log("WebDAV : identifiants d'usine gravity/gravity retirés (définir un compte dans Paramètres > Services)");
-        return true;
-      }
-      return false;
+    if (!fs.existsSync(WEBDAV_UNIT) || !fs.existsSync(WEBDAV_AUTH)) return false;
+    try { fs.chmodSync(WEBDAV_AUTH, 0o755); } catch {}
+    let changed = false;
+    if (fs.readFileSync(WEBDAV_UNIT, "utf8") !== webdavUnitText()) {
+      fs.writeFileSync(WEBDAV_UNIT, webdavUnitText());
+      await execAsync("systemctl daemon-reload");
+      changed = true;
     }
-    const followsPrev = !!(cur && prev && prev.valid && cur.username === prev.user && await verifyPassword(cur.password, prev.stored));
-    if (!factory && !followsPrev) return false;
-    if (cur && cur.username === c.user && cur.password === c.pass) return false;
-    writeWebdavEnv(c.user, c.pass);
-    await execAsync("systemctl is-active gravity-webdav").then(() => execAsync("systemctl restart gravity-webdav")).catch(() => {});
-    console.log("WebDAV : identifiants alignés sur le compte WebUI");
-    return true;
-  } catch (e) { console.error("Synchronisation WebDAV:", e.message); return false; }
+    if (fs.existsSync(WEBDAV_OLD_ENV)) {
+      fs.unlinkSync(WEBDAV_OLD_ENV);
+      changed = true;
+      console.log("WebDAV : ancien compte unique retiré — choisir les utilisateurs autorisés dans Paramètres > Services > WebDAV");
+    }
+    const access = loadServiceAccess();
+    if (!Array.isArray(access.webdav)) { access.webdav = []; saveServiceAccess(access); }
+    if (changed) await refreshWebdavAuth();
+    await restrictWebdavFirewall();
+    return changed;
+  } catch (e) { console.error("Service WebDAV:", e.message); return false; }
 }
+// Le port 8081 n'est ouvert qu'aux adresses locales : WebDAV (HTTP + mot de passe
+// de compte) ne doit pas être joignable depuis Internet si la box redirige le port.
+async function restrictWebdavFirewall() {
+  try {
+    const st = (await execAsync("ufw status").catch(() => ({ stdout: "" }))).stdout;
+    if (!/Status: active/i.test(st)) return;
+    const generic = /^8081(\/tcp)?\s+ALLOW\s+Anywhere/m.test(st);
+    const lan = /^8081(\/tcp)?\s+ALLOW\s+(10\.0\.0\.0\/8|192\.168\.0\.0\/16)/m.test(st);
+    if (!generic && lan) return;
+    if (generic) await execAsync("ufw delete allow 8081/tcp").catch(() => {});
+    for (const r of PRIVATE_RANGES) await execAsync(`ufw allow from ${r} to any port 8081 proto tcp`).catch(() => {});
+    console.log("Pare-feu : WebDAV (port 8081) limité au réseau local");
+  } catch (e) { console.error("Pare-feu WebDAV:", e.message); }
+}
+
+app.get("/api/services/:svc/access", auth, async (req,res) => {
+  const svc = req.params.svc;
+  if (!ACCESS_SERVICES[svc]) return res.status(404).json({ error: "Service inconnu ou pas encore disponible" });
+  try {
+    const allowed = new Set(Array.isArray(loadServiceAccess()[svc]) ? loadServiceAccess()[svc] : []);
+    const users = (await listNasUsers()).map(u => ({ ...u, allowed: allowed.has(u.username) }));
+    res.json({ service: svc, label: ACCESS_SERVICES[svc], users });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put("/api/services/:svc/access", auth, async (req,res) => {
+  const svc = req.params.svc;
+  if (!ACCESS_SERVICES[svc]) return res.status(404).json({ error: "Service inconnu ou pas encore disponible" });
+  const wanted = req.body && req.body.users;
+  if (!Array.isArray(wanted) || wanted.some(u => typeof u !== "string")) return res.status(400).json({ error: "Liste d'utilisateurs invalide" });
+  try {
+    const known = new Set((await listNasUsers()).map(u => u.username));
+    const unknown = wanted.filter(u => !known.has(u));
+    if (unknown.length) return res.status(400).json({ error: `Utilisateur inconnu : ${unknown[0]}` });
+    const access = loadServiceAccess();
+    access[svc] = [...new Set(wanted)].sort();
+    saveServiceAccess(access);
+    if (svc === "webdav") await refreshWebdavAuth();
+    res.json({ ok: true, users: access[svc] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── Comptes d'usine gravity/gravity et compte root ───────────────────────────
 // L'ISO livre gravity/gravity (Linux = SSH, FTP, console, sudo ; Samba ; root
@@ -1812,12 +1881,12 @@ async function migrateCredentialsHash() {
     return true;
   } catch (e) { console.error("Hachage du mot de passe WebUI:", e.message); return false; }
 }
-// Ordre important : WebDAV et root utilisent le mot de passe en clair, donc
-// avant que le fichier soit converti.
+// Ordre important : root utilise le mot de passe en clair, donc avant que le
+// fichier soit converti.
 async function migrateAccountsAtStartup() {
-  await syncWebdavWithWebui(null);
   await neutralizeDefaultAccounts();
   await migrateCredentialsHash();
+  await ensureWebdavService();
 }
 // Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
 function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
@@ -1826,34 +1895,16 @@ app.get("/api/webdav/status", auth, async (req,res) => {
   try {
     const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
     const ip = (await execAsync("hostname -I 2>/dev/null").catch(()=>({stdout:"?"}))).stdout.trim().split(" ")[0];
-    res.json({ active: stdout.trim()==="active", ip, port: 8081 });
+    const allowed = Array.isArray(loadServiceAccess().webdav) ? loadServiceAccess().webdav.length : 0;
+    res.json({ active: stdout.trim()==="active", ip, port: 8081, allowedUsers: allowed });
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 app.post("/api/webdav/toggle", auth, async (req,res) => {
   try {
-    const { stdout } = await execAsync("systemctl is-active gravity-webdav").catch(()=>({stdout:"inactive"}));
-    const cmd = stdout.trim()==="active" ? "stop" : "start";
-    // Jamais de démarrage sans identifiants (accès anonyme). Le mot de passe
-    // WebUI n'étant plus stocké en clair, on ne peut plus le recopier ici.
-    if (cmd === "start" && !readWebdavEnv()) return res.status(400).json({error:"Définissez d'abord un compte WebDAV (nom d'utilisateur et mot de passe) avant de l'activer"});
-    await execAsync(`systemctl ${cmd} gravity-webdav`);
-    res.json({ok:true, running: cmd==="start"});
-  } catch(e) { res.status(500).json({error:e.message}); }
-});
-app.get("/api/webdav/account", auth, (req,res) => {
-  const cur = readWebdavEnv();
-  res.json({ username: cur ? cur.username : getCreds().user });
-});
-app.post("/api/webdav/account", auth, async (req,res) => {
-  const { username, password } = req.body || {};
-  if (!username || !/^[a-z][a-z0-9_-]{2,31}$/i.test(username)) return res.status(400).json({error:"Nom d'utilisateur invalide (3-32 caractères alphanumériques)"});
-  if (typeof password !== "string" || password.length < 4) return res.status(400).json({error:"Mot de passe trop court (minimum 4 caractères)"});
-  if (/[\r\n\0]/.test(password)) return res.status(400).json({error:"Mot de passe invalide (retour à la ligne interdit)"});
-  if (isFactoryPassword(password)) return res.status(400).json({error:"Ce mot de passe est celui d'usine, choisissez-en un autre"});
-  try {
-    writeWebdavEnv(username, password);
-    await execAsync("systemctl is-active gravity-webdav").then(()=>execAsync("systemctl restart gravity-webdav")).catch(()=>{});
-    res.json({ok:true});
+    const active = await webdavActive();
+    if (!active) await ensureWebdavService(); // unité à jour avant de démarrer
+    await execAsync(`systemctl ${active ? "stop" : "start"} gravity-webdav`);
+    res.json({ok:true, running: !active});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 
@@ -5678,6 +5729,7 @@ app.put("/api/users/:username", auth, async(req,res)=>{
       await execAsync(`(echo ${sh(password)}; echo ${sh(password)}) | smbpasswd -a ${sh(username)} -s`).catch(()=>{});
     }
     if (roleId) await applyRole(username, roleId);
+    if (password) await refreshWebdavAuth();
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -5689,6 +5741,13 @@ app.delete("/api/users/:username", auth, async(req,res)=>{
     const map = loadUserRoles();
     delete map[username];
     saveUserRoles(map);
+    // Un compte supprimé ne doit pas laisser d'autorisation : un futur compte du
+    // même nom hériterait de l'accès aux services.
+    const access = loadServiceAccess();
+    let touched = false;
+    for (const svc of Object.keys(access)) if (Array.isArray(access[svc]) && access[svc].includes(username)) { access[svc] = access[svc].filter(u => u !== username); touched = true; }
+    if (touched) saveServiceAccess(access);
+    await refreshWebdavAuth();
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -5712,6 +5771,7 @@ app.post("/api/users/:username/status", auth, async(req,res)=>{
   if (!["Actif","Désactivé"].includes(status)) return res.status(400).json({error:"Statut invalide"});
   try {
     await execAsync(`passwd ${status==="Désactivé"?"-l":"-u"} ${sh(username)}`);
+    await refreshWebdavAuth();
     res.json({ok:true});
   } catch(e){ res.status(500).json({error:e.message}); }
 });
@@ -6027,11 +6087,10 @@ GRAVDEFAULT
 [Unit]
 Description=GravityOS WebDAV (rclone)
 After=network.target
-ConditionPathExists=/etc/gravity/webdav.env
+ConditionPathExists=/opt/gravity/webdav-auth.js
 
 [Service]
-EnvironmentFile=-/etc/gravity/webdav.env
-ExecStart=/usr/bin/rclone serve webdav /srv/shares --addr :8081 --user \${RCLONE_USER} --pass \${RCLONE_PASS} --vfs-cache-mode writes
+ExecStart=/usr/bin/rclone serve webdav --addr :8081 --auth-proxy /opt/gravity/webdav-auth.js --vfs-cache-mode writes
 Restart=on-failure
 
 [Install]
@@ -6039,16 +6098,10 @@ WantedBy=multi-user.target
 WEBDAVUNIT
       systemctl daemon-reload
       systemctl disable gravity-webdav 2>/dev/null || true
-      ufw allow 8081/tcp 2>/dev/null || true
+      for r in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do ufw allow from $r to any port 8081 proto tcp 2>/dev/null || true; done
     fi
-    # Unité WebDAV déjà installée : ne jamais démarrer sans fichier d'identifiants
-    # (rclone sans --user/--pass = accès anonyme). Idempotent. Les identifiants
-    # d'usine gravity/gravity sont remplacés par ceux du compte WebUI par le
-    # service au démarrage (syncWebdavWithWebui).
-    if [ -f /etc/systemd/system/gravity-webdav.service ] && ! grep -q ConditionPathExists /etc/systemd/system/gravity-webdav.service; then
-      sed -i '1a ConditionPathExists=/etc/gravity/webdav.env' /etc/systemd/system/gravity-webdav.service
-      systemctl daemon-reload
-    fi
+    # Unité WebDAV, liste d'accès et pare-feu (port 8081 limité au réseau local) :
+    # remis à jour par le service lui-même à son démarrage (ensureWebdavService).
     if ! command -v minidlnad &>/dev/null; then
       echo "Installation de minidlna (requis pour le DLNA, désactivé par défaut)..."
       apt-get install -y minidlna 2>&1 | tail -3
