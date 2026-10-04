@@ -4862,6 +4862,52 @@ bash /tmp/getamp.sh; rc=$?
 rm -f /tmp/getamp.sh
 exit $rc`;
   },
+  // Une mise à jour est-elle disponible ? Même information que la page « Updates » de
+  // l'interface AMP (API Core/GetUpdateInfo, avec le mot de passe généré à l'installation) ;
+  // si l'API ne répond pas (mot de passe changé dans AMP, service arrêté), repli sur le
+  // paquet apt ampinstmgr. `available: null` = on ne sait pas.
+  async checkUpdate() {
+    const out = { available: null, latest: null, source: null };
+    try {
+      const cred = JSON.parse(fs.readFileSync(nativeCredFile("amp"), "utf8"));
+      const call = async (endpoint, body) => {
+        const r = await fetch(`http://127.0.0.1:${nativeAppPort(this)}/API/${endpoint}`, {
+          method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify(body), signal: AbortSignal.timeout(6000),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      };
+      const login = await call("Core/Login", { username: cred.username, password: cred.password, token: "", rememberMe: false });
+      if (login?.success && login.sessionID) {
+        const info = await call("Core/GetUpdateInfo", { SESSIONID: login.sessionID });
+        if (typeof info?.UpdateAvailable === "boolean") {
+          out.available = info.UpdateAvailable;
+          if (info.Version) out.latest = String(info.Version) + (info.Build ? " - " + info.Build : "");
+          out.source = "amp";
+          return out;
+        }
+      }
+    } catch {}
+    try {
+      const { stdout } = await execAsync("LC_ALL=C apt list --upgradable 2>/dev/null | grep '^ampinstmgr/'");
+      if (stdout.trim()) { out.available = true; out.source = "apt"; }
+    } catch {}
+    return out;
+  },
+  // Ce que l'interface AMP demande de faire en ligne de commande : mettre à jour le paquet
+  // ampinstmgr (dépôt apt CubeCoders) puis `ampinstmgr upgradeall`, qui doit tourner sous
+  // l'utilisateur « amp » (jamais root).
+  updateScript() {
+    return `echo "=== Mise à jour d'AMP (CubeCoders) ==="
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq || echo "(apt-get update a échoué : poursuite avec les paquets connus)"
+apt-get install -y --only-upgrade ampinstmgr || { echo "Mise à jour du paquet ampinstmgr impossible"; exit 1; }
+echo "--- Mise à jour des instances AMP (les serveurs de jeux sont redémarrés) ---"
+runuser -l amp -c "ampinstmgr upgradeall"; rc=$?
+echo "=== Mise à jour d'AMP terminée (code $rc) ==="
+exit $rc`;
+  },
   uninstallScript(deleteData) {
     return `echo "=== Désinstallation d'AMP ==="
 systemctl stop ampinstmgr 2>/dev/null
@@ -4904,8 +4950,8 @@ app.get("/api/store/apps", auth, async (req,res)=>{
       installed: fs.existsSync(path.join(storeDir(app.id), "docker-compose.yml")),
       hasPersistentData: appUsesPersistentData(app),
     }));
-    const natives = NATIVE_APPS.map(({ isInstalled, installScript, uninstallScript, ...def }) => ({
-      ...def, hostPorts: [nativeAppPort(def)], installed: isInstalled(),
+    const natives = NATIVE_APPS.map(({ isInstalled, installScript, uninstallScript, updateScript, checkUpdate, ...def }) => ({
+      ...def, hostPorts: [nativeAppPort(def)], installed: isInstalled(), supportsUpdate: typeof updateScript === "function",
     }));
     res.json([...natives, ...list]);
   } catch(e){ res.status(500).json({error:e.message}); }
@@ -5019,6 +5065,21 @@ app.get("/api/store/apps/:id/credentials", auth, (req,res)=>{
   } catch(e){ res.status(500).json({error:e.message}); }
 });
 
+// Mise à jour d'une application native (AMP) depuis sa fiche du Magasin.
+const nativeUpdating = new Set();
+app.get("/api/store/apps/:id/update", auth, async (req,res)=>{
+  const nat = NATIVE_APPS.find(a => a.id === req.params.id.replace(/[^a-zA-Z0-9_-]/g,""));
+  if (!nat?.updateScript || !nat.isInstalled()) return res.status(404).json({error:"Mise à jour non disponible pour cette application"});
+  res.json({ ...(await nat.checkUpdate()), updating: nativeUpdating.has(nat.id) });
+});
+app.post("/api/store/apps/:id/update", auth, (req,res)=>{
+  const nat = NATIVE_APPS.find(a => a.id === req.params.id.replace(/[^a-zA-Z0-9_-]/g,""));
+  if (!nat?.updateScript || !nat.isInstalled()) return res.status(404).json({error:"Mise à jour non disponible pour cette application"});
+  if (nativeUpdating.has(nat.id)) return res.status(409).json({error:`Une mise à jour de ${nat.name} est déjà en cours`});
+  nativeUpdating.add(nat.id);
+  const jobId = runJob(nat.updateScript(), () => nativeUpdating.delete(nat.id));
+  res.json({ok:true, jobId});
+});
 app.post("/api/store/apps/:id/uninstall", auth, async(req,res)=>{
   const id = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
   const nat = NATIVE_APPS.find(a => a.id === id);
