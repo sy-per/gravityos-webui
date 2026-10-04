@@ -5077,7 +5077,7 @@ app.post("/api/store/apps/:id/update", auth, (req,res)=>{
   if (!nat?.updateScript || !nat.isInstalled()) return res.status(404).json({error:"Mise à jour non disponible pour cette application"});
   if (nativeUpdating.has(nat.id)) return res.status(409).json({error:`Une mise à jour de ${nat.name} est déjà en cours`});
   nativeUpdating.add(nat.id);
-  const jobId = runJob(nat.updateScript(), () => nativeUpdating.delete(nat.id));
+  const jobId = runJob(nat.updateScript(), (ok) => { nativeUpdating.delete(nat.id); if (ok) resolveNotification(`native-update:${nat.id}`); });
   res.json({ok:true, jobId});
 });
 app.post("/api/store/apps/:id/uninstall", auth, async(req,res)=>{
@@ -5802,6 +5802,30 @@ async function checkDockerImageUpdates() {
   return { count: updated.length, images: updated, log: lines.join("\n") };
 }
 
+// Applications natives du Magasin (AMP) : leur mise à jour ne passe pas par apt seul
+// (le paquet peut être à jour alors que l'instance ne l'est pas) — on prévient qu'il faut
+// la finaliser depuis leur fiche du Magasin. Renvoie des lignes pour le journal de la tâche.
+async function checkNativeAppUpdates() {
+  const lines = [];
+  for (const a of NATIVE_APPS) {
+    if (typeof a.updateScript !== "function" || !a.isInstalled()) continue;
+    try {
+      const r = await a.checkUpdate();
+      if (r.available === true) {
+        pushNotification({
+          key: `native-update:${a.id}`, type: "info", title: `Mise à jour de ${a.name} disponible`,
+          message: (r.latest ? `Version ${r.latest}. ` : "") + `À finaliser : Magasin > ${a.name} > Mettre à jour.`,
+        });
+        lines.push(`${a.name} : mise à jour disponible${r.latest ? " (" + r.latest + ")" : ""} — à finaliser dans le Magasin`);
+      } else if (r.available === false) {
+        resolveNotification(`native-update:${a.id}`);
+        lines.push(`${a.name} : à jour`);
+      } else lines.push(`${a.name} : état des mises à jour indéterminé`);
+    } catch (e) { lines.push(`${a.name} : vérification impossible (${e.message})`); }
+  }
+  return lines;
+}
+
 // Dispatche l'action réelle d'une tâche système (pas de commande/script
 // utilisateur — voir la case "Système" du Planificateur). Chaque branche
 // retourne {ok, log} comme runJob/runUpdateProcess pour rester compatible
@@ -5811,7 +5835,25 @@ async function runBuiltinTask(t) {
     const sys = await runUpdateProcess(systemUpdateCmd());
     const grav = await runUpdateProcess(gravityUpdateCmd());
     if (sys.ok) resolveNotification("os-updates");
-    return { ok: sys.ok && grav.ok, log: `${sys.log}\n\n${grav.log}` };
+    if (grav.ok) resolveNotification("gravity-updates");
+    // la mise à jour du système peut avoir apporté un nouvel ampinstmgr : prévenir si l'instance AMP reste à finaliser
+    const native = sys.ok ? await checkNativeAppUpdates() : [];
+    return { ok: sys.ok && grav.ok, log: `${sys.log}\n\n${grav.log}` + (native.length ? "\n\n" + native.join("\n") : "") };
+  }
+  if (t.builtinType === "check-gravity-updates") {
+    const r = await checkGravityUpdatesCore();
+    if (r.message && r.message.startsWith("Erreur")) return { ok: false, log: r.message };
+    if (r.available) {
+      const shown = (r.commits || []).slice(0, 3).map(c => c.replace(/^[0-9a-f]+\s+/, "").slice(0, 90));
+      pushNotification({
+        key: "gravity-updates", type: "info",
+        title: `Mise à jour de GravityOS disponible${r.count > 1 ? ` (${r.count} nouveautés)` : ""}`,
+        message: shown.join(" ; ") + (r.count > shown.length ? " …" : "") + ". À installer dans Paramètres > Mises à jour.",
+      });
+      return { ok: true, log: `${r.count} nouveauté(s) disponible(s) :\n${(r.commits || []).join("\n")}` };
+    }
+    resolveNotification("gravity-updates");
+    return { ok: true, log: `GravityOS est à jour (${r.currentVersion || "version inconnue"}).` };
   }
   if (t.builtinType === "check-os-updates") {
     const r = await checkOsUpdatesCore();
@@ -5823,7 +5865,8 @@ async function runBuiltinTask(t) {
         message: names.join(", ") + (r.count > names.length ? ` et ${r.count - names.length} autre(s)` : "") + ". À installer dans Paramètres > Mises à jour.",
       });
     } else resolveNotification("os-updates");
-    return { ok: true, log: r.count > 0 ? `${r.count} mise(s) à jour disponible(s) :\n${r.packages.join("\n")}` : "Système à jour." };
+    const native = await checkNativeAppUpdates();
+    return { ok: true, log: (r.count > 0 ? `${r.count} mise(s) à jour disponible(s) :\n${r.packages.join("\n")}` : "Système à jour.") + (native.length ? "\n\n" + native.join("\n") : "") };
   }
   if (t.builtinType === "check-docker-updates") {
     const r = await checkDockerImageUpdates();
@@ -5993,6 +6036,7 @@ function seedBuiltinScheduledTasks() {
   const defaults = [
     { builtinType: "auto-update", name: "Mise à jour automatique", scheduleInterval: "Hebdomadaire", scheduleTime: "02:00", weekday: 1 },
     { builtinType: "check-os-updates", name: "Vérification des mises à jour (OS)", scheduleInterval: "Personnalisé", intervalMinutes: 360 },
+    { builtinType: "check-gravity-updates", name: "Vérification des mises à jour (GravityOS)", scheduleInterval: "Personnalisé", intervalMinutes: 360 },
     { builtinType: "check-docker-updates", name: "Vérification des mises à jour (Docker)", scheduleInterval: "Quotidien", scheduleTime: "03:00" },
   ];
   let changed = false;
@@ -6313,11 +6357,12 @@ app.post("/api/updates/system/start", auth, (req,res) => {
 });
 
 // Vérifier les mises à jour GravityOS (via git)
-app.get("/api/updates/gravity/check", auth, async(req,res) => {
+// Extrait en fonction pour être partagé avec la tâche planifiée « Vérification des
+// mises à jour (GravityOS) » ; renvoie exactement ce que la route renvoyait.
+async function checkGravityUpdatesCore() {
   try {
-    const REPO = "https://github.com/sy-per/gravityos-webui.git";
     const isGit = fs.existsSync("/opt/gravity/.git");
-    if(!isGit) return res.json({available:true, message:"Repo non initialisé — cliquez Mettre à jour", count:1, commits:["Premier déploiement depuis git"]});
+    if(!isGit) return {available:true, message:"Repo non initialisé — cliquez Mettre à jour", count:1, commits:["Premier déploiement depuis git"]};
     // Fix ownership
     await execAsync("git config --global --add safe.directory /opt/gravity 2>/dev/null").catch(()=>{});
     await execAsync("git -C /opt/gravity fetch origin main 2>/dev/null");
@@ -6334,9 +6379,15 @@ app.get("/api/updates/gravity/check", auth, async(req,res) => {
     let version = "?";
     try { version = fs.readFileSync("/opt/gravity/VERSION", "utf8").trim(); } catch {}
     const currentVersion = `${version} — ${relTime.trim()}`;
-    res.json({available: commits.length>0, commits, count: commits.length, currentVersion});
-  } catch(e){ res.json({available:false, message:"Erreur: "+e.message}); }
-});
+    return {available: commits.length>0, commits, count: commits.length, currentVersion};
+  } catch(e){ return {available:false, message:"Erreur: "+e.message}; }
+}
+app.get("/api/updates/gravity/check", auth, async(req,res) => res.json(await checkGravityUpdatesCore()));
+// Après une mise à jour (qui redémarre ce service), la notification « mise à jour
+// disponible » n'a plus lieu d'être : on la retire sans attendre la prochaine vérification.
+setTimeout(() => {
+  checkGravityUpdatesCore().then(r => { if (!r.available && !r.message) resolveNotification("gravity-updates"); }).catch(() => {});
+}, 45000).unref();
 
 // Extrait en fonction (au lieu d'inline dans le handler) pour être réutilisé
 // par la tâche planifiée système "Mise à jour automatique".
