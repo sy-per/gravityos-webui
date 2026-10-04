@@ -3891,6 +3891,14 @@ app.post("/api/notifications/email/test", auth, async(req,res)=>{
 //  d'être dupliquée, et ne redevient « non lue » que si son contenu change.
 // ══════════════════════════════════════════════════════════════════════════════
 const NOTIF_FILE = `${CFG}/notifications.json`;
+// Où mène un clic sur la notification (ouvre l'application concernée dans la WebUI).
+// appId = identifiant d'application du registre ; params : section de Paramètres, fiche du Magasin…
+const NOTIF_ACTION = {
+  updates: { appId: "settings", params: { section: "updates" }, label: "Ouvrir les mises à jour" },
+  scheduling: { appId: "settings", params: { section: "scheduling" }, label: "Voir la planification" },
+  docker: { appId: "docker", label: "Ouvrir Docker" },
+  backup: { appId: "backup", label: "Ouvrir Sauvegarde" },
+};
 function loadNotifs() {
   try { const a = JSON.parse(fs.readFileSync(NOTIF_FILE, "utf8")); return Array.isArray(a) ? a : []; }
   catch { return []; }
@@ -3924,7 +3932,7 @@ async function sendNotificationEmail(subject, body) {
   } finally { fs.unlink(tmp, () => {}); }
 }
 // Ne doit jamais faire échouer l'appelant (une tâche planifiée, par exemple).
-function pushNotification({ key, type = "info", title, message = "", emailBody }) {
+function pushNotification({ key, type = "info", title, message = "", emailBody, action }) {
   try {
     const list = loadNotifs();
     const now = new Date().toISOString();
@@ -3933,9 +3941,9 @@ function pushNotification({ key, type = "info", title, message = "", emailBody }
     if (i >= 0) {
       const old = list[i];
       changed = old.title !== title || old.message !== message || old.type !== type;
-      if (changed) { list.splice(i, 1); list.unshift({ ...old, type, title, message, time: now, read: false }); }
+      if (changed) { list.splice(i, 1); list.unshift({ ...old, type, title, message, action: action || null, time: now, read: false }); }
     } else {
-      list.unshift({ id: crypto.randomBytes(6).toString("hex"), key: key || null, type, title, message, time: now, read: false });
+      list.unshift({ id: crypto.randomBytes(6).toString("hex"), key: key || null, type, title, message, action: action || null, time: now, read: false });
     }
     if (!changed) return;
     saveNotifs(list);
@@ -5567,7 +5575,7 @@ function startTaskRun(taskId){
     const tasks2 = loadTasks(); const t2 = tasks2.find(x=>x.id===taskId);
     if (t2) {
       t2.status = "warning"; saveTasks(tasks2);
-      pushNotification({ key: `backup-failed:${taskId}`, type: "error", title: `Échec de la sauvegarde « ${t2.name} »`, message: String(e?.message || e).slice(0, 200), emailBody: `La sauvegarde « ${t2.name} » n'a pas pu démarrer. Consultez Sauvegarde dans GravityOS.` });
+      pushNotification({ key: `backup-failed:${taskId}`, type: "error", action: NOTIF_ACTION.backup, title: `Échec de la sauvegarde « ${t2.name} »`, message: String(e?.message || e).slice(0, 200), emailBody: `La sauvegarde « ${t2.name} » n'a pas pu démarrer. Consultez Sauvegarde dans GravityOS.` });
     }
     return;
   }
@@ -5578,7 +5586,7 @@ function startTaskRun(taskId){
     const wasFailing = t2.status === "warning";
     t2.status = ok ? "success" : "warning";
     if (!ok && !wasFailing) {
-      pushNotification({ key: `backup-failed:${taskId}`, type: "error", title: `Échec de la sauvegarde « ${t2.name} »`, message: String(log || "").trim().slice(-200) || "Aucun détail dans le journal.", emailBody: `La sauvegarde « ${t2.name} » a échoué. Consultez son journal dans l'application Sauvegarde.` });
+      pushNotification({ key: `backup-failed:${taskId}`, type: "error", action: NOTIF_ACTION.backup, title: `Échec de la sauvegarde « ${t2.name} »`, message: String(log || "").trim().slice(-200) || "Aucun détail dans le journal.", emailBody: `La sauvegarde « ${t2.name} » a échoué. Consultez son journal dans l'application Sauvegarde.` });
     } else if (ok) resolveNotification(`backup-failed:${taskId}`);
     t2.lastBackup = new Date().toISOString();
     const sizeMatch = log.match(/SIZE_BYTES:(\d+)/);
@@ -5813,7 +5821,7 @@ async function checkNativeAppUpdates() {
       const r = await a.checkUpdate();
       if (r.available === true) {
         pushNotification({
-          key: `native-update:${a.id}`, type: "info", title: `Mise à jour de ${a.name} disponible`,
+          key: `native-update:${a.id}`, type: "info", action: { appId: "apps-store", params: { appId: a.id }, label: `Ouvrir ${a.name} dans le Magasin` }, title: `Mise à jour de ${a.name} disponible`,
           message: (r.latest ? `Version ${r.latest}. ` : "") + `À finaliser : Magasin > ${a.name} > Mettre à jour.`,
         });
         lines.push(`${a.name} : mise à jour disponible${r.latest ? " (" + r.latest + ")" : ""} — à finaliser dans le Magasin`);
@@ -5846,7 +5854,7 @@ async function runBuiltinTask(t) {
     if (r.available) {
       const shown = (r.commits || []).slice(0, 3).map(c => c.replace(/^[0-9a-f]+\s+/, "").slice(0, 90));
       pushNotification({
-        key: "gravity-updates", type: "info",
+        key: "gravity-updates", type: "info", action: NOTIF_ACTION.updates,
         title: `Mise à jour de GravityOS disponible${r.count > 1 ? ` (${r.count} nouveautés)` : ""}`,
         message: shown.join(" ; ") + (r.count > shown.length ? " …" : "") + ". À installer dans Paramètres > Mises à jour.",
       });
@@ -5860,7 +5868,7 @@ async function runBuiltinTask(t) {
     if (r.count > 0) {
       const names = r.packages.map(l => l.split("/")[0]).slice(0, 8);
       pushNotification({
-        key: "os-updates", type: "info",
+        key: "os-updates", type: "info", action: NOTIF_ACTION.updates,
         title: `${r.count} mise${r.count > 1 ? "s" : ""} à jour système disponible${r.count > 1 ? "s" : ""}`,
         message: names.join(", ") + (r.count > names.length ? ` et ${r.count - names.length} autre(s)` : "") + ". À installer dans Paramètres > Mises à jour.",
       });
@@ -5872,7 +5880,7 @@ async function runBuiltinTask(t) {
     const r = await checkDockerImageUpdates();
     if (r.count > 0) {
       pushNotification({
-        type: "info",
+        type: "info", action: NOTIF_ACTION.docker,
         title: `${r.count} image${r.count > 1 ? "s" : ""} Docker mise${r.count > 1 ? "s" : ""} à jour téléchargée${r.count > 1 ? "s" : ""}`,
         message: r.images.join(", ") + ". Recréez les conteneurs concernés pour les appliquer.",
       });
@@ -5901,7 +5909,7 @@ function startScheduledTaskRun(taskId){
     // enverrait une par minute) ; elle disparaît dès que la tâche réussit.
     if (!ok && !wasFailing) {
       pushNotification({
-        key: `task-failed:${taskId}`, type: "error", title: `Échec de la tâche « ${t2.name} »`,
+        key: `task-failed:${taskId}`, type: "error", action: NOTIF_ACTION.scheduling, title: `Échec de la tâche « ${t2.name} »`,
         message: String(log || "").trim().slice(-200) || "Aucun détail dans le journal.",
         emailBody: `La tâche planifiée « ${t2.name} » a échoué. Consultez son journal dans Paramètres > Planification.`,
       });
