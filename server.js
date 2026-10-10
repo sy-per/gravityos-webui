@@ -2155,6 +2155,7 @@ async function migrateAccountsAtStartup() {
   await ensureSharingServices();
   await restrictOtherServicesFirewall();
   removeFactoryNfsExports();
+  setTimeout(() => { healAmpTmpNamespace(); }, 20000).unref();
 }
 // Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
 function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
@@ -4868,6 +4869,10 @@ export USE_ANSWERS=1 ANSWER_AMPUSER=admin ANSWER_AMPPASS=${sh(password)} ANSWER_
 curl -fsSL https://getamp.sh -o /tmp/getamp.sh || { echo "Téléchargement de l'installateur impossible (connexion Internet ?)"; exit 1; }
 bash /tmp/getamp.sh; rc=$?
 rm -f /tmp/getamp.sh
+# L'installateur démarre l'instance principale depuis ce processus : elle hériterait du /tmp privé
+# du service GravityOS (PrivateTmp), supprimé au prochain redémarrage de la WebUI, et plus aucun
+# serveur de jeu ne démarrerait. On la relance donc par son propre service systemd.
+if [ $rc -eq 0 ]; then systemctl restart ampinstmgr 2>/dev/null || true; fi
 exit $rc`;
   },
   // Une mise à jour est-elle disponible ? Même information que la page « Updates » de
@@ -4913,6 +4918,10 @@ apt-get update -qq || echo "(apt-get update a échoué : poursuite avec les paqu
 apt-get install -y --only-upgrade ampinstmgr || { echo "Mise à jour du paquet ampinstmgr impossible"; exit 1; }
 echo "--- Mise à jour des instances AMP (les serveurs de jeux sont redémarrés) ---"
 runuser -l amp -c "ampinstmgr upgradeall"; rc=$?
+# Les instances relancées par « upgradeall » héritent du /tmp privé de la WebUI (PrivateTmp) : on les
+# remet sous leur service systemd, sinon les serveurs de jeu ne démarrent plus après un redémarrage de la WebUI.
+echo "--- Relance d'AMP par son service ---"
+systemctl restart ampinstmgr 2>/dev/null || true
 echo "=== Mise à jour d'AMP terminée (code $rc) ==="
 exit $rc`;
   },
@@ -4945,6 +4954,41 @@ async function syncNativeShortcuts() {
   for (const def of NATIVE_APPS) {
     if (def.isInstalled() && !st[def.id]?.shortcut) await ensureNativeShortcut(def).catch(()=>{});
   }
+}
+// Une instance AMP lancée depuis un job de la WebUI (installateur, « ampinstmgr upgradeall ») hérite
+// du /tmp privé du service (PrivateTmp=yes) : ce dossier est supprimé quand la WebUI redémarre, et plus
+// aucun jeu ne démarre (« Could not find file '/tmp/… »). Détecte une instance AMP dans un autre espace
+// de montage dont le /tmp est inutilisable et la relance par son service systemd (les serveurs de jeu
+// redémarrent). Ne touche à rien si tout est sain.
+async function healAmpTmpNamespace() {
+  try {
+    const amp = NATIVE_APPS.find(a => a.id === "amp");
+    if (!amp || !amp.isInstalled()) return false;
+    const { stdout } = await execAsync("pgrep -u amp -f AMP_Linux_x86_64").catch(() => ({ stdout: "" }));
+    const pids = stdout.split("\n").map(x => x.trim()).filter(x => /^\d+$/.test(x));
+    if (!pids.length) return false;
+    const mine = fs.readlinkSync("/proc/1/ns/mnt");
+    const stale = [];
+    for (const pid of pids) {
+      let ns;
+      try { ns = fs.readlinkSync(`/proc/${pid}/ns/mnt`); } catch { continue; }
+      if (ns === mine) continue;
+      const ok = await execAsync(`nsenter -t ${pid} -m sh -c 'f=$(mktemp -p /tmp) && rm -f "$f"'`).then(() => true, () => false);
+      if (!ok) stale.push(pid);
+    }
+    if (!stale.length) return false;
+    console.log(`AMP : instance (pid ${stale.join(", ")}) dans un /tmp inutilisable, hérité de la WebUI — relance du service ampinstmgr`);
+    await execAsync("systemctl restart ampinstmgr");
+    // si l'ancien processus ne s'est pas arrêté de lui-même, on l'arrête puis on relance une seconde fois
+    await new Promise(r => setTimeout(r, 5000));
+    const still = stale.filter(pid => fs.existsSync(`/proc/${pid}`));
+    if (still.length) {
+      for (const pid of still) { try { process.kill(Number(pid), "SIGTERM"); } catch {} }
+      await new Promise(r => setTimeout(r, 5000));
+      await execAsync("systemctl restart ampinstmgr").catch(() => {});
+    }
+    return true;
+  } catch (e) { console.error("Contrôle du /tmp d'AMP :", e.message); return false; }
 }
 function nativeCredFile(id){ return path.join(NATIVE_CRED_DIR, `${id}.json`); }
 
