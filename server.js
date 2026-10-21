@@ -1610,6 +1610,55 @@ async function writeSmbConfChecked(next, prev) {
     throw new Error("Configuration Samba refusée : " + (fresh.slice(0, 3).join(" ") || "fichier non chargé"));
   }
 }
+// Point de montage fstab (sous /srv/) qui contient `real` mais n'est pas monté ; null sinon.
+async function unmountedVolumeOf(real) {
+  try {
+    for (const raw of fs.readFileSync("/etc/fstab", "utf8").split("\n")) {
+      const l = raw.trim();
+      if (!l || l.startsWith("#")) continue;
+      const mnt = l.split(/\s+/)[1];
+      if (!mnt || !mnt.startsWith("/srv/")) continue;
+      if (real !== mnt && !real.startsWith(mnt + "/")) continue;
+      if (!(await execAsync("findmnt -rn " + sh(mnt)).then(() => true, () => false))) return mnt;
+    }
+  } catch {}
+  return null;
+}
+// Droits du CONTENU d'un dossier partagé : sans eux, les sous-dossiers existants (droits d'origine, souvent
+// 700/750 ou propriétaire différent) restent inaccessibles aux comptes SMB alors que la racine du partage
+// s'ouvre. Les comptes autorisés dans « Gérer les accès » sont membres du groupe « gravity » : on donne à ce
+// groupe les droits par ACL POSIX (aucun changement de propriétaire), y compris par défaut pour les futurs
+// fichiers. Disques sans droits Unix (FAT/exFAT/NTFS) : rien à faire, les droits viennent des options de montage.
+function smbPermsScript(dir, readonly) {
+  const g = readonly ? "rX" : "rwX";
+  const plain = readonly ? "g+rX" : "g+rwX";
+  return `d=${sh(dir)}
+groupadd -f gravity
+fs=$(findmnt -no FSTYPE -T "$d" 2>/dev/null)
+case "$fs" in vfat|exfat|ntfs|ntfs3|fuseblk|msdos) echo "Ce disque ($fs) ne gère pas les droits Unix : rien à ajuster."; exit 0;; esac
+command -v setfacl >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y acl >/dev/null 2>&1 || true
+if command -v setfacl >/dev/null 2>&1; then
+  echo "Droits du groupe gravity (ACL) sur $d …"
+  setfacl -R -m g:gravity:${g} "$d"; rc1=$?
+  setfacl -R -d -m g:gravity:${g} "$d"; rc2=$?
+  if [ $rc1 -ne 0 ] || [ $rc2 -ne 0 ]; then echo "(certains éléments n'ont pas pu être modifiés)"; exit 1; fi
+else
+  echo "setfacl indisponible : repli sur les droits Unix classiques"
+  chgrp -R gravity "$d" && chmod -R ${plain} "$d"
+fi`;
+}
+function applySmbSharePermissions(name, dir, readonly) {
+  return runJob(smbPermsScript(dir, readonly), (ok, log) => {
+    const when = new Date().toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+    const tail = String(log).trim().split("\n").filter(l => !/^===|^\$ /.test(l)).slice(-2).join(" ").slice(0, 200);
+    pushNotification({
+      key: `smb-perms:${name}`, type: ok ? "info" : "warning",
+      title: ok ? `Droits du partage « ${name} » appliqués` : `Droits du partage « ${name} » : terminé avec des avertissements`,
+      message: ok ? `Le ${when} : les comptes autorisés dans « Gérer les accès » peuvent ouvrir tous les sous-dossiers.` : `Le ${when} : ${tail}`,
+      action: { appId: "settings", params: { section: "services" }, label: "Ouvrir les services" },
+    });
+  });
+}
 // Partager un dossier de n'importe quel volume (ou clé USB montée), comme le sélecteur de dossiers.
 app.post("/api/smb/shares", auth, async (req,res) => {
   const { name, path: p, comment, public: pub, readonly } = req.body || {};
@@ -1625,17 +1674,7 @@ app.post("/api/smb/shares", auth, async (req,res) => {
   if (real === VOL_ROOT || !pathUnderRoots(real, await browseRoots())) return res.status(400).json({error:"Le dossier doit se trouver dans un volume (ou l'un de ses sous-dossiers)"});
   // Un volume déclaré dans /etc/fstab mais démonté : on partagerait le dossier VIDE du point de montage, et
   // les droits seraient posés sur lui au lieu du disque (constaté après un démontage pendant une mise à jour).
-  try {
-    for (const raw of fs.readFileSync("/etc/fstab", "utf8").split("\n")) {
-      const l = raw.trim();
-      if (!l || l.startsWith("#")) continue;
-      const mnt = l.split(/\s+/)[1];
-      if (!mnt || !mnt.startsWith("/srv/")) continue;
-      if (real !== mnt && !real.startsWith(mnt + "/")) continue;
-      const mounted = await execAsync("findmnt -rn " + sh(mnt)).then(() => true, () => false);
-      if (!mounted) return res.status(409).json({error:"Ce volume n'est pas monté pour le moment (son dossier est vide) : il sera remonté automatiquement, ou remontez-le, puis réessayez."});
-    }
-  } catch {}
+  if (await unmountedVolumeOf(real)) return res.status(409).json({error:"Ce volume n'est pas monté pour le moment (son dossier est vide) : il sera remonté automatiquement, ou remontez-le, puis réessayez."});
   try {
     const prev = fs.readFileSync(SMB_CONF, "utf8");
     if (smbSectionNames(prev).some(x => x.toLowerCase() === n.toLowerCase())) return res.status(409).json({error:"Un partage porte déjà ce nom"});
@@ -1651,7 +1690,30 @@ app.post("/api/smb/shares", auth, async (req,res) => {
       await execAsync("chgrp gravity " + sh(real) + " && chmod g+rwxs " + sh(real)).catch(() => {});
     }
     await execAsync("systemctl reload smbd 2>/dev/null; systemctl reload nmbd 2>/dev/null").catch(() => {});
-    res.json({ok:true, path: real});
+    // Le contenu existant du dossier peut être long à traiter : en arrière-plan, la fin est notifiée.
+    const jobId = applySmbSharePermissions(n, real, !!readonly);
+    res.json({ok:true, path: real, jobId});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+app.post("/api/smb/shares/:name/permissions", auth, async (req,res) => {
+  const n = String(req.params.name || "").trim();
+  try {
+    const conf = fs.readFileSync(SMB_CONF, "utf8");
+    if (SMB_RESERVED.includes(n.toLowerCase()) || !smbSectionNames(conf).some(x => x.toLowerCase() === n.toLowerCase())) return res.status(404).json({error:"Partage introuvable"});
+    // lignes de la section demandée
+    let inSec = false; const body = [];
+    for (const l of conf.split("\n")) {
+      const m = /^\[([^\]]+)\]\s*$/.exec(l.trimEnd());
+      if (m) { inSec = m[1].trim().toLowerCase() === n.toLowerCase(); continue; }
+      if (inSec) body.push(l);
+    }
+    const get = (k) => (body.map(l => new RegExp("^\\s*" + k + "\\s*=\\s*(.+)$", "i").exec(l)).find(Boolean) || [])[1]?.trim() || "";
+    const p = get("path");
+    let real; try { real = fs.realpathSync(p); if (!fs.statSync(real).isDirectory()) throw new Error("x"); } catch { return res.status(400).json({error:"Le dossier de ce partage est introuvable"}); }
+    if (real === VOL_ROOT || !pathUnderRoots(real, await browseRoots())) return res.status(400).json({error:"Ce dossier n'est pas dans un volume : droits non modifiés"});
+    if (await unmountedVolumeOf(real)) return res.status(409).json({error:"Ce volume n'est pas monté pour le moment : il sera remonté automatiquement, puis réessayez."});
+    const jobId = applySmbSharePermissions(n, real, /^(yes|true|1)$/i.test(get("read only")));
+    res.json({ok:true, jobId});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 app.delete("/api/smb/shares/:name", auth, async (req,res) => {
@@ -6926,6 +6988,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 MOUNTRETRY
+    command -v setfacl >/dev/null 2>&1 || apt-get install -y acl 2>&1 | tail -2
     chmod 644 /etc/systemd/system/gravity-*.service /etc/systemd/system/getty@tty1.service.d/override.conf 2>/dev/null || true
     systemctl daemon-reload
     systemctl enable gravity-mount-retry.service 2>&1 | tail -2
