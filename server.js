@@ -1258,7 +1258,7 @@ app.post("/api/storage/volumes", auth, (req,res)=>{
     mkdir -p ${sh(mnt)}
     grep -q "$UUID" /etc/fstab || echo "UUID=$UUID  ${mnt}  ext4  defaults,nofail  0  2" >> /etc/fstab
     systemctl daemon-reload
-    mount ${sh(mnt)}
+    ${hostNs()}mount ${sh(mnt)}
     chown gravity:gravity ${sh(mnt)}
     echo "Volume '${slug}' prêt sur ${mnt}"
   `;
@@ -1283,6 +1283,29 @@ app.put("/api/storage/volumes/:name/label", auth, (req,res)=>{
 // données sont intactes, seul le montage manque. Ce contrôle remonte les volumes « UUID=… /srv/… » dont le
 // disque est présent, au démarrage de la WebUI puis chaque minute (un disque USB rebranché est aussi remonté).
 // Jamais pendant la suppression d'un volume (qui démonte exprès puis retire la ligne du fstab).
+// Le service GravityOS tournait avec PrivateTmp=yes, donc dans un espace de montage PROPRE : un disque monté
+// depuis le service (création d'un volume, remontage automatique, terminal de l'interface) n'existait que
+// là — invisible de Samba, Docker, AMP… — et DISPARAISSAIT à chaque arrêt du service (donc à chaque mise à
+// jour : « EXT4-fs: unmounting filesystem » dans la seconde qui suit « Stopping gravity-webui.service »).
+// Les montages/démontages passent donc par l'espace de montage du système (PID 1) tant que le service a le
+// sien ; `fixServiceUnitNamespace` retire PrivateTmp de l'unité (le service redémarre alors une fois).
+function hostNs() {
+  try { return fs.readlinkSync("/proc/self/ns/mnt") !== fs.readlinkSync("/proc/1/ns/mnt") ? "nsenter -t 1 -m " : ""; }
+  catch { return ""; }
+}
+function fixServiceUnitNamespace(unitFile = "/etc/systemd/system/gravity-webui.service") {
+  try {
+    if (!fs.existsSync(unitFile)) return false;
+    const cur = fs.readFileSync(unitFile, "utf8");
+    if (!/^PrivateTmp=yes\s*$/m.test(cur)) return false;
+    fs.writeFileSync(unitFile, cur.replace(/^PrivateTmp=yes[ \t]*\r?\n?/m, ""));
+    console.log("Service GravityOS : PrivateTmp retiré (espace de montage du système) — redémarrage différé");
+    execAsync("systemctl daemon-reload")
+      .then(() => execAsync("systemd-run --on-active=5 --unit=gravity-webui-ns-fix-" + Date.now() + " /usr/bin/systemctl restart gravity-webui"))
+      .catch(() => {});
+    return true;
+  } catch (e) { console.error("Espace de montage du service :", e.message); return false; }
+}
 // Les connexions Samba ouvertes pendant que le volume n'était pas monté restent dans le dossier VIDE du
 // point de montage masqué : même après le remontage elles ne voient pas le disque (dossiers partagés
 // « vides » côté Windows/Mac). On ferme donc les connexions aux partages situés sur ce volume : les
@@ -1317,7 +1340,7 @@ async function remountMissingVolumes() {
       if (Date.now() < volumeOpUntil) return remounted;
       try { fs.mkdirSync(mnt, { recursive: true }); } catch {}
       try {
-        await execAsync(`mount ${sh(mnt)}`);
+        await execAsync(`${hostNs()}mount ${sh(mnt)}`);
         remounted.push(mnt);
         await closeSmbSharesUnder(mnt);
         const name = path.basename(mnt);
@@ -1339,7 +1362,7 @@ app.delete("/api/storage/volumes/:name", auth, async(req,res)=>{
   try {
     if(!fs.existsSync(mnt)) return res.status(404).json({error:"Volume introuvable"});
     volumeOpUntil = Date.now() + 20000;
-    await execAsync(`umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
+    await execAsync(`${hostNs()}umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
     const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(mnt)).join("\n");
     fs.writeFileSync("/etc/fstab", fstab);
     await execAsync("systemctl daemon-reload").catch(()=>{});
@@ -1495,7 +1518,7 @@ app.post("/api/storage/snapraid", auth, (req,res)=>{
     mkdir -p ${sh(target)}
     UUID=$(blkid -s UUID -o value ${sh(dev)})
     grep -q "$UUID" /etc/fstab || echo "UUID=$UUID  ${target}  ext4  defaults,nofail  0  2" >> /etc/fstab
-    mount ${sh(target)}
+    ${hostNs()}mount ${sh(target)}
   `;
 
   const confLines = [
@@ -1530,7 +1553,7 @@ EOF
     mkdir -p ${sh(mnt)}
     grep -q " ${mnt} " /etc/fstab || echo "${mergerfsBranches}  ${mnt}  fuse.mergerfs  defaults,allow_other,use_ino,cache.files=partial,dropcacheonclose=true,category.create=mfs,minfreespace=1G,nofail  0  0" >> /etc/fstab
     systemctl daemon-reload
-    mount ${sh(mnt)}
+    ${hostNs()}mount ${sh(mnt)}
     chown gravity:${SHARED_GROUP} ${sh(mnt)}
     chmod 2775 ${sh(mnt)}
     snapraid -c ${sh(snapraidConfPath(safeName))} sync 2>&1
@@ -1558,10 +1581,10 @@ app.delete("/api/storage/snapraid/:name", auth, async(req,res)=>{
   const poolDir = path.join(SNAPRAID_POOL_ROOT, name);
   try {
     volumeOpUntil = Date.now() + 20000;
-    await execAsync(`umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
+    await execAsync(`${hostNs()}umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
     if (fs.existsSync(poolDir)) {
       for (const sub of fs.readdirSync(poolDir)) {
-        await execAsync(`umount ${sh(path.join(poolDir,sub))} 2>/dev/null`).catch(()=>{});
+        await execAsync(`${hostNs()}umount ${sh(path.join(poolDir,sub))} 2>/dev/null`).catch(()=>{});
       }
     }
     const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(` ${mnt} `) && !l.includes(poolDir)).join("\n");
@@ -2371,6 +2394,7 @@ async function migrateAccountsAtStartup() {
   removeFactoryNfsExports();
   setTimeout(() => { healAmpTmpNamespace(); }, 20000).unref();
   fixUnitFilePermissions();
+  fixServiceUnitNamespace();
   setTimeout(() => { remountMissingVolumes(); }, 15000).unref();
   setInterval(() => { remountMissingVolumes(); }, 60000).unref();
 }
@@ -7008,6 +7032,8 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 MOUNTRETRY
     command -v setfacl >/dev/null 2>&1 || apt-get install -y acl 2>&1 | tail -2
+    # PrivateTmp = espace de montage propre au service : un disque monté depuis la WebUI disparaissait à chaque redémarrage
+    sed -i '/^PrivateTmp=yes/d' /etc/systemd/system/gravity-webui.service 2>/dev/null || true
     chmod 644 /etc/systemd/system/gravity-*.service /etc/systemd/system/getty@tty1.service.d/override.conf 2>/dev/null || true
     systemctl daemon-reload
     systemctl enable gravity-mount-retry.service 2>&1 | tail -2
