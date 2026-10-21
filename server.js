@@ -1547,14 +1547,29 @@ function removeSmbSection(conf, name) {
   }
   return out.join("\n");
 }
-// Valide la configuration avec testparm ; en cas d'erreur, restaure l'ancienne.
+// Rapport de testparm : lignes de problème + « chargé ». Le code de sortie varie selon la version de Samba
+// (une erreur ancienne comme « unix password sync sans passwd program » le rend non nul chez certains
+// et pas chez d'autres) : on compare donc avec l'état d'AVANT, au lieu de se fier au code de sortie.
+async function testparmReport(file) {
+  let out = "";
+  try { out = (await execAsync("testparm -s " + sh(file) + " 2>&1")).stdout; }
+  catch (e) { out = String(e.stdout || "") + String(e.stderr || ""); }
+  const problems = out.split("\n").map(l => l.trim()).filter(l => /^ERROR|^Error loading|not boolean|^Unknown|badly formed|invalid|failed/i.test(l));
+  return { problems, loaded: /Loaded services file OK/.test(out) };
+}
+// Écrit la nouvelle configuration ; si testparm y trouve un problème QUI N'EXISTAIT PAS avant, restaure l'ancienne.
+// Une configuration déjà imparfaite (erreurs d'origine tolérées par Samba) ne bloque plus les changements.
 async function writeSmbConfChecked(next, prev) {
+  const tmp = path.join("/tmp", "gravity-smb-prev-" + crypto.randomBytes(4).toString("hex") + ".conf");
+  fs.writeFileSync(tmp, prev);
+  const before = await testparmReport(tmp);
+  fs.unlink(tmp, () => {});
   fs.writeFileSync(SMB_CONF, next);
-  try { await execAsync("testparm -s " + SMB_CONF + " >/dev/null 2>/tmp/gravity-testparm.err"); }
-  catch (e) {
+  const after = await testparmReport(SMB_CONF);
+  const fresh = after.problems.filter(l => !before.problems.includes(l));
+  if (fresh.length || (before.loaded && !after.loaded)) {
     fs.writeFileSync(SMB_CONF, prev);
-    let detail = ""; try { detail = fs.readFileSync("/tmp/gravity-testparm.err", "utf8").trim().split("\n").slice(-3).join(" "); } catch {}
-    throw new Error("Configuration Samba refusée" + (detail ? " : " + detail : ""));
+    throw new Error("Configuration Samba refusée : " + (fresh.slice(0, 3).join(" ") || "fichier non chargé"));
   }
 }
 // Partager un dossier de n'importe quel volume (ou clé USB montée), comme le sélecteur de dossiers.
