@@ -1283,6 +1283,24 @@ app.put("/api/storage/volumes/:name/label", auth, (req,res)=>{
 // données sont intactes, seul le montage manque. Ce contrôle remonte les volumes « UUID=… /srv/… » dont le
 // disque est présent, au démarrage de la WebUI puis chaque minute (un disque USB rebranché est aussi remonté).
 // Jamais pendant la suppression d'un volume (qui démonte exprès puis retire la ligne du fstab).
+// Les connexions Samba ouvertes pendant que le volume n'était pas monté restent dans le dossier VIDE du
+// point de montage masqué : même après le remontage elles ne voient pas le disque (dossiers partagés
+// « vides » côté Windows/Mac). On ferme donc les connexions aux partages situés sur ce volume : les
+// clients se reconnectent tout seuls et voient alors le disque.
+async function closeSmbSharesUnder(mnt) {
+  const closed = [];
+  try {
+    let name = null;
+    for (const l of fs.readFileSync("/etc/samba/smb.conf", "utf8").split("\n")) {
+      const m = /^\[([^\]]+)\]\s*$/.exec(l.trimEnd());
+      if (m) { name = m[1].trim(); continue; }
+      const p = /^\s*path\s*=\s*(.+)$/i.exec(l);
+      if (name && p) { const v = p[1].trim(); if (v === mnt || v.startsWith(mnt + "/")) closed.push(name); }
+    }
+    for (const n of closed) await execAsync("smbcontrol all close-share " + sh(n)).catch(() => {});
+  } catch {}
+  return closed;
+}
 let volumeOpUntil = 0;
 async function remountMissingVolumes() {
   try {
@@ -1301,6 +1319,7 @@ async function remountMissingVolumes() {
       try {
         await execAsync(`mount ${sh(mnt)}`);
         remounted.push(mnt);
+        await closeSmbSharesUnder(mnt);
         const name = path.basename(mnt);
         console.log(`Volume ${mnt} remonté automatiquement (disque présent mais non monté)`);
         pushNotification({
