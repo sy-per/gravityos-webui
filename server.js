@@ -1532,22 +1532,70 @@ app.get("/api/smb/shares", auth, (req,res) => {
     res.json(shares);
   } catch { res.json([]); }
 });
+const SMB_CONF = "/etc/samba/smb.conf";
+const SMB_RESERVED = ["global", "homes", "printers", "print$"];
+function smbSectionNames(conf) { return [...conf.matchAll(/^\[([^\]\r\n]+)\]/gm)].map(m => m[1].trim()); }
+// Retire UNE section (nom exact, sans tenir compte de la casse) — pas d'expression régulière
+// construite depuis le nom : un nom contenant des caractères spéciaux n'efface plus autre chose.
+function removeSmbSection(conf, name) {
+  const out = [];
+  let skip = false;
+  for (const l of conf.split("\n")) {
+    const m = /^\[([^\]]+)\]\s*$/.exec(l.trimEnd());
+    if (m) skip = m[1].trim().toLowerCase() === name.toLowerCase();
+    if (!skip) out.push(l);
+  }
+  return out.join("\n");
+}
+// Valide la configuration avec testparm ; en cas d'erreur, restaure l'ancienne.
+async function writeSmbConfChecked(next, prev) {
+  fs.writeFileSync(SMB_CONF, next);
+  try { await execAsync("testparm -s " + SMB_CONF + " >/dev/null 2>/tmp/gravity-testparm.err"); }
+  catch (e) {
+    fs.writeFileSync(SMB_CONF, prev);
+    let detail = ""; try { detail = fs.readFileSync("/tmp/gravity-testparm.err", "utf8").trim().split("\n").slice(-3).join(" "); } catch {}
+    throw new Error("Configuration Samba refusée" + (detail ? " : " + detail : ""));
+  }
+}
+// Partager un dossier de n'importe quel volume (ou clé USB montée), comme le sélecteur de dossiers.
 app.post("/api/smb/shares", auth, async (req,res) => {
-  const { name, path:p, comment, public:pub, readonly } = req.body;
-  const block = `\n[${name}]\n   comment = ${comment||name}\n   path = ${p}\n   browseable = yes\n   read only = ${readonly?"yes":"no"}\n   guest ok = ${pub?"yes":"no"}\n   create mask = 0664\n   directory mask = 0775\n   force group = gravity\n`;
+  const { name, path: p, comment, public: pub, readonly } = req.body || {};
+  const n = typeof name === "string" ? name.trim() : "";
+  if (!/^[A-Za-z0-9][A-Za-z0-9._ -]{0,38}$/.test(n)) return res.status(400).json({error:"Nom invalide (lettres, chiffres, espace, point, tiret ou souligné ; 39 caractères maximum)"});
+  if (SMB_RESERVED.includes(n.toLowerCase())) return res.status(400).json({error:"Ce nom est réservé par Samba"});
+  if (typeof p !== "string" || !p.startsWith("/") || /[\r\n\0%]/.test(p)) return res.status(400).json({error:"Chemin invalide"});
+  let real;
+  try { real = fs.realpathSync(p); if (!fs.statSync(real).isDirectory()) throw new Error("x"); }
+  catch { return res.status(400).json({error:"Dossier introuvable : choisissez un dossier existant"}); }
+  // Même règle que le sélecteur de dossiers (volumes et clés USB montées), liens symboliques résolus ;
+  // jamais la racine qui contient tous les volumes.
+  if (real === VOL_ROOT || !pathUnderRoots(real, await browseRoots())) return res.status(400).json({error:"Le dossier doit se trouver dans un volume (ou l'un de ses sous-dossiers)"});
   try {
-    fs.mkdirSync(p,{recursive:true});
-    fs.appendFileSync("/etc/samba/smb.conf", block);
-    await execAsync("systemctl reload smbd 2>/dev/null; systemctl reload nmbd 2>/dev/null").catch(()=>{});
-    res.json({ok:true});
+    const prev = fs.readFileSync(SMB_CONF, "utf8");
+    if (smbSectionNames(prev).some(x => x.toLowerCase() === n.toLowerCase())) return res.status(409).json({error:"Un partage porte déjà ce nom"});
+    const cmt = String(comment || n).replace(/[\r\n]+/g, " ").slice(0, 100);
+    // Comme les partages d'usine : accès aux comptes du groupe « gravity » (voir « Gérer les accès »),
+    // sauf partage invité explicitement demandé.
+    const block = "\n[" + n + "]\n   comment = " + cmt + "\n   path = " + real + "\n   browseable = yes\n   read only = " + (readonly ? "yes" : "no") + "\n   guest ok = " + (pub ? "yes" : "no") + "\n" + (pub ? "" : "   valid users = @gravity\n") + "   create mask = 0664\n   directory mask = 0775\n   force group = gravity\n";
+    await writeSmbConfChecked(prev.replace(/\s*$/, "\n") + block, prev);
+    // Le groupe « gravity » doit pouvoir écrire dans le dossier (le dossier lui-même, pas son contenu) ;
+    // sans effet sur un disque qui ne gère pas les droits Unix (NTFS, exFAT).
+    if (!readonly) {
+      await execAsync("groupadd -f gravity").catch(() => {});
+      await execAsync("chgrp gravity " + sh(real) + " && chmod g+rwxs " + sh(real)).catch(() => {});
+    }
+    await execAsync("systemctl reload smbd 2>/dev/null; systemctl reload nmbd 2>/dev/null").catch(() => {});
+    res.json({ok:true, path: real});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
 app.delete("/api/smb/shares/:name", auth, async (req,res) => {
+  const n = String(req.params.name || "").trim();
+  if (SMB_RESERVED.includes(n.toLowerCase())) return res.status(400).json({error:"Ce partage système ne peut pas être retiré"});
   try {
-    let conf = fs.readFileSync("/etc/samba/smb.conf","utf8");
-    conf = conf.replace(new RegExp(`\\[${req.params.name}\\][^\\[]*`,"g"),"");
-    fs.writeFileSync("/etc/samba/smb.conf",conf);
-    await execAsync("systemctl reload smbd 2>/dev/null; systemctl reload nmbd 2>/dev/null").catch(()=>{});
+    const prev = fs.readFileSync(SMB_CONF, "utf8");
+    if (!smbSectionNames(prev).some(x => x.toLowerCase() === n.toLowerCase())) return res.status(404).json({error:"Partage introuvable"});
+    await writeSmbConfChecked(removeSmbSection(prev, n), prev);
+    await execAsync("systemctl reload smbd 2>/dev/null; systemctl reload nmbd 2>/dev/null").catch(() => {});
     res.json({ok:true});
   } catch(e) { res.status(500).json({error:e.message}); }
 });
