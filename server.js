@@ -1278,11 +1278,48 @@ app.put("/api/storage/volumes/:name/label", auth, (req,res)=>{
   saveVolumeLabel(name, label);
   res.json({ok:true});
 });
+// Un volume déclaré dans /etc/fstab dont le disque est présent peut se retrouver démonté (constaté après
+// une mise à jour, sans redémarrage ; le disque USB reste là mais le dossier du volume est vide) : les
+// données sont intactes, seul le montage manque. Ce contrôle remonte les volumes « UUID=… /srv/… » dont le
+// disque est présent, au démarrage de la WebUI puis chaque minute (un disque USB rebranché est aussi remonté).
+// Jamais pendant la suppression d'un volume (qui démonte exprès puis retire la ligne du fstab).
+let volumeOpUntil = 0;
+async function remountMissingVolumes() {
+  try {
+    if (Date.now() < volumeOpUntil) return [];
+    const remounted = [];
+    for (const raw of fs.readFileSync("/etc/fstab", "utf8").split("\n")) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const [dev, mnt] = line.split(/\s+/);
+      const m = /^UUID=([0-9A-Fa-f-]+)$/.exec(dev || "");
+      if (!m || !mnt || !mnt.startsWith("/srv/")) continue;
+      if (!fs.existsSync(`/dev/disk/by-uuid/${m[1]}`)) continue; // disque absent : rien à remonter
+      if (await execAsync(`findmnt -rn ${sh(mnt)}`).then(() => true, () => false)) continue; // déjà monté
+      if (Date.now() < volumeOpUntil) return remounted;
+      try { fs.mkdirSync(mnt, { recursive: true }); } catch {}
+      try {
+        await execAsync(`mount ${sh(mnt)}`);
+        remounted.push(mnt);
+        const name = path.basename(mnt);
+        console.log(`Volume ${mnt} remonté automatiquement (disque présent mais non monté)`);
+        pushNotification({
+          key: `volume-remounted:${name}`, type: "warning",
+          title: `Volume « ${name} » remonté automatiquement`,
+          message: `Le disque était présent mais n'était plus monté (le ${new Date().toLocaleString("fr-FR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}). Vos données sont intactes.`,
+          action: { appId: "settings", params: { section: "storage" }, label: "Voir le stockage" },
+        });
+      } catch (e) { console.error(`Remontage de ${mnt} impossible :`, String(e.stderr || e.message).trim().split("\n")[0]); }
+    }
+    return remounted;
+  } catch (e) { console.error("Contrôle des volumes :", e.message); return []; }
+}
 app.delete("/api/storage/volumes/:name", auth, async(req,res)=>{
   const name = req.params.name.replace(/[^a-zA-Z0-9_-]/g,"");
   const mnt = path.join(VOL_ROOT, name);
   try {
     if(!fs.existsSync(mnt)) return res.status(404).json({error:"Volume introuvable"});
+    volumeOpUntil = Date.now() + 20000;
     await execAsync(`umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
     const fstab = fs.readFileSync("/etc/fstab","utf8").split("\n").filter(l=>!l.includes(mnt)).join("\n");
     fs.writeFileSync("/etc/fstab", fstab);
@@ -1501,6 +1538,7 @@ app.delete("/api/storage/snapraid/:name", auth, async(req,res)=>{
   const mnt = path.join(VOL_ROOT, name);
   const poolDir = path.join(SNAPRAID_POOL_ROOT, name);
   try {
+    volumeOpUntil = Date.now() + 20000;
     await execAsync(`umount ${sh(mnt)} 2>/dev/null`).catch(()=>{});
     if (fs.existsSync(poolDir)) {
       for (const sub of fs.readdirSync(poolDir)) {
@@ -1585,6 +1623,19 @@ app.post("/api/smb/shares", auth, async (req,res) => {
   // Même règle que le sélecteur de dossiers (volumes et clés USB montées), liens symboliques résolus ;
   // jamais la racine qui contient tous les volumes.
   if (real === VOL_ROOT || !pathUnderRoots(real, await browseRoots())) return res.status(400).json({error:"Le dossier doit se trouver dans un volume (ou l'un de ses sous-dossiers)"});
+  // Un volume déclaré dans /etc/fstab mais démonté : on partagerait le dossier VIDE du point de montage, et
+  // les droits seraient posés sur lui au lieu du disque (constaté après un démontage pendant une mise à jour).
+  try {
+    for (const raw of fs.readFileSync("/etc/fstab", "utf8").split("\n")) {
+      const l = raw.trim();
+      if (!l || l.startsWith("#")) continue;
+      const mnt = l.split(/\s+/)[1];
+      if (!mnt || !mnt.startsWith("/srv/")) continue;
+      if (real !== mnt && !real.startsWith(mnt + "/")) continue;
+      const mounted = await execAsync("findmnt -rn " + sh(mnt)).then(() => true, () => false);
+      if (!mounted) return res.status(409).json({error:"Ce volume n'est pas monté pour le moment (son dossier est vide) : il sera remonté automatiquement, ou remontez-le, puis réessayez."});
+    }
+  } catch {}
   try {
     const prev = fs.readFileSync(SMB_CONF, "utf8");
     if (smbSectionNames(prev).some(x => x.toLowerCase() === n.toLowerCase())) return res.status(409).json({error:"Un partage porte déjà ce nom"});
@@ -2211,6 +2262,25 @@ async function migrateCredentialsHash() {
 }
 // Ordre important : root utilise le mot de passe en clair, donc avant que le
 // fichier soit converti.
+// Les fichiers de service GravityOS copiés depuis Windows se retrouvaient exécutables et modifiables par
+// tout le monde (systemd : « is marked executable / world-writable ») : un utilisateur local pouvait
+// modifier un service lancé en root. Remis à 0644 (propriétaire root).
+function fixUnitFilePermissions() {
+  let changed = false;
+  try {
+    const dir = "/etc/systemd/system";
+    const files = fs.readdirSync(dir).filter(f => /^gravity-.*\.service$/.test(f)).map(f => path.join(dir, f));
+    const getty = path.join(dir, "getty@tty1.service.d", "override.conf");
+    if (fs.existsSync(getty)) files.push(getty);
+    for (const f of files) {
+      const st = fs.lstatSync(f);
+      if (!st.isFile()) continue;
+      if (st.mode & 0o133) { fs.chmodSync(f, 0o644); changed = true; }
+    }
+  } catch (e) { console.error("Droits des fichiers de service :", e.message); }
+  if (changed) execAsync("systemctl daemon-reload").catch(() => {});
+  return changed;
+}
 async function migrateAccountsAtStartup() {
   await neutralizeDefaultAccounts();
   await migrateCredentialsHash();
@@ -2219,6 +2289,9 @@ async function migrateAccountsAtStartup() {
   await restrictOtherServicesFirewall();
   removeFactoryNfsExports();
   setTimeout(() => { healAmpTmpNamespace(); }, 20000).unref();
+  fixUnitFilePermissions();
+  setTimeout(() => { remountMissingVolumes(); }, 15000).unref();
+  setInterval(() => { remountMissingVolumes(); }, 60000).unref();
 }
 // Mot de passe d'usine refusé pour le compte créé (sinon rien n'est neutralisé).
 function isFactoryPassword(p) { return String(p ?? "").trim().toLowerCase() === "gravity"; }
@@ -6853,6 +6926,7 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 MOUNTRETRY
+    chmod 644 /etc/systemd/system/gravity-*.service /etc/systemd/system/getty@tty1.service.d/override.conf 2>/dev/null || true
     systemctl daemon-reload
     systemctl enable gravity-mount-retry.service 2>&1 | tail -2
     systemctl start gravity-mount-retry.service 2>&1 | tail -2
