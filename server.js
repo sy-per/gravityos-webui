@@ -2395,6 +2395,7 @@ async function migrateAccountsAtStartup() {
   setTimeout(() => { healAmpTmpNamespace(); }, 20000).unref();
   fixUnitFilePermissions();
   fixServiceUnitNamespace();
+  setTimeout(() => { ensureComposeV2(); }, 30000).unref();
   setTimeout(() => { remountMissingVolumes(); }, 15000).unref();
   setInterval(() => { remountMissingVolumes(); }, 60000).unref();
 }
@@ -4281,6 +4282,36 @@ function allStacks() {
 
 // ── docker compose (v2 "docker compose" si dispo, sinon "docker-compose" v1) ──
 let COMPOSE_CMD = null;
+// Docker Compose v1 (paquet « docker-compose » de Debian 12) est abandonné et REFUSE la syntaxe actuelle des
+// projets : clé « name: » en tête de fichier, booléens non quotés dans environment (« LOGFLARE_SINGLE_TENANT:
+// true contains true, which is an invalid type »)… On installe donc le plugin officiel v2 (binaire statique)
+// s'il manque : `docker compose` est alors utilisé à la place de `docker-compose`.
+const COMPOSE_PLUGIN_DIR = "/usr/local/lib/docker/cli-plugins";
+async function ensureComposeV2(dir = COMPOSE_PLUGIN_DIR) {
+  const dst = path.join(dir, "docker-compose"), tmp = dst + ".part";
+  try {
+    if (await execAsync("docker compose version").then(() => true, () => false)) return false;
+    if (!(await execAsync("command -v docker").then(() => true, () => false))) return false;
+    const arch = { x86_64: "x86_64", aarch64: "aarch64", armv7l: "armv7" }[(await execAsync("uname -m")).stdout.trim()];
+    if (!arch) return false;
+    fs.mkdirSync(dir, { recursive: true });
+    await execAsync(`curl -fsSL --retry 2 -m 300 -o ${sh(tmp)} https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${arch}`);
+    fs.chmodSync(tmp, 0o755);
+    await execAsync(`${sh(tmp)} version`); // le binaire téléchargé fonctionne ?
+    fs.renameSync(tmp, dst);
+    COMPOSE_CMD = null; // recalculé au prochain appel
+    const ok = await execAsync("docker compose version").then(() => true, () => false);
+    if (ok) {
+      console.log("Docker Compose v2 installé (plugin officiel)");
+      pushNotification({ key: "compose-v2", type: "info", title: "Docker Compose mis à jour (v2)", message: "Les projets au format actuel (clé « name: », booléens dans environment…) sont maintenant acceptés." });
+    }
+    return ok;
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    console.error("Docker Compose v2 non installé :", String(e.stderr || e.message).trim().split("\n")[0]);
+    return false;
+  }
+}
 function composeCmd() {
   if (COMPOSE_CMD) return COMPOSE_CMD;
   try { execSync("docker compose version", {stdio:"ignore"}); COMPOSE_CMD = "docker compose"; }
