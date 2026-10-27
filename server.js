@@ -4831,7 +4831,9 @@ app.post("/api/docker/compose/validate", auth, async(req,res)=>{
       // compose v1 (pas de --format json) : simple validation de syntaxe
       try { await execAsync(`cd ${sh(tmp)} && ${composeCmd()} config -q 2>&1`); return res.json({valid:true, error:null, services:null}); }
       catch(e2) { errText = String(e2.stdout || e2.stderr || e2.message || errText); }
-      const msg = errText.trim().split("\n").filter(Boolean)[0] || "Fichier invalide";
+      // Docker Compose écrit « The Compose file … is invalid because: » puis la VRAIE raison sur les lignes
+      // suivantes : on garde le message entier (limité), pas seulement la première ligne.
+      const msg = errText.trim().split("\n").map(l => l.trimEnd()).filter(Boolean).slice(0, 8).join("\n").slice(0, 700) || "Fichier invalide";
       return res.json({valid:false, error:msg, services:[]});
     }
     const services = Object.entries(json.services || {}).map(([name, svc]) => ({
