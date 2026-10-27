@@ -6885,7 +6885,11 @@
     "website": "https://www.plex.tv/",
     "repo": "https://github.com/linuxserver/docker-plex",
     "icon": "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/plex.png",
-    "gallery": [],
+    "gallery": [
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Plex/screenshot-1.png",
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Plex/screenshot-2.png",
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Plex/screenshot-3.png"
+    ],
     "hostPorts": [
       32400
     ],
