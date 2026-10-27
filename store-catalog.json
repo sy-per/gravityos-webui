@@ -6876,7 +6876,7 @@
   },
   {
     "id": "plex",
-    "name": "Plex Media Server",
+    "name": "Plex",
     "tagline": "Your media, on every device",
     "description": "Plex organise vos films, séries, musiques et photos dans une belle bibliothèque et les diffuse sur tous vos appareils : navigateur, smartphone, TV connectée, console, Chromecast…\n\nLe serveur analyse vos dossiers, récupère affiches, résumés et sous-titres, et transcode à la volée si l'appareil ne sait pas lire le fichier.\n\nAu premier lancement, ouvrez l'interface sur le port 32400 depuis un navigateur de votre réseau local et connectez-vous avec votre compte Plex (gratuit) pour réclamer le serveur. Ajoutez ensuite vos bibliothèques : le dossier de téléchargements du NAS est monté dans le conteneur sous /downloads.",
     "category": "media",
