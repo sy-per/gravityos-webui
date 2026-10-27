@@ -6873,5 +6873,25 @@
     "composeYaml": "services:\n  server:\n    image: homeassistant/home-assistant:2026.8.3@sha256:14931c6b13756317849f46da1d01b45937a1150db66c081cfe529d48215943fe\n    network_mode: host\n    privileged: true\n    volumes:\n      - /srv/volumes/volume1/AppData/home-assistant/data:/config\n      - /srv/volumes/volume1/Téléchargements:/media\n      - /dev:/dev\n      - /run/dbus:/run/dbus:ro\n",
     "needsReview": [],
     "excluded": false
+  },
+  {
+    "id": "plex",
+    "name": "Plex",
+    "tagline": "Your media, on every device",
+    "description": "Plex organise vos films, séries, musiques et photos dans une belle bibliothèque et les diffuse sur tous vos appareils : navigateur, smartphone, TV connectée, console, Chromecast…\n\nLe serveur analyse vos dossiers, récupère affiches, résumés et sous-titres, et transcode à la volée si l'appareil ne sait pas lire le fichier.\n\nAu premier lancement, ouvrez l'interface sur le port 32400 depuis un navigateur de votre réseau local et connectez-vous avec votre compte Plex (gratuit) pour réclamer le serveur. Ajoutez ensuite vos bibliothèques : le dossier de téléchargements du NAS est monté dans le conteneur sous /downloads.",
+    "category": "media",
+    "version": "latest",
+    "developer": "Plex, Inc.",
+    "website": "https://www.plex.tv/",
+    "repo": "https://github.com/linuxserver/docker-plex",
+    "icon": "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/plex.png",
+    "gallery": [],
+    "hostPorts": [
+      32400
+    ],
+    "usesHostNetwork": false,
+    "composeYaml": "services:\n  server:\n    image: lscr.io/linuxserver/plex:latest\n    restart: on-failure\n    environment:\n      - PUID=1000\n      - PGID=1000\n      - TZ=Europe/Paris\n      - VERSION=docker\n    volumes:\n      - /srv/volumes/volume1/AppData/plex/config:/config\n      - /srv/volumes/volume1/Téléchargements:/downloads\n    ports:\n      - 32400:32400\n",
+    "needsReview": [],
+    "excluded": false
   }
 ]
