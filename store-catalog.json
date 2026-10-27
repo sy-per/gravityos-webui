@@ -6889,8 +6889,8 @@
     "hostPorts": [
       32400
     ],
-    "usesHostNetwork": false,
-    "composeYaml": "services:\n  server:\n    image: lscr.io/linuxserver/plex:latest\n    restart: on-failure\n    environment:\n      - PUID=1000\n      - PGID=1000\n      - TZ=Europe/Paris\n      - VERSION=docker\n    volumes:\n      - /srv/volumes/volume1/AppData/plex/config:/config\n      - /srv/volumes/volume1/Téléchargements:/downloads\n    ports:\n      - 32400:32400\n",
+    "usesHostNetwork": true,
+    "composeYaml": "services:\n  server:\n    image: lscr.io/linuxserver/plex:latest\n    network_mode: host\n    restart: on-failure\n    environment:\n      - PUID=1000\n      - PGID=1000\n      - TZ=Europe/Paris\n      - VERSION=docker\n    volumes:\n      - /srv/volumes/volume1/AppData/plex/config:/config\n      - /srv/volumes/volume1/Téléchargements:/downloads\n",
     "needsReview": [],
     "excluded": false
   }
