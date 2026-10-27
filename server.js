@@ -5370,7 +5370,8 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
           // testant réellement le port (curl http:// donnait 400 Bad
           // Request, seul https:// répondait avec le vrai contenu).
           const scheme = app_.usesHttps ? "https" : "http";
-          list.push({ id: crypto.randomBytes(6).toString("hex"), name: app_.name, url: `${scheme}://${ip}:${app_.hostPorts[0]}`, icon: app_.icon, storeAppId: id });
+          // webPath (optionnel, ex. "/web" pour Plex) : la racine du port ne sert pas l'interface de toutes les apps.
+          list.push({ id: crypto.randomBytes(6).toString("hex"), name: app_.name, url: `${scheme}://${ip}:${app_.hostPorts[0]}${app_.webPath || ""}`, icon: app_.icon, storeAppId: id });
           saveAppShortcuts(list);
         }
       } catch (e) { console.error(`Création du raccourci Magasin (${id}) échouée:`, e.message); }
