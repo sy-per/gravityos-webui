@@ -5098,6 +5098,12 @@ function writeEnvFile(dir, values) {
 function catalogAppDataPrefix(id) { return `/srv/volumes/volume1/AppData/${id}`; }
 function appUsesPersistentData(app_) { return app_.composeYaml.includes(catalogAppDataPrefix(app_.id)); }
 
+// Dossier multimédia : les apps de la catégorie "media" (Plex, Jellyfin, Emby…) montent par défaut le dossier
+// Téléchargements du volume 1 pour lire les films/séries/musiques. L'assistant permet de le remplacer par
+// n'importe quel dossier d'un volume (champ "mediaDir"). Le dossier choisi n'est jamais supprimé à la désinstallation.
+const CATALOG_MEDIA_PREFIX = "/srv/volumes/volume1/Téléchargements";
+function appHasMediaFolder(app_) { return app_.category === "media" && app_.composeYaml.includes(`- ${CATALOG_MEDIA_PREFIX}:`); }
+
 // ── Applications "natives" du Magasin (installées sur le système, hors Docker) ──
 // Le catalogue umbrel ne contient que des apps Docker. Certaines apps (ex. AMP
 // de CubeCoders, gestionnaire de serveurs de jeux) s'installent directement
@@ -5275,6 +5281,7 @@ app.get("/api/store/apps", auth, async (req,res)=>{
       composeYaml: undefined, // pas besoin côté liste, alourdit la réponse
       installed: fs.existsSync(path.join(storeDir(app.id), "docker-compose.yml")),
       hasPersistentData: appUsesPersistentData(app),
+      hasMediaFolder: appHasMediaFolder(app),
     }));
     const natives = NATIVE_APPS.map(({ isInstalled, installScript, uninstallScript, updateScript, checkUpdate, ...def }) => ({
       ...def, hostPorts: [nativeAppPort(def)], installed: isInstalled(), supportsUpdate: typeof updateScript === "function",
@@ -5320,9 +5327,22 @@ app.post("/api/store/apps/:id/install", auth, async(req,res)=>{
     const candidate = path.normalize(req.body.dataDir);
     if (candidate.startsWith("/srv/volumes/")) dataDir = candidate;
   }
+  // Dossier multimédia choisi dans le wizard : doit être un dossier existant sous /srv/volumes/, sans caractère
+  // qui casserait la ligne de volume du compose (":", guillemets, "#", retour à la ligne).
+  let mediaDir = null;
+  if (req.body?.mediaDir !== undefined && req.body.mediaDir !== null && appHasMediaFolder(app_)) {
+    const candidate = typeof req.body.mediaDir === "string" ? path.normalize(req.body.mediaDir).replace(/\/+$/, "") : "";
+    let isDir = false;
+    try { isDir = fs.statSync(candidate).isDirectory(); } catch {}
+    if (!candidate.startsWith("/srv/volumes/") || /[:"'#\\\r\n\0]/.test(candidate) || !isDir) return res.status(400).json({error:"Dossier multimédia invalide : choisissez un dossier existant d'un volume du NAS"});
+    mediaDir = candidate;
+  }
   try {
     fs.mkdirSync(dir, {recursive:true});
-    const composeYaml = app_.composeYaml.split(catalogAppDataPrefix(id)).join(dataDir);
+    // Le dossier multimédia est remplacé AVANT le dossier de données (le second pourrait se trouver sous le premier).
+    let composeYaml = app_.composeYaml;
+    if (mediaDir) composeYaml = composeYaml.split(CATALOG_MEDIA_PREFIX).join(mediaDir);
+    composeYaml = composeYaml.split(catalogAppDataPrefix(id)).join(dataDir);
     fs.writeFileSync(path.join(dir, "docker-compose.yml"), composeYaml);
     // Beaucoup d'apps du catalogue (héritées d'umbrel-apps) font tourner un
     // service avec "user: 1000:1000" sur un volume bind-mount sous
