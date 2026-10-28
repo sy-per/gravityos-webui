@@ -6898,5 +6898,53 @@
     "composeYaml": "services:\n  server:\n    image: lscr.io/linuxserver/plex:latest\n    network_mode: host\n    restart: on-failure\n    environment:\n      - PUID=1000\n      - PGID=1000\n      - TZ=Europe/Paris\n      - VERSION=docker\n    volumes:\n      - /srv/volumes/volume1/AppData/plex/config:/config\n      - /srv/volumes/volume1/Téléchargements:/downloads\n",
     "needsReview": [],
     "excluded": false
+  },
+  {
+    "id": "radarr",
+    "name": "Radarr",
+    "tagline": "Movie collection manager",
+    "description": "Radarr surveille les sorties de films, les recherche via vos indexeurs (Prowlarr, torrents ou Usenet), les envoie à votre client de téléchargement, puis les renomme et les range dans votre bibliothèque.\n\nIl peut aussi remplacer automatiquement un film par une version de meilleure qualité quand elle devient disponible.\n\nAprès l'installation, ouvrez l'interface sur le port 7878, ajoutez votre client de téléchargement (par exemple qBittorrent) et vos indexeurs. Le dossier de téléchargements du NAS est monté dans le conteneur sous /downloads : utilisez le même chemin dans votre client de téléchargement pour que Radarr retrouve les fichiers terminés.",
+    "category": "media",
+    "version": "latest",
+    "developer": "Radarr",
+    "website": "https://radarr.video/",
+    "repo": "https://github.com/Radarr/Radarr",
+    "icon": "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/radarr.png",
+    "gallery": [
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Radarr/screenshot-1.jpg",
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Radarr/screenshot-2.jpg",
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Radarr/screenshot-3.jpg"
+    ],
+    "hostPorts": [
+      7878
+    ],
+    "usesHostNetwork": false,
+    "composeYaml": "services:\n  server:\n    image: lscr.io/linuxserver/radarr:latest\n    restart: on-failure\n    environment:\n      - PUID=1000\n      - PGID=1000\n      - TZ=Europe/Paris\n    volumes:\n      - /srv/volumes/volume1/AppData/radarr/config:/config\n      - /srv/volumes/volume1/Téléchargements:/downloads\n    ports:\n      - 7878:7878\n",
+    "needsReview": [],
+    "excluded": false
+  },
+  {
+    "id": "sonarr",
+    "name": "Sonarr",
+    "tagline": "TV series collection manager",
+    "description": "Sonarr surveille les nouveaux épisodes de vos séries, les recherche via vos indexeurs (Prowlarr, torrents ou Usenet), les envoie à votre client de téléchargement, puis les renomme et les range dans votre bibliothèque.\n\nIl peut aussi remplacer automatiquement un épisode par une version de meilleure qualité quand elle devient disponible.\n\nAprès l'installation, ouvrez l'interface sur le port 8989, ajoutez votre client de téléchargement (par exemple qBittorrent) et vos indexeurs. Le dossier de téléchargements du NAS est monté dans le conteneur sous /downloads : utilisez le même chemin dans votre client de téléchargement pour que Sonarr retrouve les fichiers terminés.",
+    "category": "media",
+    "version": "latest",
+    "developer": "Sonarr",
+    "website": "https://sonarr.tv/",
+    "repo": "https://github.com/Sonarr/Sonarr",
+    "icon": "https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/sonarr.png",
+    "gallery": [
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Sonarr/screenshot-1.jpg",
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Sonarr/screenshot-2.jpg",
+      "https://raw.githubusercontent.com/IceWhaleTech/CasaOS-AppStore/main/Apps/Sonarr/screenshot-3.jpg"
+    ],
+    "hostPorts": [
+      8989
+    ],
+    "usesHostNetwork": false,
+    "composeYaml": "services:\n  server:\n    image: lscr.io/linuxserver/sonarr:latest\n    restart: on-failure\n    environment:\n      - PUID=1000\n      - PGID=1000\n      - TZ=Europe/Paris\n    volumes:\n      - /srv/volumes/volume1/AppData/sonarr/config:/config\n      - /srv/volumes/volume1/Téléchargements:/downloads\n    ports:\n      - 8989:8989\n",
+    "needsReview": [],
+    "excluded": false
   }
 ]
