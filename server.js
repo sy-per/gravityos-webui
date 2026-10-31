@@ -16,6 +16,29 @@ let Dockerode; try { Dockerode = require("dockerode"); } catch {}
 let multer; try { multer = require("multer"); } catch {}
 
 const execAsync = promisify(exec);
+// Un disque qui cale (pont USB défaillant, SSD saturé…) laisse les processus qui le touchent bloqués en attente
+// disque ("D") : df/stat ne reviennent plus, et sans garde-fou une seule requête vers ce volume figeait les métriques
+// et l'interface. execLimited rend la main au bout de "ms" (la commande bloquée est abandonnée, pas attendue).
+function execLimited(cmd, ms = 5000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("délai dépassé : " + cmd.split(" ")[0])), ms);
+    execAsync(cmd, { timeout: ms }).then((r) => { clearTimeout(t); resolve(r); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+// Occupation des volumes pour les widgets : une seule lecture à la fois (jamais empilée), partagée entre tous les
+// clients WebSocket, au plus toutes les 10 s, avec un délai maximal ; en cas de blocage on garde la dernière valeur.
+let fsSizeCache = { at: 0, value: [], pending: null };
+function getFsSizeCached() {
+  const now = Date.now();
+  if (fsSizeCache.pending) return fsSizeCache.pending;
+  if (now - fsSizeCache.at < 10000) return Promise.resolve(fsSizeCache.value);
+  const read = Promise.race([si.fsSize(), new Promise((_, rej) => setTimeout(() => rej(new Error("fsSize bloqué")), 4000))])
+    .then((v) => { fsSizeCache.value = v; }, () => {})
+    .finally(() => { fsSizeCache.at = Date.now(); fsSizeCache.pending = null; })
+    .then(() => fsSizeCache.value);
+  fsSizeCache.pending = read;
+  return read;
+}
 const app    = express();
 const server = http.createServer(app);
 
@@ -340,9 +363,12 @@ wss.on("connection", (ws, req) => {
   }
   let iv;
   let lastRapl = { energy: readRaplEnergyUj(), time: Date.now() };
+  let pushing = false;
   async function push() {
+    if (pushing) return; // la lecture précédente n'est pas finie (disque lent) : on n'en empile pas une autre
+    pushing = true;
     try {
-      const [cpu,mem,net,temp,disk] = await Promise.all([si.currentLoad(),si.mem(),si.networkStats(),si.cpuTemperature(),si.fsSize()]);
+      const [cpu,mem,net,temp,disk] = await Promise.all([si.currentLoad(),si.mem(),si.networkStats(),si.cpuTemperature(),getFsSizeCached()]);
       // mem.used = total - free, ce qui compte le cache disque (pages
       // Samba/NFS/Docker mises en cache par le noyau) comme "utilisé" alors
       // que Linux le libère instantanément dès qu'un process en a besoin —
@@ -366,6 +392,7 @@ wss.on("connection", (ws, req) => {
 
       ws.send(JSON.stringify({ type:"metrics", cpu:Math.round(cpu.currentLoad), cpuCores:cpu.cpus.map(c=>Math.round(c.load)), cpuWatts, ram:{used:ramUsed,total:mem.total,pct:Math.round(ramUsed/mem.total*100)}, net:net[0]?{rx:net[0].rx_sec,tx:net[0].tx_sec}:{rx:0,tx:0}, temp:temp.main||0, disks:disk.map(d=>({fs:d.fs,used:d.used,size:d.size,pct:Math.round(d.use)})) }));
     } catch {}
+    finally { pushing = false; }
   }
   iv = setInterval(push, 2000); push();
   ws.on("close",()=>clearInterval(iv));
@@ -562,7 +589,7 @@ app.post("/api/install/reboot", liveOnly, (req,res) => {
 //  STOCKAGE — Disques, Volumes (façon ZimaOS : Volume 1 = disque système, disques
 //  ajoutés = nouveaux volumes), RAID logiciel (mdadm)
 // ══════════════════════════════════════════════════════════════════════════════
-app.get("/api/disks",  auth, async (req,res) => { const [b,f]=await Promise.all([si.blockDevices(),si.fsSize()]); res.json({devices:b,filesystems:f}); });
+app.get("/api/disks",  auth, async (req,res) => { const [b,f]=await Promise.all([si.blockDevices(),getFsSizeCached()]); res.json({devices:b,filesystems:f}); });
 app.get("/api/mdstat", auth, async (req,res) => { try{const{stdout}=await execAsync("cat /proc/mdstat");res.json({raw:stdout});}catch{res.json({raw:""}); } });
 
 const VOL_ROOT = "/srv/volumes";
@@ -755,7 +782,7 @@ app.get("/api/files/external", auth, async(req,res)=>{
     const devices = [];
     for (const d of flat) {
       if (d.tran!=="usb" || !d.mountpoint) continue;
-      const { stdout } = await execAsync(`df -B1 --output=size,used ${sh(d.mountpoint)} 2>/dev/null | tail -n1`).catch(()=>({stdout:"0 0"}));
+      const { stdout } = await execLimited(`df -B1 --output=size,used ${sh(d.mountpoint)} 2>/dev/null | tail -n1`).catch(()=>({stdout:"0 0"}));
       const [sz,us] = stdout.trim().split(/\s+/);
       devices.push({
         name: d.model?.trim() || d.name,
@@ -1207,7 +1234,7 @@ function slugifyVolumeName(raw){
 async function getVolumesList(){
   fs.mkdirSync(VOL_ROOT,{recursive:true});
   const {stdout:rootSrc} = await execAsync("findmnt -n -o SOURCE /").catch(()=>({stdout:"—"}));
-  const {stdout:rootDf}  = await execAsync("df -B1 --output=size,used / 2>/dev/null | tail -n1").catch(()=>({stdout:"0 0"}));
+  const {stdout:rootDf}  = await execLimited("df -B1 --output=size,used / 2>/dev/null | tail -n1").catch(()=>({stdout:"0 0"}));
   const [rsz,rus] = rootDf.trim().split(/\s+/);
   // Volume 1 = le disque système, représenté par son dossier partagé dans
   // VOL_ROOT (pas /srv/shares — les stats ci-dessus viennent déjà du point
@@ -1229,7 +1256,7 @@ async function getVolumesList(){
     // un doublon fantôme de "Volume 1" (signalé par un utilisateur réel).
     // On l'ignore : ce n'est pas un vrai volume.
     if (fs.statSync(p).dev === volRootDev) continue;
-    const {stdout:info} = await execAsync(`df -B1 --output=source,size,used ${sh(p)} 2>/dev/null | tail -n1`).catch(()=>({stdout:""}));
+    const {stdout:info} = await execLimited(`df -B1 --output=source,size,used ${sh(p)} 2>/dev/null | tail -n1`).catch(()=>({stdout:""}));
     const [device,sz,us] = info.trim().split(/\s+/);
     volumes.push({ name, label: labels[name] || name, path:p, device:device||"—", size:Number(sz)||0, used:Number(us)||0, system:false });
   }
@@ -1491,7 +1518,7 @@ async function listSnapraidPools(){
     const parityDisks = [...conf.matchAll(/^parity\s+(\S+)/gm), ...conf.matchAll(/^\d-parity\s+(\S+)/gm)]
       .map(m=>path.dirname(m[1]));
     const mnt = path.join(VOL_ROOT, name);
-    const {stdout:info} = await execAsync(`df -B1 --output=size,used ${sh(mnt)} 2>/dev/null | tail -n1`).catch(()=>({stdout:""}));
+    const {stdout:info} = await execLimited(`df -B1 --output=size,used ${sh(mnt)} 2>/dev/null | tail -n1`).catch(()=>({stdout:""}));
     const [sz,us] = info.trim().split(/\s+/);
     let lastSync = null;
     try { lastSync = fs.statSync(snapraidSyncMarker(name)).mtime.toISOString(); } catch {}
