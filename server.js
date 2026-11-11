@@ -5300,14 +5300,20 @@ async function healAmpTmpNamespace() {
 function nativeCredFile(id){ return path.join(NATIVE_CRED_DIR, `${id}.json`); }
 
 // ── Mises à jour des applications du Magasin (Docker) ──────────────────────────
-// Une app "a une mise à jour" quand l'image de son tag (ex. "latest") a changé sur le registre depuis le dernier
-// téléchargement. Détection sans rien télécharger : on compare l'empreinte (Docker-Content-Digest) renvoyée par le
-// registre à celles de l'image locale. Les images figées par empreinte ("repo:tag@sha256:…", cas de la plupart des
-// apps issues d'Umbrel) ne bougent jamais : elles sont signalées "figées". L'application recrée ensuite le projet
-// du Magasin ("compose pull" puis "up -d") : les données (bind-mounts) ne sont pas touchées.
+// Deux cas, sans rien télécharger pour vérifier :
+//  • image "flottante" (ex. "plex:latest") : on compare l'empreinte (Docker-Content-Digest) du tag sur le registre à
+//    celles de l'image réellement utilisée par le conteneur (pas celle du tag local : une tâche planifiée peut avoir
+//    déjà téléchargé la nouvelle image sans recréer le conteneur) ;
+//  • image figée par empreinte ("repo:0.17.2@sha256:…", cas de la quasi-totalité du catalogue issu d'Umbrel) : le tag
+//    ne bouge jamais, on cherche donc sur le registre une version plus récente au même format (même préfixe et même
+//    suffixe, même nombre de chiffres : "0.17.2" → "0.17.3", jamais "0.18.0-rc1"). Une version majeure plus haute est
+//    signalée "major" : l'interface demande une confirmation. L'application réécrit alors le tag et l'empreinte dans le
+//    docker-compose.yml de l'app (sauvegarde restaurée si la mise à jour échoue), puis "compose pull" et "up -d".
+// Les données (bind-mounts) ne sont jamais touchées.
 function parseImageRef(ref) {
   const clean = String(ref).trim().replace(/^["']|["']$/g, "");
   const pinned = clean.includes("@sha256:");
+  const digest = pinned ? clean.split("@")[1] : null;
   const noDigest = clean.split("@")[0];
   const slash = noDigest.lastIndexOf("/");
   const colon = noDigest.lastIndexOf(":");
@@ -5321,7 +5327,7 @@ function parseImageRef(ref) {
   if (registry === "docker.io" && !repo.includes("/")) repo = `library/${repo}`;
   // lscr.io (LinuxServer) est un simple alias de ghcr.io/linuxserver : mêmes empreintes, sans redirection à suivre
   const apiHost = registry === "docker.io" ? "registry-1.docker.io" : registry === "lscr.io" ? "ghcr.io" : registry;
-  return { pinned, tag, repo, registry, apiHost, localName: name };
+  return { pinned, digest, tag, repo, registry, apiHost, localName: name };
 }
 const MANIFEST_ACCEPT = [
   "application/vnd.oci.image.index.v1+json",
@@ -5329,10 +5335,11 @@ const MANIFEST_ACCEPT = [
   "application/vnd.oci.image.manifest.v1+json",
   "application/vnd.docker.distribution.manifest.v2+json",
 ].join(", ");
-async function registryDigest(p) {
-  const url = `https://${p.apiHost}/v2/${p.repo}/manifests/${p.tag}`;
-  const head = (auth) => fetch(url, { method: "HEAD", headers: { Accept: MANIFEST_ACCEPT, "User-Agent": "GravityOS", ...(auth ? { Authorization: `Bearer ${auth}` } : {}) }, signal: AbortSignal.timeout(10000) });
-  let r = await head();
+// Requête vers l'API d'un registre, avec le jeton "Bearer" anonyme demandé par le registre si besoin
+async function registryRequest(p, urlPath, init = {}) {
+  const url = urlPath.startsWith("http") ? urlPath : `https://${p.apiHost}${urlPath}`;
+  const call = (token) => fetch(url, { ...init, headers: { "User-Agent": "GravityOS", ...(init.headers || {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) }, signal: AbortSignal.timeout(10000) });
+  let r = await call();
   if (r.status === 401) {
     const ch = r.headers.get("www-authenticate") || "";
     const realm = ch.match(/realm="([^"]+)"/)?.[1];
@@ -5343,27 +5350,110 @@ async function registryDigest(p) {
     const tr = await fetch(`${realm}?${q}`, { headers: { "User-Agent": "GravityOS" }, signal: AbortSignal.timeout(10000) });
     if (!tr.ok) throw new Error(`jeton refusé par ${p.registry} (${tr.status})`);
     const tj = await tr.json();
-    r = await head(tj.token || tj.access_token);
+    r = await call(tj.token || tj.access_token);
   }
+  return r;
+}
+async function registryDigest(p) {
+  const r = await registryRequest(p, `/v2/${p.repo}/manifests/${p.tag}`, { method: "HEAD", headers: { Accept: MANIFEST_ACCEPT } });
   if (!r.ok) throw new Error(`${p.registry} a répondu ${r.status}`);
   const d = r.headers.get("docker-content-digest");
   if (!d) throw new Error("empreinte absente de la réponse du registre");
   return d;
 }
+// Liste des versions d'un dépôt. Docker Hub rend les tags par ordre alphabétique (spec OCI) : on ne lit alors que la
+// tranche qui commence par le préfixe des versions ("", "v", "release-"… suivi d'un chiffre), de "last" jusqu'au premier
+// tag qui la dépasse. D'autres registres (ghcr.io) ne trient pas et peuvent en compter des dizaines de milliers
+// (ex. "dev-<hash>" de Frigate) : on n'y lit que 3 pages et la liste est alors marquée incomplète (complete: false).
+async function registryTags(p, versionPrefix = "") {
+  const tags = [];
+  const upper = versionPrefix + "9￿";
+  const last = versionPrefix ? versionPrefix.slice(0, -1) : "";
+  let next = `/v2/${p.repo}/tags/list?n=1000${last ? "&last=" + encodeURIComponent(last) : ""}`;
+  let sorted = true, complete = false;
+  for (let page = 0; next && page < 15; page++) {
+    const r = await registryRequest(p, next);
+    if (!r.ok) throw new Error(`${p.registry} a répondu ${r.status} (liste des versions)`);
+    const got = (await r.json()).tags || [];
+    if (tags.length && got.length && tags[tags.length - 1] > got[0]) sorted = false;
+    for (let i = 1; i < got.length && sorted; i++) if (got[i - 1] > got[i]) sorted = false;
+    tags.push(...got);
+    next = r.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1] || null;
+    if (!next || !got.length) { complete = true; break; }
+    if (sorted && got[got.length - 1] > upper) { complete = true; break; }
+    if (!sorted && page >= 2) break;
+  }
+  return { tags, complete };
+}
+// Plus récentes releases GitHub du dépôt de l'app (la catégorie "repo" du catalogue) : leurs tags, avec et sans "v"
+async function githubReleaseTags(repoUrl) {
+  const m = String(repoUrl || "").match(/github\.com\/([^/\s]+\/[^/\s#?]+)/i);
+  if (!m) throw new Error("dépôt GitHub inconnu");
+  const r = await fetch(`https://api.github.com/repos/${m[1].replace(/\.git$/, "")}/releases?per_page=30`, { headers: { "User-Agent": "GravityOS", Accept: "application/vnd.github+json" }, signal: AbortSignal.timeout(10000) });
+  if (!r.ok) throw new Error(`GitHub a répondu ${r.status}`);
+  return (await r.json()).filter((x) => !x.draft && !x.prerelease).flatMap((x) => [x.tag_name, String(x.tag_name).replace(/^v/i, "")]);
+}
+// "v1.2.3-alpine" → { prefix: "v", nums: [1,2,3], suffix: "-alpine" } ; null si le tag ne contient pas de version
+function parseVersionTag(tag) {
+  const m = String(tag).match(/^(.*?)(\d+(?:\.\d+)+)(.*)$/);
+  return m ? { prefix: m[1], nums: m[2].split(".").map(Number), suffix: m[3] } : null;
+}
+function cmpVersionNums(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) { const d = (a[i] || 0) - (b[i] || 0); if (d) return d; }
+  return 0;
+}
+// Plus haute version strictement supérieure au tag courant, au même format (pas de rc/beta : leur suffixe diffère)
+function newerTags(current, tags) {
+  const cur = parseVersionTag(current);
+  if (!cur) return [];
+  const found = new Map();
+  for (const t of tags) {
+    const v = parseVersionTag(t);
+    if (!v || v.prefix !== cur.prefix || v.suffix !== cur.suffix || v.nums.length !== cur.nums.length) continue;
+    if (cmpVersionNums(v.nums, cur.nums) <= 0) continue;
+    // "majeure" = le premier chiffre augmente ; en 0.x (ex. Frigate 0.17 → 0.18) c'est le deuxième qui casse la compatibilité
+    found.set(t, { tag: t, nums: v.nums, major: v.nums[0] > cur.nums[0] || (cur.nums[0] === 0 && (v.nums[1] || 0) > (cur.nums[1] || 0)) });
+  }
+  return [...found.values()].sort((a, b) => cmpVersionNums(b.nums, a.nums)).map(({ tag, major }) => ({ tag, major }));
+}
+function newerTag(current, tags) { return newerTags(current, tags)[0] || null; }
 // Empreintes de l'image locale pour ce dépôt (une image multi-architecture n'en a qu'une : celle de l'index)
-async function localDigests(ref, p) {
+async function localDigests(imageRef, p) {
   if (!docker) throw new Error("Docker indisponible");
-  const info = await docker.getImage(ref).inspect();
+  const info = await docker.getImage(imageRef).inspect();
   return (info.RepoDigests || []).filter((d) => d.startsWith(p.localName + "@")).map((d) => d.split("@")[1]);
 }
 function composeImageRefs(composeYaml) {
   return [...new Set([...composeYaml.matchAll(/^\s*image:\s*(\S+)/gm)].map((m) => m[1].replace(/^["']|["']$/g, "")))];
 }
-async function checkImageUpdate(ref) {
+// runningImageId : image réellement utilisée par le conteneur de cette ligne du compose (sinon, image du tag local)
+async function checkImageUpdate(ref, runningImageId, repoUrl) {
   const p = parseImageRef(ref);
-  if (p.pinned) return { ref, state: "pinned" };
+  if (p.pinned) {
+    try {
+      const cur = parseVersionTag(p.tag);
+      if (cur) {
+        let n = null, complete = false, regError = null;
+        try { const t = await registryTags(p, cur.prefix); complete = t.complete; n = newerTag(p.tag, t.tags); } catch (e) { regError = e; }
+        // Liste du registre absente ou partielle (ghcr.io) : on s'appuie sur les releases GitHub, mais seules les versions
+        // dont le tag d'image existe vraiment sur le registre sont proposées
+        if (!n && !complete) {
+          try {
+            for (const c of newerTags(p.tag, await githubReleaseTags(repoUrl)).slice(0, 5)) {
+              if (await registryDigest({ ...p, tag: c.tag }).then(() => true, () => false)) { n = c; break; }
+            }
+            complete = true;
+          } catch (e) { if (regError) throw regError; throw e; }
+        }
+        return n ? { ref, state: "update", from: p.tag, to: n.tag, major: n.major } : { ref, state: "current" };
+      }
+      // tag sans numéro de version (ex. "stable") figé par empreinte : le tag a-t-il bougé sur le registre ?
+      const remote = await registryDigest(p);
+      return remote === p.digest ? { ref, state: "current" } : { ref, state: "update", from: p.tag, to: p.tag, major: false };
+    } catch (e) { return { ref, state: "pinned", error: e.message }; }
+  }
   try {
-    const [remote, local] = await Promise.all([registryDigest(p), localDigests(ref.split("@")[0], p)]);
+    const [remote, local] = await Promise.all([registryDigest(p), localDigests(runningImageId || ref, p)]);
     if (!local.length) return { ref, state: "unknown", error: "image locale sans empreinte (construite localement ?)" };
     return { ref, state: local.includes(remote) ? "current" : "update" };
   } catch (e) { return { ref, state: "unknown", error: e.message }; }
@@ -5376,12 +5466,18 @@ async function computeStoreAppUpdates() {
   for (const app_ of catalog) {
     let yml;
     try { yml = fs.readFileSync(path.join(storeDir(app_.id), "docker-compose.yml"), "utf8"); } catch { continue; }
-    const images = await Promise.all(composeImageRefs(yml).map(checkImageUpdate));
-    const floating = images.filter((i) => i.state !== "pinned");
-    const status = images.some((i) => i.state === "update") ? "update"
-      : !floating.length ? "pinned"
-      : floating.some((i) => i.state === "unknown") ? "unknown" : "current";
-    out.push({ id: app_.id, name: app_.name, icon: app_.icon, status, images, error: images.find((i) => i.error)?.error });
+    const running = new Map();
+    try {
+      for (const c of await docker.listContainers({ all: true, filters: { label: [`com.docker.compose.project=store-${app_.id}`] } })) running.set(c.Image, c.ImageID);
+    } catch {}
+    const images = await Promise.all(composeImageRefs(yml).map((ref) => checkImageUpdate(ref, running.get(ref), app_.repo)));
+    const upd = images.find((i) => i.state === "update");
+    const status = upd ? "update" : images.some((i) => i.state === "pinned") ? "pinned" : images.some((i) => i.state === "unknown") ? "unknown" : "current";
+    out.push({
+      id: app_.id, name: app_.name, icon: app_.icon, status, images,
+      from: upd?.from, to: upd?.to, major: images.some((i) => i.state === "update" && i.major),
+      error: images.find((i) => i.error)?.error,
+    });
   }
   return out;
 }
@@ -5393,17 +5489,84 @@ app.get("/api/store/updates", auth, async (req, res) => {
     res.json({ checkedAt: storeUpdatesCache.at, apps: storeUpdatesCache.apps.map((a) => ({ ...a, updating: storeUpdating.has(a.id) })) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-function startStoreAppUpdate(id, res) {
+// Prépare la mise à jour d'une app : nouveau docker-compose.yml (tags + empreintes) calculé, rien n'est encore écrit
+async function prepareStoreAppUpdate(id, allowMajor) {
   const dir = storeDir(id);
-  if (!loadStoreCatalog().some((a) => a.id === id) || !fs.existsSync(path.join(dir, "docker-compose.yml"))) return res.status(404).json({ error: "Application non installée" });
-  if (storeUpdating.has(id)) return res.status(409).json({ error: "Une mise à jour de cette application est déjà en cours" });
-  storeUpdating.add(id);
-  const retag = retagPinnedImagesForDir(dir);
-  const jobId = runJob(`{ cd ${sh(dir)} && ${composeCmd()} pull && ${composeCmd()} up -d${retag ? " && " + retag : ""} ; } 2>&1`, (ok) => {
-    storeUpdating.delete(id);
-    if (ok && storeUpdatesCache.apps) storeUpdatesCache.apps = storeUpdatesCache.apps.map((a) => a.id === id ? { ...a, status: a.status === "update" ? "current" : a.status, images: a.images.map((i) => i.state === "update" ? { ...i, state: "current" } : i) } : a);
-  });
-  res.json({ ok: true, jobId });
+  const file = path.join(dir, "docker-compose.yml");
+  const original = fs.readFileSync(file, "utf8");
+  let yml = original;
+  const lines = [], blocked = [];
+  const repoUrl = loadStoreCatalog().find((a) => a.id === id)?.repo;
+  for (const ref of composeImageRefs(original)) {
+    const r = await checkImageUpdate(ref, undefined, repoUrl);
+    if (r.state !== "update") continue;
+    const p = parseImageRef(ref);
+    if (r.major && !allowMajor) { blocked.push(`${p.localName} ${r.from} → ${r.to}`); continue; }
+    if (p.pinned) {
+      const digest = await registryDigest({ ...p, tag: r.to });
+      yml = yml.split(ref).join(`${p.localName}:${r.to}@${digest}`);
+      lines.push(r.from === r.to ? `${p.localName}:${r.to} : nouvelle image` : `${p.localName} : ${r.from} → ${r.to}`);
+    } else lines.push(`${p.localName}:${p.tag} : nouvelle image`);
+  }
+  return { id, dir, file, original, yml, lines, blocked };
+}
+function storeUpdateCommand(prep) {
+  const retag = retagPinnedImagesCmd(prep.yml);
+  return `{ cd ${sh(prep.dir)} && ${composeCmd()} pull && ${composeCmd()} up -d${retag ? " && " + retag : ""} ; } 2>&1`;
+}
+function storeUpdateDone(prep, ok) {
+  storeUpdating.delete(prep.id);
+  if (!ok && prep.yml !== prep.original) { try { fs.writeFileSync(prep.file, prep.original); } catch {} }
+  if (ok && storeUpdatesCache.apps) {
+    storeUpdatesCache.apps = storeUpdatesCache.apps.map((a) => a.id === prep.id
+      ? { ...a, status: a.status === "update" ? "current" : a.status, from: undefined, to: undefined, major: false, images: a.images.map((i) => i.state === "update" ? { ref: i.ref, state: "current" } : i) }
+      : a);
+  }
+}
+function runShell(cmd) {
+  return new Promise((resolve) => exec(cmd, { shell: "/bin/bash", maxBuffer: 20 * 1024 * 1024, timeout: 30 * 60 * 1000 }, (err, stdout, stderr) => resolve({ ok: !err, log: String(stdout || "") + String(stderr || "") })));
+}
+async function startStoreAppUpdate(id, req, res) {
+  try {
+    if (!loadStoreCatalog().some((a) => a.id === id) || !fs.existsSync(path.join(storeDir(id), "docker-compose.yml"))) return res.status(404).json({ error: "Application non installée" });
+    if (storeUpdating.has(id)) return res.status(409).json({ error: "Une mise à jour de cette application est déjà en cours" });
+    storeUpdating.add(id);
+    let prep;
+    try {
+      prep = await prepareStoreAppUpdate(id, req.body?.allowMajor === true);
+      if (prep.blocked.length) { storeUpdating.delete(id); return res.status(409).json({ error: `Montée de version majeure à confirmer : ${prep.blocked.join(", ")}`, major: true }); }
+      if (prep.yml !== prep.original) fs.writeFileSync(prep.file, prep.yml);
+    } catch (e) { storeUpdating.delete(id); throw e; }
+    const jobId = runJob(storeUpdateCommand(prep), (ok) => storeUpdateDone(prep, ok));
+    res.json({ ok: true, jobId });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+}
+// Tâche planifiée "Mise à jour automatique (applications du Magasin)" : les montées de version majeure restent manuelles
+async function autoUpdateStoreApps() {
+  const lines = [];
+  let allOk = true;
+  const todo = (await computeStoreAppUpdates()).filter((a) => a.status === "update" && !storeUpdating.has(a.id));
+  if (!todo.length) return { ok: true, log: "Toutes les applications du Magasin sont à jour." };
+  for (const a of todo) {
+    storeUpdating.add(a.id);
+    let prep;
+    try {
+      prep = await prepareStoreAppUpdate(a.id, false);
+      for (const b of prep.blocked) lines.push(`${a.name} : ${b} — version majeure ignorée, à faire à la main (Paramètres > Mises à jour)`);
+      if (!prep.lines.length) { storeUpdating.delete(a.id); continue; }
+      if (prep.yml !== prep.original) fs.writeFileSync(prep.file, prep.yml);
+      const r = await runShell(storeUpdateCommand(prep));
+      storeUpdateDone(prep, r.ok);
+      lines.push(`${a.name} : ${r.ok ? "mise à jour faite (" + prep.lines.join(" ; ") + ")" : "ÉCHEC\n" + r.log.trim().split("\n").slice(-6).join("\n")}`);
+      if (!r.ok) allOk = false;
+    } catch (e) {
+      storeUpdating.delete(a.id);
+      if (prep) storeUpdateDone(prep, false);
+      lines.push(`${a.name} : échec (${e.message})`);
+      allOk = false;
+    }
+  }
+  return { ok: allOk, log: lines.join("\n") };
 }
 
 app.get("/api/store/apps", auth, async (req,res)=>{
@@ -5555,7 +5718,7 @@ app.get("/api/store/apps/:id/update", auth, async (req,res)=>{
 });
 app.post("/api/store/apps/:id/update", auth, (req,res)=>{
   const appId = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
-  if (!NATIVE_APPS.some(a => a.id === appId)) return startStoreAppUpdate(appId, res);
+  if (!NATIVE_APPS.some(a => a.id === appId)) return startStoreAppUpdate(appId, req, res);
   const nat = NATIVE_APPS.find(a => a.id === req.params.id.replace(/[^a-zA-Z0-9_-]/g,""));
   if (!nat?.updateScript || !nat.isInstalled()) return res.status(404).json({error:"Mise à jour non disponible pour cette application"});
   if (nativeUpdating.has(nat.id)) return res.status(409).json({error:`Une mise à jour de ${nat.name} est déjà en cours`});
@@ -6314,15 +6477,19 @@ async function checkNativeAppUpdates() {
 // retourne {ok, log} comme runJob/runUpdateProcess pour rester compatible
 // avec startScheduledTaskRun ci-dessous.
 async function runBuiltinTask(t) {
-  if (t.builtinType === "auto-update") {
+  if (t.builtinType === "auto-update-os") {
     const sys = await runUpdateProcess(systemUpdateCmd());
-    const grav = await runUpdateProcess(gravityUpdateCmd());
     if (sys.ok) resolveNotification("os-updates");
-    if (grav.ok) resolveNotification("gravity-updates");
     // la mise à jour du système peut avoir apporté un nouvel ampinstmgr : prévenir si l'instance AMP reste à finaliser
     const native = sys.ok ? await checkNativeAppUpdates() : [];
-    return { ok: sys.ok && grav.ok, log: `${sys.log}\n\n${grav.log}` + (native.length ? "\n\n" + native.join("\n") : "") };
+    return { ok: sys.ok, log: sys.log + (native.length ? "\n\n" + native.join("\n") : "") };
   }
+  if (t.builtinType === "auto-update-gravity") {
+    const grav = await runUpdateProcess(gravityUpdateCmd());
+    if (grav.ok) resolveNotification("gravity-updates");
+    return { ok: grav.ok, log: grav.log };
+  }
+  if (t.builtinType === "auto-update-store-apps") return autoUpdateStoreApps();
   if (t.builtinType === "check-gravity-updates") {
     const r = await checkGravityUpdatesCore();
     if (r.message && r.message.startsWith("Erreur")) return { ok: false, log: r.message };
@@ -6515,20 +6682,25 @@ app.delete("/api/scheduled-tasks/:id", auth, (req,res) => {
 // depuis une version de GravityOS antérieure à leur ajout (auto-réparant,
 // pas besoin de réinstaller pour les récupérer).
 function seedBuiltinScheduledTasks() {
-  const tasks = loadScheduledTasks();
+  let tasks = loadScheduledTasks();
   const defaults = [
-    { builtinType: "auto-update", name: "Mise à jour automatique", scheduleInterval: "Hebdomadaire", scheduleTime: "02:00", weekday: 1 },
+    // Mises à jour automatiques : trois tâches indépendantes, désactivées par défaut (l'utilisateur les active dans Paramètres > Mises à jour)
+    { builtinType: "auto-update-os", name: "Mise à jour automatique (système)", scheduleInterval: "Hebdomadaire", scheduleTime: "02:00", weekday: 1, enabled: false },
+    { builtinType: "auto-update-gravity", name: "Mise à jour automatique (interface GravityOS)", scheduleInterval: "Hebdomadaire", scheduleTime: "02:30", weekday: 1, enabled: false },
+    { builtinType: "auto-update-store-apps", name: "Mise à jour automatique (applications du Magasin)", scheduleInterval: "Hebdomadaire", scheduleTime: "03:00", weekday: 1, enabled: false },
     { builtinType: "check-os-updates", name: "Vérification des mises à jour (OS)", scheduleInterval: "Personnalisé", intervalMinutes: 360 },
     { builtinType: "check-gravity-updates", name: "Vérification des mises à jour (GravityOS)", scheduleInterval: "Personnalisé", intervalMinutes: 360 },
     { builtinType: "check-docker-updates", name: "Vérification des mises à jour (Docker)", scheduleInterval: "Quotidien", scheduleTime: "03:00" },
   ];
   let changed = false;
+  // L'ancienne tâche unique "Mise à jour automatique" (système + interface) est remplacée par les trois ci-dessus
+  if (tasks.some(t => t.builtinType === "auto-update")) { tasks = tasks.filter(t => t.builtinType !== "auto-update"); changed = true; }
   for (const def of defaults) {
     if (tasks.some(t => t.builtinType === def.builtinType)) continue;
     tasks.push({
       id: crypto.randomBytes(6).toString("hex"), name: def.name, kind: "builtin", builtin: true, builtinType: def.builtinType,
       scheduleInterval: def.scheduleInterval, scheduleTime: def.scheduleTime, weekday: def.weekday, dayOfMonth: def.dayOfMonth, intervalMinutes: def.intervalMinutes,
-      enabled: true, status: "idle", lastRun: null, lastOk: null, history: [],
+      enabled: def.enabled ?? true, status: "idle", lastRun: null, lastOk: null, history: [],
       createdAt: new Date().toISOString(),
     });
     changed = true;
