@@ -5299,6 +5299,113 @@ async function healAmpTmpNamespace() {
 }
 function nativeCredFile(id){ return path.join(NATIVE_CRED_DIR, `${id}.json`); }
 
+// ── Mises à jour des applications du Magasin (Docker) ──────────────────────────
+// Une app "a une mise à jour" quand l'image de son tag (ex. "latest") a changé sur le registre depuis le dernier
+// téléchargement. Détection sans rien télécharger : on compare l'empreinte (Docker-Content-Digest) renvoyée par le
+// registre à celles de l'image locale. Les images figées par empreinte ("repo:tag@sha256:…", cas de la plupart des
+// apps issues d'Umbrel) ne bougent jamais : elles sont signalées "figées". L'application recrée ensuite le projet
+// du Magasin ("compose pull" puis "up -d") : les données (bind-mounts) ne sont pas touchées.
+function parseImageRef(ref) {
+  const clean = String(ref).trim().replace(/^["']|["']$/g, "");
+  const pinned = clean.includes("@sha256:");
+  const noDigest = clean.split("@")[0];
+  const slash = noDigest.lastIndexOf("/");
+  const colon = noDigest.lastIndexOf(":");
+  const hasTag = colon > slash;
+  const tag = hasTag ? noDigest.slice(colon + 1) : "latest";
+  const name = hasTag ? noDigest.slice(0, colon) : noDigest;
+  const parts = name.split("/");
+  let registry = "docker.io";
+  if (parts.length > 1 && (parts[0].includes(".") || parts[0].includes(":") || parts[0] === "localhost")) registry = parts.shift();
+  let repo = parts.join("/");
+  if (registry === "docker.io" && !repo.includes("/")) repo = `library/${repo}`;
+  // lscr.io (LinuxServer) est un simple alias de ghcr.io/linuxserver : mêmes empreintes, sans redirection à suivre
+  const apiHost = registry === "docker.io" ? "registry-1.docker.io" : registry === "lscr.io" ? "ghcr.io" : registry;
+  return { pinned, tag, repo, registry, apiHost, localName: name };
+}
+const MANIFEST_ACCEPT = [
+  "application/vnd.oci.image.index.v1+json",
+  "application/vnd.docker.distribution.manifest.list.v2+json",
+  "application/vnd.oci.image.manifest.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json",
+].join(", ");
+async function registryDigest(p) {
+  const url = `https://${p.apiHost}/v2/${p.repo}/manifests/${p.tag}`;
+  const head = (auth) => fetch(url, { method: "HEAD", headers: { Accept: MANIFEST_ACCEPT, "User-Agent": "GravityOS", ...(auth ? { Authorization: `Bearer ${auth}` } : {}) }, signal: AbortSignal.timeout(10000) });
+  let r = await head();
+  if (r.status === 401) {
+    const ch = r.headers.get("www-authenticate") || "";
+    const realm = ch.match(/realm="([^"]+)"/)?.[1];
+    if (!realm) throw new Error("authentification du registre non reconnue");
+    const service = ch.match(/service="([^"]+)"/)?.[1];
+    const scope = ch.match(/scope="([^"]+)"/)?.[1] || `repository:${p.repo}:pull`;
+    const q = new URLSearchParams({ scope, ...(service ? { service } : {}) });
+    const tr = await fetch(`${realm}?${q}`, { headers: { "User-Agent": "GravityOS" }, signal: AbortSignal.timeout(10000) });
+    if (!tr.ok) throw new Error(`jeton refusé par ${p.registry} (${tr.status})`);
+    const tj = await tr.json();
+    r = await head(tj.token || tj.access_token);
+  }
+  if (!r.ok) throw new Error(`${p.registry} a répondu ${r.status}`);
+  const d = r.headers.get("docker-content-digest");
+  if (!d) throw new Error("empreinte absente de la réponse du registre");
+  return d;
+}
+// Empreintes de l'image locale pour ce dépôt (une image multi-architecture n'en a qu'une : celle de l'index)
+async function localDigests(ref, p) {
+  if (!docker) throw new Error("Docker indisponible");
+  const info = await docker.getImage(ref).inspect();
+  return (info.RepoDigests || []).filter((d) => d.startsWith(p.localName + "@")).map((d) => d.split("@")[1]);
+}
+function composeImageRefs(composeYaml) {
+  return [...new Set([...composeYaml.matchAll(/^\s*image:\s*(\S+)/gm)].map((m) => m[1].replace(/^["']|["']$/g, "")))];
+}
+async function checkImageUpdate(ref) {
+  const p = parseImageRef(ref);
+  if (p.pinned) return { ref, state: "pinned" };
+  try {
+    const [remote, local] = await Promise.all([registryDigest(p), localDigests(ref.split("@")[0], p)]);
+    if (!local.length) return { ref, state: "unknown", error: "image locale sans empreinte (construite localement ?)" };
+    return { ref, state: local.includes(remote) ? "current" : "update" };
+  } catch (e) { return { ref, state: "unknown", error: e.message }; }
+}
+const storeUpdating = new Set();
+let storeUpdatesCache = { at: 0, apps: null };
+async function computeStoreAppUpdates() {
+  const catalog = loadStoreCatalog();
+  const out = [];
+  for (const app_ of catalog) {
+    let yml;
+    try { yml = fs.readFileSync(path.join(storeDir(app_.id), "docker-compose.yml"), "utf8"); } catch { continue; }
+    const images = await Promise.all(composeImageRefs(yml).map(checkImageUpdate));
+    const floating = images.filter((i) => i.state !== "pinned");
+    const status = images.some((i) => i.state === "update") ? "update"
+      : !floating.length ? "pinned"
+      : floating.some((i) => i.state === "unknown") ? "unknown" : "current";
+    out.push({ id: app_.id, name: app_.name, icon: app_.icon, status, images, error: images.find((i) => i.error)?.error });
+  }
+  return out;
+}
+app.get("/api/store/updates", auth, async (req, res) => {
+  try {
+    if (req.query.refresh === "1" || !storeUpdatesCache.apps || Date.now() - storeUpdatesCache.at > 10 * 60 * 1000) {
+      storeUpdatesCache = { at: Date.now(), apps: await computeStoreAppUpdates() };
+    }
+    res.json({ checkedAt: storeUpdatesCache.at, apps: storeUpdatesCache.apps.map((a) => ({ ...a, updating: storeUpdating.has(a.id) })) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+function startStoreAppUpdate(id, res) {
+  const dir = storeDir(id);
+  if (!loadStoreCatalog().some((a) => a.id === id) || !fs.existsSync(path.join(dir, "docker-compose.yml"))) return res.status(404).json({ error: "Application non installée" });
+  if (storeUpdating.has(id)) return res.status(409).json({ error: "Une mise à jour de cette application est déjà en cours" });
+  storeUpdating.add(id);
+  const retag = retagPinnedImagesForDir(dir);
+  const jobId = runJob(`{ cd ${sh(dir)} && ${composeCmd()} pull && ${composeCmd()} up -d${retag ? " && " + retag : ""} ; } 2>&1`, (ok) => {
+    storeUpdating.delete(id);
+    if (ok && storeUpdatesCache.apps) storeUpdatesCache.apps = storeUpdatesCache.apps.map((a) => a.id === id ? { ...a, status: a.status === "update" ? "current" : a.status, images: a.images.map((i) => i.state === "update" ? { ...i, state: "current" } : i) } : a);
+  });
+  res.json({ ok: true, jobId });
+}
+
 app.get("/api/store/apps", auth, async (req,res)=>{
   try {
     await syncNativeShortcuts();
@@ -5447,6 +5554,8 @@ app.get("/api/store/apps/:id/update", auth, async (req,res)=>{
   res.json({ ...(await nat.checkUpdate()), updating: nativeUpdating.has(nat.id) });
 });
 app.post("/api/store/apps/:id/update", auth, (req,res)=>{
+  const appId = req.params.id.replace(/[^a-zA-Z0-9_-]/g,"");
+  if (!NATIVE_APPS.some(a => a.id === appId)) return startStoreAppUpdate(appId, res);
   const nat = NATIVE_APPS.find(a => a.id === req.params.id.replace(/[^a-zA-Z0-9_-]/g,""));
   if (!nat?.updateScript || !nat.isInstalled()) return res.status(404).json({error:"Mise à jour non disponible pour cette application"});
   if (nativeUpdating.has(nat.id)) return res.status(409).json({error:`Une mise à jour de ${nat.name} est déjà en cours`});
